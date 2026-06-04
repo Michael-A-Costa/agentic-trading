@@ -69,14 +69,33 @@ overnight/pre-market gaps, or a crashed/asleep engine.
 - **Paper / now:** both tags still **sell at the next tick** — resting vs synthetic fill identically
   in the sim. The tag exists for record fidelity and to drive the live executor; the real protection
   edge of a resting order only materializes live. Agent is always free to sell; no open-order lock.
-- **Live, later (not whole-share-by-default):** Robinhood resting stops need **whole shares**, and
-  fractional is market-only — so a real resting stop can only ride on whole-share-eligible lots. Plan
-  is a **hybrid**: real resting **stop-market** (not stop-limit — a limit can gap through and never
-  fill) when the lot is whole-share-eligible, synthetic otherwise. Keep fractional sizing as the
-  default; never force whole-share trading just to get a resting stop. Hybrid adds: read
-  `get_equity_orders` each tick (know the resting stop + its id), **cancel-stop → sell** for
-  discretionary exits, and reconcile the "stop already fired while asleep" case (position gone →
-  book realized P&L, don't re-sell).
+- **Live (BUILT — `scripts/live_execute.py`):** Robinhood resting stops need **whole shares**, and
+  fractional is market-only — so a real resting stop only rides on whole-share-eligible lots. The
+  hybrid: whole-share lot → marketable **`limit`** entry + real resting **`stop_market`** GTC (not
+  stop-limit — a limit can gap through and never fill); fractional → **`market`** entry + synthetic
+  stop. Fractional sizing stays the default; whole-share is never forced. Each tick the executor
+  reads the broker snapshot, **arms** the resting stop off the confirmed cost basis (one tick after
+  the entry fills; the synthetic stop covers the gap), **cancel-stop → sell** for discretionary
+  exits, and **reconciles** the "stop fired while asleep" case (position gone from broker → book it,
+  clear metadata, start cooldown).
+
+### Live execution architecture (how orders actually reach the broker)
+Python can't call the Robinhood MCP — only a Claude agent can. The live path reuses
+`decide.py:run_claude`: **all** sizing/cap/gating logic is Python (`live_execute.py`), which then
+spawns a **tightly-scoped relay agent** (`rh_mcp.py`, minimum RH tools, no web/fs) to execute a
+precise recipe and echo strict JSON. **Truth is always re-read from the broker** — the agent's prose
+is never trusted; fills/closures are reconciled from `get_equity_positions` / `get_equity_orders`.
+- **Tick flow (live):** `broker_snapshot.py` (real buying power/positions/orders, fail-closed) →
+  `tick_context.py` (screen off broker truth + our metadata) → `decide.py` → `live_execute.py`.
+- **State:** broker is source of truth for cash/qty/cost; `data/live_state.json` holds only our
+  metadata (stop/TP/entry_ts/scaled/`resting_stop_order_id`, SOD equity).
+- **Two-step arming:** `TRADING_MODE=live` + `LIVE_ARMED!=1` = **dry-run** (runs `review_equity_order`
+  for real alerts, logs intended orders, places nothing). `LIVE_ARMED=1` places for real; the first
+  order is capped to `LIVE_CANARY_USD` until one round-trip completes.
+- **Gate (no human per-trade):** account hard-pin · `review` before every `place` with blocking-alert
+  skip · `ref_id` idempotency · caps re-checked vs fresh buying power · daily breaker on broker SOD ·
+  fail-closed snapshot. **Kill switch:** set `TRADING_MODE=paper`, set `LIVE_ARMED=0`, or disconnect
+  the MCP.
 
 ## DD / discovery (the "find stocks" half)
 - **Universe per tick** = discovered, not fixed: liquid, fractional-eligible names with real intraday

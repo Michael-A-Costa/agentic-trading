@@ -90,14 +90,16 @@ deterministic Python:
      which permanently **excludes** it: excluded names are filtered out of discovery and the screen,
      never quoted or researched again. Manage manually:
      `python3 scripts/stock_memory.py [show SYM | exclude SYM "why" | allow SYM]`.
-5. **`apply_decision.py`** — the deterministic **executor + gate**: re-validates every action
-   against the `.env` caps (the LLM is advisory; this is the real guardrail), simulates the paper
-   fill, attaches the synthetic stop / take-profit, and appends the full what+why record to
-   `data/engine-log.jsonl`.
+5. **Executor + gate** — re-validates every action against the `.env` caps (the LLM is advisory;
+   this is the real guardrail) and appends the full what+why record to `data/engine-log.jsonl`:
+   - **paper** → **`apply_decision.py`**: models a marketable-limit fill with slippage, attaches the
+     synthetic/resting stop tag + take-profit, updates `data/paper_state.json`.
+   - **live** → **`live_execute.py`**: turns each action into real MCP orders (marketable-`limit`
+     entry + resting `stop_market` GTC for whole-share lots; `market` + synthetic for fractional),
+     re-checking caps against fresh broker buying power. See **Live trading** below.
 
 On a `circuit_breaker` SKIP the engine still runs **protective exits** (it halts new entries, not
-stops). On `market_closed` / stale-data SKIPs it stays fully idle. `TRADING_MODE=live` is refused
-until the live executor is built.
+stops). On `market_closed` / stale-data SKIPs it stays idle (live still reconciles broker stops/closures).
 
 ```bash
 scripts/run_trading_tick.sh                 # one paper tick by hand
@@ -153,6 +155,44 @@ claude -p 'Call get_accounts and report only the count' \
 # -> {"ok": true, "num_accounts": 4}  (exit 0, ~15s, no interactive auth)
 ```
 So the autonomous engine path is: **cron → `claude -p` (headless) in this repo → MCP tools**,
-scoped by `--allowedTools` and the `.env` risk caps. For live order placement, the allow-list
-expands to include `place_equity_order` / `cancel_equity_order`. The market-conditions cron above
-stays independent (public data, no auth) as a robust regime feed the engine can read.
+scoped by `--allowedTools` and the `.env` risk caps. The market-conditions cron above stays
+independent (public data, no auth) as a robust regime feed the engine can read.
+
+---
+
+## Live trading (`TRADING_MODE=live`)
+
+Python can't call the Robinhood MCP — only a Claude agent can — so live orders go through a
+tightly-scoped relay agent (`rh_mcp.py`), while **all** sizing/cap/gating logic stays in Python
+(`live_execute.py`). **Truth is always re-read from the broker**; fills and closures are reconciled
+from `get_equity_positions` / `get_equity_orders`, never from the agent's prose.
+
+**Tick flow (live):** `broker_snapshot.py` (real buying power/positions/orders → `data/tick/
+broker_snapshot.json`, **fail-closed**) → `tick_context.py` (screens off broker truth +
+`data/live_state.json` metadata) → `decide.py` → `live_execute.py`.
+
+**Order semantics** (pinned by the MCP schema — `dollar_amount`/fractional are market-only; `limit`/
+`stop_market` need whole shares): whole-share lot → marketable **`limit`** entry + resting
+**`stop_market`** GTC (armed off the confirmed cost basis one tick after the fill; synthetic stop
+covers the gap); fractional → **`market`** entry + synthetic engine-tick stop.
+
+**Two-step arming (the seatbelt):**
+```bash
+# 1) DRY-RUN: real review_equity_order alerts, logs intended orders, places NOTHING
+TRADING_MODE=live LIVE_ARMED=0 scripts/run_trading_tick.sh
+tail -n 3 data/engine-log.jsonl     # look for "buy_dryrun" / "DRY-RUN would place"
+
+# 2) ARMED: real orders; first one capped to LIVE_CANARY_USD until a round-trip completes
+TRADING_MODE=live LIVE_ARMED=1 scripts/run_trading_tick.sh
+```
+**Gate (no human per-trade approval):** account hard-pinned to `AGENTIC_ACCOUNT` · `review` before
+every `place` with blocking-alert skip · `ref_id` idempotency · caps re-checked vs fresh buying
+power · daily breaker on broker start-of-day equity · fail-closed snapshot · resting GTC stop on
+every whole-share lot · full audit log with order ids.
+**Kill switch:** set `TRADING_MODE=paper`, set `LIVE_ARMED=0`, or disconnect the MCP.
+
+> NOTE: the exact JSON field names returned by the RH read tools are mapped defensively in
+> `live_execute.parse_snapshot` / `tick_context.load_live_state`; confirm/adjust them against the
+> first real dry-run output (`data/tick/broker_snapshot.json`).
+
+Pure-logic unit tests (no MCP, no orders): `python3 scripts/test_live_execute.py`.

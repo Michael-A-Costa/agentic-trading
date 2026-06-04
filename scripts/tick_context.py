@@ -86,6 +86,71 @@ def save_state(state: dict) -> None:
     STATE_PATH.write_text(json.dumps(state, indent=2))
 
 
+def load_live_state() -> dict:
+    """LIVE mode: build a paper-state-shaped dict from broker truth so the rest of the screen/exit
+    logic is unchanged. Cash + position qty/cost come from data/tick/broker_snapshot.json (the
+    broker), while our stop/TP/entry_ts/scale metadata comes from data/live_state.json. We never
+    write paper_state.json in live mode — live_execute.py owns live_state.json (incl. SOD equity)."""
+    snap_path = DATA / "tick" / "broker_snapshot.json"
+    live_path = DATA / "live_state.json"
+    snap = json.loads(snap_path.read_text()) if snap_path.exists() else {}
+    lstate = json.loads(live_path.read_text()) if live_path.exists() else {}
+    lots = lstate.get("lots", {})
+
+    # buying power — confirmed live shape: data.buying_power.buying_power (nested), fallback data.cash.
+    # Tool results may arrive wrapped as {"data": {...}}; peel that first. Same mapping as
+    # live_execute.parse_snapshot — keep the two in sync.
+    def _flt(v):
+        try:
+            return float(v) if v not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+    pf = snap.get("portfolio") or {}
+    if isinstance(pf, dict) and isinstance(pf.get("data"), dict):
+        pf = pf["data"]
+    bp = pf.get("buying_power") if isinstance(pf, dict) else None
+    cash = _flt(bp.get("buying_power")) if isinstance(bp, dict) else _flt(bp)
+    if cash is None:
+        cash = _flt(pf.get("cash")) or 0.0
+
+    raw_pos = snap.get("positions")
+    if isinstance(raw_pos, dict):
+        raw_pos = raw_pos.get("data", raw_pos)
+        if isinstance(raw_pos, dict):
+            raw_pos = raw_pos.get("positions") or raw_pos.get("results") or []
+    positions: dict[str, dict] = {}
+    for p in raw_pos or []:
+        if not isinstance(p, dict):
+            continue
+        sym = str(p.get("symbol") or p.get("ticker") or "").upper().strip()
+        try:
+            qty = float(p.get("quantity") or p.get("qty") or p.get("shares") or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if not sym or qty <= 0:
+            continue
+        avg = p.get("average_buy_price") or p.get("average_price") or p.get("avg_cost") or p.get("price")
+        try:
+            entry = float(avg) if avg is not None else None
+        except (TypeError, ValueError):
+            entry = None
+        lot = lots.get(sym, {})
+        entry = lot.get("entry_price") or entry or 0.0
+        positions[sym] = {
+            "qty": qty, "entry_price": entry,
+            "entry_ts": lot.get("entry_ts"),
+            "stop_price": lot.get("stop_price"),
+            "take_profit_price": lot.get("take_profit_price"),
+            "init_qty": lot.get("init_qty", qty),
+            "scaled": lot.get("scaled") or [],
+            "stop_type": lot.get("stop_type", "synthetic"),
+        }
+    return {
+        "cash": cash, "positions": positions, "realized_total": 0.0,
+        "day": lstate.get("day"), "start_of_day_equity": lstate.get("start_of_day_equity"),
+    }
+
+
 def latest_regime() -> dict:
     if not REGIME_LOG.exists():
         return {}
@@ -120,7 +185,8 @@ def main() -> int:
     session, is_open = mc.session_state(now_et)
     allow_offhours = env("ALLOW_OFFHOURS", "0") == "1"
 
-    state = load_state()
+    is_live = env("TRADING_MODE", "paper").strip().lower() == "live"
+    state = load_live_state() if is_live else load_state()
     # Universe = dynamic discovery (today's top eligible movers) + always-watch pins + held.
     # Discovery replaces a static stock allowlist: a momentum engine has to see what's actually
     # moving market-wide, not a fixed watchlist. The pins (CANDIDATES) stay screened every tick and
@@ -174,10 +240,15 @@ def main() -> int:
     equity = round(state["cash"] + pos_value, 2)
 
     # --- day rollover + day P&L for the circuit breaker ---
+    # In LIVE mode live_execute.py owns start-of-day equity (in live_state.json); tick_context must
+    # NOT write paper_state.json. We still need a SOD baseline for the breaker cap this tick — use
+    # live_state's value if present, else fall back to current equity (live_execute re-checks the
+    # breaker authoritatively against broker numbers before any entry).
     if state.get("day") != today or state.get("start_of_day_equity") is None:
         state["day"] = today
         state["start_of_day_equity"] = equity
-        save_state(state)
+        if not is_live:
+            save_state(state)
     day_pnl = round(equity - state["start_of_day_equity"], 2)
 
     # --- candidates with intraday move ---

@@ -26,12 +26,20 @@ LOG_DIR="${REPO}/data/logs"; mkdir -p "$LOG_DIR"
 RUN_LOG="${LOG_DIR}/tick_$(date +%Y-%m-%d).log"
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$RUN_LOG"; }
 
-# Live mode is NOT yet wired into the executor — apply_decision.py only simulates paper fills
-# (there is no review_equity_order -> place_equity_order path). Refuse to run live so flipping
-# the flag can't silently no-op (or, worse, half-execute through the simulator).
-if [ "${TRADING_MODE:-paper}" = "live" ]; then
-  log "FATAL: TRADING_MODE=live but no live executor exists — refusing. Build the live path first."
-  exit 1
+# Executor + execution mode. paper -> apply_decision.py (simulated fills). live -> live_execute.py
+# (real review->place via the MCP relay). Within live, LIVE_ARMED=1 actually places orders; anything
+# else is a DRY-RUN (review only, logs "would place", never places). The arming gate lives in
+# live_execute.py (Python), so even a live tick can't place unless armed.
+MODE="${TRADING_MODE:-paper}"
+if [ "$MODE" = "live" ]; then
+  EXEC="${REPO}/scripts/live_execute.py"
+  if [ "${LIVE_ARMED:-0}" = "1" ]; then
+    log "WARNING: TRADING_MODE=live and LIVE_ARMED=1 — REAL orders will be placed (caps are the gate)."
+  else
+    log "live DRY-RUN (LIVE_ARMED!=1): will review + log intended orders, place nothing."
+  fi
+else
+  EXEC="${REPO}/scripts/apply_decision.py"
 fi
 
 # --- single-flight lock (atomic mkdir); treat >15-min-old lock as stale ---
@@ -52,6 +60,17 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
   # 1) market regime (public data; appends to market_conditions.jsonl)
   "$PYTHON" "${REPO}/scripts/market_conditions.py" --quiet || log "market_conditions failed (continuing)"
 
+  # 1b) LIVE only: pull the real broker state (buying power, positions, open orders) via the MCP
+  # relay before anything reads it. Fail-closed — if the snapshot can't be fetched, skip the whole
+  # tick rather than trade/reconcile blind. (Paper has no broker step.)
+  if [ "$MODE" = "live" ]; then
+    if ! "$PYTHON" "${REPO}/scripts/broker_snapshot.py" 2>>"$RUN_LOG" | tee -a "$RUN_LOG"; then
+      log "broker_snapshot failed — failing closed, skipping this tick"
+      log "=== tick end (${SECONDS}s) ==="
+      exit 0
+    fi
+  fi
+
   # 2) context + gate (script) — writes context/packet, prints GATE=...
   GATE_LINE="$("$PYTHON" "${REPO}/scripts/tick_context.py" | tail -n 1)"
   log "gate: ${GATE_LINE}"
@@ -59,17 +78,18 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
   CTX="${REPO}/data/tick/context_latest.json"
 
   if [[ "$GATE_LINE" == GATE=SKIP* ]]; then
-    # log the skipped tick deterministically; no LLM call
-    "$PYTHON" "${REPO}/scripts/apply_decision.py" --context "$CTX" --skip | tee -a "$RUN_LOG"
+    # log the skipped tick deterministically; no decision LLM call. (Live still reconciles stops /
+    # books closures from the broker snapshot inside the executor's --skip path.)
+    "$PYTHON" "$EXEC" --context "$CTX" --skip | tee -a "$RUN_LOG"
   else
     # 3) decide: Stage-1 screen (deterministic) -> Stage-2 deep DD + commit (Sonnet + web) on candidates
     DEC="${REPO}/data/tick/decision_latest.json"
     if "$PYTHON" "${REPO}/scripts/decide.py" 2>>"$RUN_LOG" | tee -a "$RUN_LOG"; then
-      # 4) apply + log (script) — re-checks caps, simulates fills, writes the what+why record
-      "$PYTHON" "${REPO}/scripts/apply_decision.py" --context "$CTX" --decision "$DEC" | tee -a "$RUN_LOG"
+      # 4) execute + log (script) — re-checks caps, then simulates (paper) or reviews->places (live)
+      "$PYTHON" "$EXEC" --context "$CTX" --decision "$DEC" | tee -a "$RUN_LOG"
     else
       log "decide.py failed — logging as skip"
-      "$PYTHON" "${REPO}/scripts/apply_decision.py" --context "$CTX" --skip | tee -a "$RUN_LOG"
+      "$PYTHON" "$EXEC" --context "$CTX" --skip | tee -a "$RUN_LOG"
     fi
   fi
   log "=== tick end (${SECONDS}s) ==="
