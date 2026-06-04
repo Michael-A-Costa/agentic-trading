@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent: run one PAPER trading tick every 5 minutes.
+  Install:  cp scripts/com.agentic.trading-tick.plist ~/Library/LaunchAgents/
+            launchctl load -w ~/Library/LaunchAgents/com.agentic.trading-tick.plist
+  Stop:     launchctl unload -w ~/Library/LaunchAgents/com.agentic.trading-tick.plist
+  Note: the Mac must be AWAKE for ticks to fire (launchd won't wake it from sleep).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agentic.trading-tick</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/mcosta/Documents/workrepos/agentic-trading/scripts/run_trading_tick.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/mcosta/Documents/workrepos/agentic-trading</string>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/mcosta/Documents/workrepos/agentic-trading/data/logs/launchd.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/mcosta/Documents/workrepos/agentic-trading/data/logs/launchd.err</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
