@@ -66,7 +66,7 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
     fi
   fi
   log "=== tick end ==="
-  echo
-} >>"$RUN_LOG" 2>&1
+}
 
-tail -n 3 "$RUN_LOG"
+# log() and the apply_decision `tee` already append to RUN_LOG; their stdout copy lands in
+# launchd.out (real-time visibility). No outer RUN_LOG redirect, so nothing is double-written.

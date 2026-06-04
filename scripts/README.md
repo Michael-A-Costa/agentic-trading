@@ -50,7 +50,7 @@ crontab -e
 Add (every 30 min, weekdays, ~market hours; the script self-labels off-hours runs, so the
 edge ticks at :00/:30 around the open/close are harmless):
 ```cron
-*/30 9-16 * * 1-5 /Users/mcosta/Documents/workrepos/agentic-trading/scripts/run_market_check.sh >/dev/null 2>&1
+*/30 9-16 * * 1-5 /Users/mcosta/agentic-trading/scripts/run_market_check.sh >/dev/null 2>&1
 ```
 **macOS gotchas:**
 - Grant **Full Disk Access** to `/usr/sbin/cron` (System Settings → Privacy & Security → Full
@@ -74,7 +74,7 @@ The trading engine needs the Robinhood MCP (account data + orders), and **headle
 confirmed**. A non-interactive probe reused the stored OAuth token with no browser step:
 ```bash
 claude -p 'Call get_accounts and report only the count' \
-  --mcp-config /Users/mcosta/Documents/workrepos/agentic-trading/.mcp.json \
+  --mcp-config /Users/mcosta/agentic-trading/.mcp.json \
   --allowedTools 'mcp__robinhood-trading__get_accounts' \
   --dangerously-skip-permissions --output-format text
 # -> {"ok": true, "num_accounts": 4}  (exit 0, ~15s, no interactive auth)
