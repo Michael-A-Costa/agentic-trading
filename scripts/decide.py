@@ -194,7 +194,11 @@ def main() -> int:
     exits = screen.get("exits") or []
     candidates = screen.get("entry_candidates") or []
 
-    actions = [{"symbol": e.get("symbol"), "side": "sell", "reason": e.get("reason", "")}
+    # Carry the optional partial-sell fields (qty + scale_tiers) through for scale-out exits; a
+    # full close has neither and defaults to selling the whole position in apply_decision.
+    actions = [{"symbol": e.get("symbol"), "side": "sell", "reason": e.get("reason", ""),
+                **({"qty": e["qty"]} if e.get("qty") is not None else {}),
+                **({"scale_tiers": e["scale_tiers"]} if e.get("scale_tiers") else {})}
                for e in exits if e.get("symbol")]
 
     # --- Stage 2: deep DD + commit, with a per-symbol TTL cache (split commit/reject TTLs) ---

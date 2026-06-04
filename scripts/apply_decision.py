@@ -31,6 +31,10 @@ DATA = REPO / "data"
 STATE_PATH = DATA / "paper_state.json"
 ENGINE_LOG = DATA / "engine-log.jsonl"
 
+# After the FIRST scale-out trim, ratchet the synthetic stop up to breakeven (entry) so the
+# remaining shares can't turn a banked partial win into a net loser. 0/false = leave the stop put.
+SCALE_BREAKEVEN = os.environ.get("SCALE_BREAKEVEN_AFTER_FIRST", "1").strip().lower() not in ("0", "false", "no", "")
+
 
 def load_json(p: Path) -> dict:
     return json.loads(p.read_text())
@@ -201,10 +205,12 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
         new_entry = (prev["qty"] * prev["entry_price"] + qty * price) / new_qty
         sl, tp = caps.get("STOP_LOSS_PCT", 2.0), caps.get("TAKE_PROFIT_PCT", 4.0)
         positions[sym] = {"qty": new_qty, "entry_price": round(new_entry, 4),
+                          "init_qty": round(new_qty, 6),  # scale-out base: fractions are of this entry qty
                           "entry_ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                           "stop_price": round(new_entry * (1 - sl / 100), 4),
                           "take_profit_price": round(new_entry * (1 + tp / 100), 4),
-                          "stop_type": "synthetic"}
+                          "stop_type": "synthetic",
+                          "scaled": prev.get("scaled", [])}  # tiers already taken (preserved when averaging in)
         state["cash"] -= notional
         result.update(status="filled", qty=round(qty, 6), price=price,
                       notional=round(notional, 2),
@@ -230,14 +236,27 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
     state["cash"] += proceeds
     state["realized_total"] += realized
     remaining = held - qty
+    scale_tiers = action.get("scale_tiers")
     if remaining <= 1e-9:
         del positions[sym]
+        # Full exit: start the re-entry cooldown (anti-whipsaw). A partial scale-out does NOT —
+        # the name is still held, and cooldown only governs re-ENTERING a name we've fully left.
+        state.setdefault("last_exit", {})[sym] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     else:
         positions[sym]["qty"] = remaining
-    # Record the exit so the screen can enforce a re-entry cooldown (anti-whipsaw).
-    state.setdefault("last_exit", {})[sym] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        if scale_tiers:
+            # Mark these tiers taken so the screen won't re-trim them next tick, and after the
+            # FIRST trim ratchet the synthetic stop up to breakeven (entry) to lock the runner.
+            taken = positions[sym].get("scaled") or []
+            first_trim = not taken
+            positions[sym]["scaled"] = taken + [t for t in scale_tiers if t not in taken]
+            if first_trim and SCALE_BREAKEVEN:
+                entry = positions[sym]["entry_price"]
+                if positions[sym].get("stop_price") is None or positions[sym]["stop_price"] < entry:
+                    positions[sym]["stop_price"] = round(entry, 4)
     result.update(status="filled", qty=round(qty, 6), price=price,
-                  notional=round(proceeds, 2), realized_usd=round(realized, 2))
+                  notional=round(proceeds, 2), realized_usd=round(realized, 2),
+                  **({"scale_tiers": scale_tiers} if scale_tiers else {}))
     return result
 
 
@@ -309,7 +328,9 @@ def main() -> int:
         if run_exits:
             exits = (context.get("screen") or {}).get("exits") or []
             exit_actions = [{"symbol": e.get("symbol"), "side": "sell",
-                             "reason": f"[breaker-exit] {e.get('reason', '')}"}
+                             "reason": f"[breaker-exit] {e.get('reason', '')}",
+                             **({"qty": e["qty"]} if e.get("qty") is not None else {}),
+                             **({"scale_tiers": e["scale_tiers"]} if e.get("scale_tiers") else {})}
                             for e in exits if e.get("symbol")]
             exit_results = [validate_and_fill(a, context, state, caps) for a in exit_actions]
             write_json_atomic(state_path, state)

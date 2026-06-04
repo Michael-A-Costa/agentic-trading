@@ -34,7 +34,9 @@ Derived from `research/agentic-robinhood-mcp-landscape.md`. An **autonomous** mo
 | `MIN_POSITION_USD` | `0` | reject dust fills (0 = off) |
 | `COOLDOWN_MIN` | `30` | no re-entry into a name within N min of exiting (anti-whipsaw) |
 | `FLATTEN_BEFORE_CLOSE_MIN` / `NO_ENTRY_LAST_MIN` | `15` / `15` | EOD flatten + block late entries |
-| `MAX_HOLD_MIN` | `0` | force-exit a stale position (0 = off) |
+| `WINDDOWN_BEFORE_CLOSE_MIN` / `WINDDOWN_MIN_PROFIT_PCT` | `0` / `1.0` | EOD wind-down: in the last N min, lock in **green** positions (`pnl% ≥ profit`) early rather than risk the gain into a choppy close. Asymmetric — losers keep full runway to the hard flatten. Set N > `FLATTEN_BEFORE_CLOSE_MIN`; `0` = off |
+| `MAX_HOLD_MIN` / `STALL_BAND_PCT` | `0` / `2.0` | force-exit a STALLED position held > N min, but only when `|pnl%|` < band so a runner/bleeder keeps its price rule (`STALL_BAND_PCT<=0` = blind time stop; `MAX_HOLD_MIN=0` = off) |
+| `SCALE_OUT_TIERS` / `SCALE_BREAKEVEN_AFTER_FIRST` | `""` / `1` | partial profit-take ladder `gain%:fracOfEntryQty,…` (e.g. `5:0.33,8:0.33`): trim a slice at each tier the gain clears, leaving the rest to ride to `TAKE_PROFIT_PCT`. After the first trim, ratchet the synthetic stop to breakeven. Empty = off (one all-or-nothing exit). Tiers ≥ TP never fire. |
 | `DD_MODEL` / `MAX_DD_CANDIDATES` / `DD_CACHE_TTL_MIN` | Sonnet / `2` / `180` | Stage-2 commit model + cost bounds |
 
 > **All caps above are enforced deterministically** in `apply_decision.py` (buy branch) and

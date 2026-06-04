@@ -42,6 +42,30 @@ def envf(key: str, default: float) -> float:
         return default
 
 
+def scale_out_tiers() -> list[tuple[float, float]]:
+    """Parse SCALE_OUT_TIERS ("gain%:fracOfInitQty, ...") into sorted (gain, frac) pairs.
+
+    e.g. "5:0.33,8:0.33" -> [(5.0, 0.33), (8.0, 0.33)]: at +5% sell a third of the original
+    position, at +8% sell another third, leaving a third to ride to the take-profit. Empty/off
+    returns []. Fractions are of the position's qty AT ENTRY (init_qty), so "a third then a third"
+    means exact thirds, not thirds-of-the-remainder.
+    """
+    raw = (os.environ.get("SCALE_OUT_TIERS", "") or "").strip()
+    tiers: list[tuple[float, float]] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if ":" not in part:
+            continue
+        g, f = part.split(":", 1)
+        try:
+            gain, frac = float(g), float(f)
+        except ValueError:
+            continue
+        if gain > 0 and 0 < frac < 1:
+            tiers.append((gain, frac))
+    return sorted(tiers)
+
+
 def load_state() -> dict:
     if STATE_PATH.exists():
         try:
@@ -142,6 +166,8 @@ def main() -> int:
             "last": lp, "value": round(val, 2), "pnl_usd": round(pnl, 2), "pnl_pct": pnl_pct,
             "stop_price": p.get("stop_price"), "take_profit_price": p.get("take_profit_price"),
             "entry_ts": p.get("entry_ts"),  # for the max-hold time-exit
+            "init_qty": p.get("init_qty", round(qty, 6)),  # scale-out base (qty at entry); fallback for pre-existing positions
+            "scaled": p.get("scaled") or [],               # scale-out tiers already taken (gain%s)
             "stop_type": p.get("stop_type", "synthetic"),  # synthetic = engine-tick only, not a resting broker stop
         })
 
@@ -186,9 +212,13 @@ def main() -> int:
     # Screen / risk-mgmt tuning knobs (all .env-overridable; defaults are conservative).
     rel_strength_pct = envf("REL_STRENGTH_PCT", 1.0)   # require this much intraday % ABOVE SPY
     cooldown_min = envf("COOLDOWN_MIN", 30.0)          # no re-entry within N min of an exit (anti-whipsaw)
-    flatten_min = envf("FLATTEN_BEFORE_CLOSE_MIN", 15.0)  # flatten all positions N min before close
+    flatten_min = envf("FLATTEN_BEFORE_CLOSE_MIN", 15.0)  # flatten ALL positions N min before close
+    winddown_min = envf("WINDDOWN_BEFORE_CLOSE_MIN", 0.0)  # in the last N min, lock GREEN positions early (0 = off)
+    winddown_profit = envf("WINDDOWN_MIN_PROFIT_PCT", 1.0)  # only wind down positions with pnl% >= this (0 = any green)
     no_entry_last_min = envf("NO_ENTRY_LAST_MIN", 15.0)   # block NEW entries in the last N min
-    max_hold_min = envf("MAX_HOLD_MIN", 0.0)           # force-exit a position held > N min (0 = off)
+    max_hold_min = envf("MAX_HOLD_MIN", 0.0)           # force-exit a STALLED position held > N min (0 = off)
+    stall_band_pct = envf("STALL_BAND_PCT", 2.0)       # max |pnl%| for max-hold to fire (<=0 = exit at time regardless)
+    tiers = scale_out_tiers()                          # partial profit-take ladder (gain% -> fraction of entry qty); [] = off
     # Minutes until the 16:00 ET close (None when not in a regular session).
     close_et = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
     mins_to_close = (close_et - now_et).total_seconds() / 60.0 if is_open else None
@@ -213,15 +243,43 @@ def main() -> int:
         # Time-based exits (price-independent risk mgmt; bound the synthetic-stop gap window).
         elif is_open and flatten_min > 0 and mins_to_close is not None and mins_to_close <= flatten_min:
             reason = f"EOD flatten ({int(mins_to_close)}m to close)"
+        elif (is_open and winddown_min > 0 and mins_to_close is not None
+              and mins_to_close <= winddown_min and pp is not None and pp >= winddown_profit):
+            # EOD wind-down: in the last N min, lock in GREEN positions early rather than risk the
+            # gain eroding into a choppy close. Asymmetric on purpose — losers are NOT touched here;
+            # they keep their full runway to the hard flatten (which takes everything regardless).
+            reason = f"EOD wind-down: +{pp}% locked ({int(mins_to_close)}m to close)"
         elif max_hold_min > 0 and p.get("entry_ts"):
+            # Recycle STALLED capital: only force-exit on the time limit when the position is
+            # going nowhere (|pnl| within the stall band). A name still climbing toward TP (or
+            # bleeding toward the stop) is left for its price rule. stall_band <= 0 = blind time stop.
             try:
                 age_min = (now_utc - datetime.fromisoformat(p["entry_ts"])).total_seconds() / 60.0
-                if age_min >= max_hold_min:
-                    reason = f"max-hold {int(age_min)}m >= {int(max_hold_min)}m"
+                stalled = stall_band_pct <= 0 or (pp is not None and abs(pp) < stall_band_pct)
+                if age_min >= max_hold_min and stalled:
+                    band = "" if stall_band_pct <= 0 else f", stalled |{pp}%|<{stall_band_pct:g}%"
+                    reason = f"max-hold {int(age_min)}m >= {int(max_hold_min)}m{band}"
             except (ValueError, TypeError):
                 pass
         if reason:
             exits.append({"symbol": p["symbol"], "reason": reason})
+        elif tiers and pp is not None and pp > 0:
+            # Scale-out ladder: no full-exit rule fired, so check the partial profit-take tiers.
+            # Sell a fraction of the ENTRY qty for every tier the gain has cleared but we haven't
+            # taken yet (collapsing a multi-tier gap-up into one slice so we don't miss a tier that
+            # reverses before the next 5-min tick). The position stays open; apply_decision marks the
+            # tiers taken and ratchets the stop to breakeven after the first trim.
+            already = p.get("scaled") or []
+            base = p.get("init_qty") or p.get("qty") or 0.0
+            due = [(g, f) for (g, f) in tiers if pp >= g and g not in already]
+            qty_out = round(base * sum(f for _, f in due), 6)
+            if due and qty_out > 0:
+                gains = [g for g, _ in due]
+                pct = int(round(sum(f for _, f in due) * 100))
+                tier_lbl = ",".join(f"+{g:g}%" for g in gains)
+                exits.append({"symbol": p["symbol"],
+                              "reason": f"scale-out {pct}% at +{pp}% (tier {tier_lbl})",
+                              "qty": qty_out, "scale_tiers": gains})
 
     # Entry candidates: movers clearing BOTH an absolute threshold and a relative-strength bar vs
     # SPY (so we don't just buy market beta on a broad-up tape), in a non-hostile regime, not held,
