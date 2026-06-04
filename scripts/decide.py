@@ -14,6 +14,7 @@ gathering is scripts.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import math
 import os
@@ -148,8 +149,11 @@ def run_dd(c: dict, regime: dict, caps: dict, portfolio: dict, dd_model: str) ->
         "prior_evaluation": memory.get_note(sym),
         "dd": dd,
     })
+    # Per-DD wall-clock cap. Kept tight (default 240s) so that — even when several DDs run in
+    # parallel — one slow web-research call can't push the tick past the ~5-min launchd cadence.
+    dd_timeout = int(os.environ.get("DD_CLAUDE_TIMEOUT_S", "240"))
     out = run_claude((SCRIPTS / "dd_prompt.txt").read_text() + dd_input,
-                     dd_model, tools=DD_TOOLS, mcp=True, timeout=420)
+                     dd_model, tools=DD_TOOLS, mcp=True, timeout=dd_timeout)
     if out is None:
         return {"symbol": sym, "decision": "error", "error": "dd_model_failed", "conviction": None,
                 "dollar_amount": None, "reason": "", "catalysts": [], "risks": []}
@@ -215,12 +219,18 @@ def main() -> int:
             "open_positions": context["portfolio"].get("open_positions", len(positions_ctx)),
             "held": [p["symbol"] for p in positions_ctx],
         }
+        shortlist = []
         for c in candidates[:max_dd]:
             sym = str(c.get("symbol", "")).upper().strip()
-            if not sym:
-                continue
-            # Serve a fresh cached verdict, applying the right TTL per decision: commits live longer
-            # than rejects; errors are never cached so they retry. reject_ttl=0 disables reject reuse.
+            if sym:
+                shortlist.append((sym, c))
+
+        # Serve fresh cached verdicts synchronously (commits live longer than rejects; errors are
+        # never cached so they retry; reject_ttl=0 disables reject reuse). Cache misses need a fresh
+        # Stage-2 call and go to the parallel pool below.
+        cache_hits = {}
+        fresh_jobs = []
+        for sym, c in shortlist:
             res = None
             cached = cache.get(sym)
             if cached:
@@ -229,20 +239,51 @@ def main() -> int:
                 ttl = commit_ttl if cdec == "commit" else (reject_ttl if cdec == "reject" else 0)
                 if ttl > 0 and age < ttl:
                     res = {**cached["result"], "cached": True, "cached_age_min": int(age / 60)}
-            if res is None:
+            if res is not None:
+                cache_hits[sym] = res
+            else:
+                fresh_jobs.append((sym, c))
+
+        # Run the cache-miss DDs CONCURRENTLY. Each run_dd is subprocess-bound (dd_probe + a headless
+        # `claude` web-research call), so it releases the GIL and threads give true parallelism.
+        # Serial DD was the cause of ticks overrunning the 5-min launchd cadence — 2-3 fresh DDs cost
+        # the SUM of their web-research calls; in parallel the tick's wall-clock is the SLOWEST single
+        # DD instead. Cache + long-term-memory writes stay on the main thread (after the pool drains)
+        # to avoid races.
+        fresh_results = {}
+        if fresh_jobs:
+            def timed_dd(cand):
                 t0 = time.time()
-                res = run_dd(c, regime, caps, portfolio, dd_model)
-                # Cache commits and rejects (each reused under its own TTL at read time); never cache
-                # an error — a transient model/timeout failure must be retried, not frozen.
-                if res.get("decision") in ("commit", "reject"):
-                    cache[sym] = {"ts": now, "result": res}
-                    cache_dirty = True
-                    # Persist the main points to long-term memory and auto-exclude a never-buy name.
-                    memory.record(sym, decision=res["decision"], conviction=res.get("conviction"),
-                                  reason=res.get("reason", ""), catalysts=res.get("catalysts"),
-                                  risks=res.get("risks"), next_earnings_date=res.get("next_earnings_date"),
-                                  never_buy=res.get("never_buy"), never_buy_reason=res.get("never_buy_reason"))
-                res = {**res, "dd_elapsed_s": round(time.time() - t0, 1)}  # annotate in-memory copy
+                r = run_dd(cand, regime, caps, portfolio, dd_model)
+                return {**r, "dd_elapsed_s": round(time.time() - t0, 1)}
+            workers = min(len(fresh_jobs), int(os.environ.get("DD_MAX_PARALLEL", "4")))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(timed_dd, c): sym for sym, c in fresh_jobs}
+                for fut in concurrent.futures.as_completed(futs):
+                    sym = futs[fut]
+                    try:
+                        fresh_results[sym] = fut.result()
+                    except Exception as e:  # one DD blowing up must not sink the whole tick
+                        fresh_results[sym] = {"symbol": sym, "decision": "error",
+                                              "error": f"dd_exception: {e}", "conviction": None,
+                                              "dollar_amount": None, "reason": "", "catalysts": [],
+                                              "risks": []}
+
+        # Reassemble in screen order: cache + persist fresh commits/rejects, then build buy actions.
+        for sym, c in shortlist:
+            res = cache_hits.get(sym) or fresh_results.get(sym)
+            if res is None:
+                continue
+            # Cache commits and rejects (each reused under its own TTL at read time); never cache an
+            # error — a transient model/timeout failure must be retried, not frozen.
+            if not res.get("cached") and res.get("decision") in ("commit", "reject"):
+                cache[sym] = {"ts": now, "result": {k: v for k, v in res.items() if k != "dd_elapsed_s"}}
+                cache_dirty = True
+                # Persist the main points to long-term memory and auto-exclude a never-buy name.
+                memory.record(sym, decision=res["decision"], conviction=res.get("conviction"),
+                              reason=res.get("reason", ""), catalysts=res.get("catalysts"),
+                              risks=res.get("risks"), next_earnings_date=res.get("next_earnings_date"),
+                              never_buy=res.get("never_buy"), never_buy_reason=res.get("never_buy_reason"))
             dd_results.append(res)
             if res.get("decision") == "commit" and res.get("dollar_amount"):
                 tag = f"DD/{res.get('conviction', '?')}" + ("/cached" if res.get("cached") else "")
