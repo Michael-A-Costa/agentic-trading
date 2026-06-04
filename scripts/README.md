@@ -5,11 +5,19 @@ account or place orders — they assess the market and log. Order execution live
 engine, which is agent-driven via the MCP.
 
 ## `market_conditions.py` — market-regime checker
-Pulls index ETFs (SPY/QQQ/IWM/DIA) + VIXY (VIX proxy) from Stooq's **keyless** CSV endpoint,
-classifies the session's **posture / volatility / breadth**, prints a one-line summary, and
-appends a structured record to `data/market_conditions.jsonl`. **Stdlib only** — nothing to
-`pip install`. Self-accumulates SPY closes so a trend signal comes online after ~5 logged
-sessions.
+Pulls index ETFs (SPY/QQQ/IWM/DIA) + VIXY (VIX proxy), classifies the session's
+**posture / volatility / breadth**, prints a one-line summary, and appends a structured record
+to `data/market_conditions.jsonl`. **Stdlib only** — nothing to `pip install`. Self-accumulates
+SPY closes so a trend signal comes online after ~5 logged sessions.
+
+**Data sources — automatic failover (logged as `source`):** every run tries them in order until
+one returns index data, so a single provider outage/throttle doesn't blind the engine. All three
+are keyless and independent:
+1. **Stooq** (primary) — one batch CSV request for all symbols, + one retry.
+2. **Cboe** delayed-quotes JSON (fallback 1) — per-symbol.
+3. **Yahoo** chart API (fallback 2) — per-symbol.
+
+If all three fail, the run logs an `error` record (and exits non-zero) rather than crashing.
 
 ```bash
 python3 scripts/market_conditions.py          # check + log + summary

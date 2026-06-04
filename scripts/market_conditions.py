@@ -29,6 +29,7 @@ import json
 import sys
 import urllib.request
 import urllib.error
+import urllib.parse
 from datetime import datetime, time, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -44,42 +45,130 @@ VIX_PROXY = "VIXY"
 ALL_SYMBOLS = INDEXES + [VIX_PROXY]
 
 STOOQ_URL = "https://stooq.com/q/l/?s={syms}&f=sd2t2ohlcv&h&e=csv"
+CBOE_URL = "https://cdn.cboe.com/api/global/delayed_quotes/quotes/{sym}.json"
+YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=1d&interval=1d"
 HTTP_TIMEOUT = 12
-UA = "Mozilla/5.0 (agentic-trading market_conditions.py)"
+# A browser-ish UA helps the Yahoo fallback (anonymous chart API 429s bare clients).
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
 
-# --------------------------------------------------------------------------- fetch
-def fetch_quotes(symbols: list[str]) -> dict[str, dict]:
-    """Return {SYMBOL: {open, high, low, last, volume, date, time}} from Stooq (keyless)."""
-    syms = "+".join(f"{s.lower()}.us" for s in symbols)
-    url = STOOQ_URL.format(syms=syms)
+def _http_get(url: str) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-        text = resp.read().decode("utf-8", errors="replace")
+        return resp.read().decode("utf-8", errors="replace")
 
+
+def _fnum(v) -> float | None:
+    try:
+        return float(str(v).strip())
+    except (ValueError, TypeError):
+        return None
+
+
+# --------------------------------------------------------------------------- fetch: primary (Stooq)
+def fetch_stooq(symbols: list[str]) -> dict[str, dict]:
+    """{SYMBOL: {open,high,low,last,volume,date,time}} from Stooq's keyless batch CSV (one request)."""
+    syms = "+".join(f"{s.lower()}.us" for s in symbols)
+    text = _http_get(STOOQ_URL.format(syms=syms))
     out: dict[str, dict] = {}
     for row in csv.DictReader(io.StringIO(text)):
         sym = (row.get("Symbol") or "").split(".")[0].upper()
         if not sym:
             continue
-
-        def num(key):
-            v = (row.get(key) or "").strip()
-            try:
-                return float(v)
-            except ValueError:
-                return None
-
         out[sym] = {
-            "open": num("Open"),
-            "high": num("High"),
-            "low": num("Low"),
-            "last": num("Close"),  # Stooq "Close" is the latest print intraday
-            "volume": num("Volume"),
+            "open": _fnum(row.get("Open")),
+            "high": _fnum(row.get("High")),
+            "low": _fnum(row.get("Low")),
+            "last": _fnum(row.get("Close")),  # Stooq "Close" is the latest print intraday
+            "volume": _fnum(row.get("Volume")),
             "date": (row.get("Date") or "").strip(),
             "time": (row.get("Time") or "").strip(),
         }
     return out
+
+
+# --------------------------------------------------------------------------- fetch: fallback 1 (Cboe)
+def fetch_cboe(symbols: list[str]) -> dict[str, dict]:
+    """Same shape, from Cboe's keyless delayed-quotes JSON (one request per symbol)."""
+    out: dict[str, dict] = {}
+    for s in symbols:
+        try:
+            d = json.loads(_http_get(CBOE_URL.format(sym=urllib.parse.quote(s.upper()))))
+            data = d.get("data") or {}
+            if not data:
+                continue
+            date, _, tm = (d.get("timestamp") or "").strip().partition(" ")
+            out[s.upper()] = {
+                "open": _fnum(data.get("open")),
+                "high": _fnum(data.get("high")),
+                "low": _fnum(data.get("low")),
+                "last": _fnum(data.get("current_price") if data.get("current_price") is not None
+                              else data.get("close")),
+                "volume": _fnum(data.get("volume")),
+                "date": date,
+                "time": tm,
+            }
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError):
+            continue
+    return out
+
+
+# --------------------------------------------------------------------------- fetch: fallback 2 (Yahoo)
+def fetch_yahoo(symbols: list[str]) -> dict[str, dict]:
+    """Same shape, from Yahoo's keyless chart API (one request per symbol). Used only if Stooq fails."""
+    out: dict[str, dict] = {}
+    for s in symbols:
+        try:
+            data = json.loads(_http_get(YAHOO_URL.format(sym=urllib.parse.quote(s))))
+            res = (data.get("chart", {}).get("result") or [None])[0]
+            if not res:
+                continue
+            meta = res.get("meta", {})
+            q = (res.get("indicators", {}).get("quote") or [{}])[0]
+            opens = [x for x in (q.get("open") or []) if x is not None]
+            ts = meta.get("regularMarketTime")
+            when = datetime.fromtimestamp(ts, ET) if ts else None
+            out[s.upper()] = {
+                "open": _fnum(opens[-1]) if opens else _fnum(meta.get("chartPreviousClose")),
+                "high": _fnum(meta.get("regularMarketDayHigh")),
+                "low": _fnum(meta.get("regularMarketDayLow")),
+                "last": _fnum(meta.get("regularMarketPrice")),
+                "volume": _fnum(meta.get("regularMarketVolume")),
+                "date": when.strftime("%Y-%m-%d") if when else "",
+                "time": when.strftime("%H:%M:%S") if when else "",
+            }
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError):
+            continue  # skip this symbol; orchestrator decides if the whole fetch failed
+    return out
+
+
+def _has_indexes(quotes: dict[str, dict]) -> bool:
+    """A usable fetch must have a last price for at least one index ETF."""
+    return any(quotes.get(s, {}).get("last") is not None for s in INDEXES)
+
+
+# --------------------------------------------------------------------------- fetch: orchestrator
+def fetch_quotes(symbols: list[str]) -> tuple[dict[str, dict], str]:
+    """Try sources in order until one returns index data. Returns (quotes, source). Raises if all fail.
+
+    Chain: Stooq (primary, batch + 1 retry) -> Cboe (fallback 1) -> Yahoo (fallback 2). All three are
+    independent keyless providers, so a single provider's outage or throttle doesn't blind the engine.
+    """
+    last_err: Exception | None = None
+    attempts = [
+        ("stooq", fetch_stooq),
+        ("stooq(retry)", fetch_stooq),
+        ("cboe(fallback)", fetch_cboe),
+        ("yahoo(fallback)", fetch_yahoo),
+    ]
+    for label, fn in attempts:
+        try:
+            q = fn(symbols)
+            if _has_indexes(q):
+                return q, label
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last_err = e
+    raise RuntimeError(f"all sources failed (last error: {last_err})")
 
 
 # --------------------------------------------------------------------------- session
@@ -216,10 +305,11 @@ def build_record() -> dict:
     session, is_open = session_state(now_et)
 
     error = None
+    source = None
     quotes: dict[str, dict] = {}
     try:
-        quotes = fetch_quotes(ALL_SYMBOLS)
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        quotes, source = fetch_quotes(ALL_SYMBOLS)
+    except (urllib.error.URLError, TimeoutError, OSError, RuntimeError) as e:
         error = f"fetch_failed: {e}"
 
     record = {
@@ -227,6 +317,7 @@ def build_record() -> dict:
         "ts_et": now_et.isoformat(timespec="seconds"),
         "session": session,
         "market_open": is_open,
+        "source": source,
         "quotes": quotes,
     }
     if error:
@@ -256,7 +347,7 @@ def summarize(record: dict) -> str:
     trend_s = (f"trend {trend['trend']} (SPY {trend['spy_last']} vs MA{trend['sessions_used']})"
                if trend.get("available") else f"trend: {trend.get('note', 'n/a')}")
     return (
-        f"[{record['ts_et']}] {record['session'].upper()} | "
+        f"[{record['ts_et']}] {record['session'].upper()} src={record.get('source')} | "
         f"POSTURE={a['posture'].upper()} vol={a['volatility_regime']} breadth={a['breadth_regime']} "
         f"({a['breadth_green']}/{a['breadth_total']}) | {moves} {vix_s} | {trend_s}"
     )
