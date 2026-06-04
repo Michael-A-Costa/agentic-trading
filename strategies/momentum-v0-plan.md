@@ -144,8 +144,10 @@ A multi-dimension review (safety / algo / prompts / flows / code / docs) drove t
 - **Risk inversion fixed:** on a `circuit_breaker` SKIP the engine still runs **protective exits**
   (it halts entries, not stops) — but stays idle on stale/closed-market SKIPs.
 - **Atomic state writes** + refuse-on-corrupt-state (no silent re-baseline of the breaker).
-- **Live-mode fail-closed:** the wrapper and executor refuse `TRADING_MODE=live` until a real
-  `review → place` path exists.
+- **Live-mode fail-closed:** the wrapper and paper executor refused `TRADING_MODE=live` until a real
+  `review → place` path existed. *(Superseded: the live path is now BUILT — `live_execute.py` +
+  `rh_mcp.py`; see "Live execution architecture" above. Live still fails closed on a missing broker
+  snapshot, and only places when `LIVE_ARMED=1`.)*
 - **Flow:** a DD model timeout/parse-failure is now `error` (retried next tick), never a cached
   "reject"; a `commit` without a valid size downgrades to reject; Stage-2 is portfolio-aware
   (headroom, open positions, held names) and gets `range_pos` / relative strength.

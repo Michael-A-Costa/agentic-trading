@@ -5,10 +5,11 @@ Headless jobs for the agentic-trading engine. Two groups:
 1. **Market-data / regime** (`market_conditions.py`, `run_market_check.sh`) — read-only, public
    data, touch no account. Stdlib-only.
 2. **Trading tick pipeline** (`run_trading_tick.sh` → `tick_context.py` → `dd_probe.py` →
-   `decide.py` → `apply_decision.py`) — the actual engine. In **PAPER mode it simulates fills**
-   against live public quotes and tracks a local portfolio in `data/paper_state.json`; it places
-   **no real orders**. Live mode (real MCP `review → place`) is not yet wired — the wrapper refuses
-   to run with `TRADING_MODE=live`. See the **Trading engine** section below.
+   `decide.py` → executor) — the actual engine. In **PAPER mode** (`apply_decision.py`) it simulates
+   fills against live public quotes and tracks a local portfolio in `data/paper_state.json`; it
+   places **no real orders**. In **LIVE mode** (`broker_snapshot.py` + `live_execute.py`) it places
+   real MCP orders (`review → place`) — gated by `LIVE_ARMED` (dry-run vs armed). See **Trading
+   engine** and **Live trading** below. Default ships at `TRADING_MODE=paper`.
 
 **Prereqs:** the data/regime scripts are stdlib-only. The tick pipeline additionally needs the
 `claude` CLI on `PATH` (or `AGENTIC_CLAUDE`) for the Stage-2 DD call, and Python 3.11 (or
@@ -191,8 +192,13 @@ power · daily breaker on broker start-of-day equity · fail-closed snapshot · 
 every whole-share lot · full audit log with order ids.
 **Kill switch:** set `TRADING_MODE=paper`, set `LIVE_ARMED=0`, or disconnect the MCP.
 
-> NOTE: the exact JSON field names returned by the RH read tools are mapped defensively in
-> `live_execute.parse_snapshot` / `tick_context.load_live_state`; confirm/adjust them against the
-> first real dry-run output (`data/tick/broker_snapshot.json`).
+**Verified live (2026-06-04):** a full `review → place → confirm → cancel` round-trip on a
+non-executing 1-share limit (0 filled, $0 fees) confirmed the path against real Robinhood. The RH
+tool JSON shapes are now mapped to the real responses (every result is wrapped in `data`;
+`buying_power` is nested under `data.buying_power.buying_power`; quotes are `data.results[].quote`; a
+resting stop is identified by a non-null `stop_price`; review alerts live in `data.order_checks`,
+where `{}` = clear and a routine `EQUITY_SUITABILITY` disclosure is non-blocking). One operational
+prerequisite surfaced: the account's **investor profile must be completed** or `place` 400s before
+the second trade.
 
-Pure-logic unit tests (no MCP, no orders): `python3 scripts/test_live_execute.py`.
+Pure-logic unit tests (no MCP, no orders): `python3 scripts/test_live_execute.py` (38 assertions).
