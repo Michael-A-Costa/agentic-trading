@@ -125,6 +125,7 @@ def main() -> int:
         positions.append({
             "symbol": sym, "qty": round(qty, 6), "entry_price": entry,
             "last": lp, "value": round(val, 2), "pnl_usd": round(pnl, 2), "pnl_pct": pnl_pct,
+            "stop_price": p.get("stop_price"), "take_profit_price": p.get("take_profit_price"),
         })
 
     equity = round(state["cash"] + pos_value, 2)
@@ -164,13 +165,19 @@ def main() -> int:
     sig = caps["SIGNAL_THRESHOLD_PCT"]
     exits = []
     for p in positions:
-        pp = p.get("pnl_pct")
-        if pp is None:
+        lp, pp = p.get("last"), p.get("pnl_pct")
+        sp, tpp = p.get("stop_price"), p.get("take_profit_price")
+        if lp is None:
             continue
-        if pp >= tp:
-            exits.append({"symbol": p["symbol"], "reason": f"take-profit {pp}% >= {tp}%"})
-        elif pp <= -sl:
+        # Prefer the explicit per-position stop/TP levels set at buy; fall back to the % rule.
+        if sp is not None and lp <= sp:
+            exits.append({"symbol": p["symbol"], "reason": f"stop hit: {lp} <= stop {sp} ({pp}%)"})
+        elif tpp is not None and lp >= tpp:
+            exits.append({"symbol": p["symbol"], "reason": f"take-profit hit: {lp} >= {tpp} ({pp}%)"})
+        elif sp is None and pp is not None and pp <= -sl:
             exits.append({"symbol": p["symbol"], "reason": f"stop-loss {pp}% <= -{sl}%"})
+        elif tpp is None and pp is not None and pp >= tp:
+            exits.append({"symbol": p["symbol"], "reason": f"take-profit {pp}% >= {tp}%"})
 
     # Entry candidates = movers above the signal threshold, in a non-hostile regime, not already
     # held. Ranked by intraday strength. Stage 2 (Sonnet + DD) makes the real commit decision.

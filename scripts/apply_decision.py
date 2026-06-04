@@ -117,15 +117,20 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
             result["reject_reason"] = f"insufficient cash ({round(state['cash'], 2)})"
             return result
 
-        # --- fill ---
+        # --- fill + attach a protective stop / take-profit level (engine-enforced each tick) ---
         prev = positions.get(sym, {"qty": 0.0, "entry_price": price})
         new_qty = prev["qty"] + qty
         new_entry = (prev["qty"] * prev["entry_price"] + qty * price) / new_qty
+        sl, tp = caps.get("STOP_LOSS_PCT", 2.0), caps.get("TAKE_PROFIT_PCT", 4.0)
         positions[sym] = {"qty": new_qty, "entry_price": round(new_entry, 4),
-                          "entry_ts": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+                          "entry_ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                          "stop_price": round(new_entry * (1 - sl / 100), 4),
+                          "take_profit_price": round(new_entry * (1 + tp / 100), 4)}
         state["cash"] -= notional
         result.update(status="filled", qty=round(qty, 6), price=price,
-                      notional=round(notional, 2))
+                      notional=round(notional, 2),
+                      stop_price=positions[sym]["stop_price"],
+                      take_profit_price=positions[sym]["take_profit_price"])
         return result
 
     # side == "sell"
