@@ -158,6 +158,15 @@ def main() -> int:
     }
     regime = latest_regime()
 
+    # --- data freshness / entry permission ---
+    # A quote is only a LIVE signal during regular hours AND when it carries today's date.
+    # Off-hours quotes are the prior session's close — never a basis for a NEW entry.
+    spy_date = (quotes.get("SPY") or {}).get("date")
+    data_stale = (spy_date != today) if spy_date else True
+    allow_entries = bool(is_open and not data_stale)
+    stale_reason = ("market_not_open" if not is_open
+                    else f"stale_quote_date={spy_date}" if data_stale else "")
+
     # --- GATE decision (deterministic; the wrapper branches on this) ---
     gate, reason = "TRADE", ""
     if fetch_error or not mc._has_indexes({s: quotes.get(s, {}) for s in candidates}):
@@ -174,6 +183,9 @@ def main() -> int:
         "session": session,
         "market_open": is_open,
         "allow_offhours": allow_offhours,
+        "allow_entries": allow_entries,
+        "data_stale": data_stale,
+        "stale_reason": stale_reason,
         "quote_source": source,
         "regime": regime,
         "portfolio": {
@@ -195,6 +207,8 @@ def main() -> int:
     # Compact packet for the LLM (only what it needs to decide).
     packet = {
         "mode": context["mode"],
+        "allow_entries": allow_entries,   # false => exits/HOLD only; no new positions
+        "data_stale": data_stale,
         "regime": {k: regime.get(k) for k in
                    ("posture", "volatility_regime", "breadth_regime", "session")},
         "portfolio": context["portfolio"],

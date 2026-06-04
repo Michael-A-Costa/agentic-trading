@@ -80,6 +80,12 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
     positions = state["positions"]
 
     if side == "buy":
+        # HARD GUARD: never open a new position on stale / off-hours data, regardless of what the
+        # LLM proposed. allow_entries is True only during regular hours with today's quote.
+        if not context.get("allow_entries", False):
+            result["reject_reason"] = f"entries disabled ({context.get('stale_reason') or 'market closed/stale'})"
+            return result
+
         # Resolve quantity from dollar_amount or qty.
         if action.get("dollar_amount") is not None:
             notional = float(action["dollar_amount"])
