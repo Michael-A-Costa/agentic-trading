@@ -6,40 +6,94 @@ Runs only in Stage 2 (when the cheap screen flags a real entry candidate), so co
 Gathers quantitative DD from public sources — NO LLM tokens spent here — and writes a compact
 JSON the Stage-2 commit model (DD_MODEL, default Sonnet, with web news search) then judges.
 
-Signals:
-  - multi-timeframe trend: 1/5/20-day returns, vs 20/50-day MA, distance from 3-mo high/low
-  - relative volume (today vs 20-day average)  — is the move backed by volume?
-  - volatility: 20-day annualized realized vol, plus Cboe IV30
-  - liquidity/cost: bid/ask spread %  — the edge must clear the spread
-  - gap %, range position
-  - convenience flags: trend_up, volume_confirmed, extended, spread_ok
+PRIMARY signals (keyless, from Cboe live quote — reliable, always computed):
+  - intraday move %, gap %, range position (where in today's H-L we sit; 1.0 = at the high)
+  - liquidity: today's $-volume and bid/ask spread %  — the edge must clear the spread
+  - IV30
+  - flags: spread_ok, liquid, iv_ok, parabolic  (these are the real gate)
 
-Sources: Yahoo daily history (3mo) for trend/vol/volume; Cboe live quote for bid/ask/IV30/gap.
-Both keyless. Degrades gracefully (nulls) if a source is unavailable.
+HISTORY signals (keyless daily OHLCV from Cboe's CDN charts endpoint — same provider as the live
+quote, deep history, no key; Yahoo is a 429-prone fallback). Enrichment, not a hard requirement:
+  - multi-timeframe trend: 1/5/20-day returns, vs 20/50-day MA, distance from 3-mo high/low
+  - relative volume — PACE-adjusted (today's partial volume vs the same fraction of a normal day)
+  - 20-day realized vol
+  - flags: trend_up, volume_confirmed, extended, at_high
+
+`history_ok` says whether the bonus block is real. When history is missing, the bonus flags are
+**null (unknown), never false** — a data blackout must not masquerade as weak momentum. A true
+data problem (no live price/liquidity at all) sets `error` so the commit model rejects on H1.
 
 Usage:  python3 scripts/dd_probe.py META            # prints JSON, also writes data/tick/dd_META.json
 """
 from __future__ import annotations
 
 import json
+import os
 import statistics
 import sys
 import urllib.parse
+from datetime import datetime
 from pathlib import Path
 
-import market_conditions as mc  # sibling: _http_get, _fnum, CBOE_URL, ET
+import market_conditions as mc  # sibling: _http_get, _fnum, CBOE_URL, ET, session_state
 
 REPO = Path(__file__).resolve().parent.parent
-TICK = REPO / "data" / "tick"
+DATA = REPO / "data"
+TICK = DATA / "tick"
+HISTORY_DIR = DATA / "history"   # per-symbol daily-bar cache: data/history/{SYM}.json
+# Daily history is KEYLESS again via Cboe's CDN (same provider as the live quote): deep OHLCV,
+# no key, no throttling. Yahoo stays only as a last-resort fallback (it's usually 429-throttled).
+CBOE_HIST = "https://cdn.cboe.com/api/global/delayed_quotes/charts/historical/{sym}.json"
 YH = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=3mo&interval=1d"
+HIST_DAYS = 66   # keep only ~3 trading months, so MA20/50, 20d-vol, and the 3-MO high/low are
+                 # computed over a 3-month window (the CDN returns full history back to IPO).
+
+# Keyless quality thresholds (intraday signals from Cboe — no daily history needed). Tunable.
+LIQ_FLOOR_USD = 5_000_000   # >= $5M traded today = liquid enough for our small paper sizes
+IV_CEIL = 80.0              # iv30 above this = too jumpy for a ~5-min synthetic stop to protect
+PARABOLIC_GAP_PCT = 8.0     # gapped >8% at the open = blow-off / chase risk
+PARABOLIC_MOVE_PCT = 5.0    # >5% intraday AND pinned at the day's high = extended chase
 
 
 def pct(a: float, b: float) -> float | None:
     return round((a / b - 1) * 100, 2) if (a is not None and b) else None
 
 
+def session_fraction() -> float:
+    """Fraction of the 9:30–16:00 ET regular session elapsed (clamped to [0.05, 1.0]).
+
+    Returns 1.0 outside regular hours. Used to PACE today's partial cumulative volume against the
+    20-day average: comparing a half-day's volume to a full-day average understates it ~2x, which
+    would wrongly read 'weak volume' on a name actually trading hot — so we scale the average down
+    by how much of the session has elapsed.
+    """
+    now_et = datetime.now(mc.ET)
+    _, is_open = mc.session_state(now_et)
+    if not is_open:
+        return 1.0
+    mins = (now_et.hour * 60 + now_et.minute) - (9 * 60 + 30)
+    return max(0.05, min(1.0, mins / 390.0))
+
+
+def _fetch_cboe_history(sym: str) -> dict:
+    """Last ~3 months of daily {closes, volumes} from Cboe's CDN (keyless). {} on failure.
+
+    The endpoint returns full history (back to IPO) oldest->newest; we keep only the last HIST_DAYS
+    bars so the 3-mo-high/low and moving-average windows mean what they say. Each bar that lacks a
+    close OR a volume is dropped as a pair, so closes[] and volumes[] stay index-aligned.
+    """
+    try:
+        d = json.loads(mc._http_get(CBOE_HIST.format(sym=urllib.parse.quote(sym.upper()))))
+        bars = d.get("data") or []
+        pairs = [(mc._fnum(b.get("close")), mc._fnum(b.get("volume"))) for b in bars]
+        pairs = [(c, v) for (c, v) in pairs if c is not None and v is not None][-HIST_DAYS:]
+        return {"closes": [c for c, _ in pairs], "volumes": [v for _, v in pairs]} if pairs else {}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+
+
 def yahoo_history(sym: str) -> dict:
-    """Daily closes/volumes for the last ~3 months from Yahoo (keyless). {} on failure."""
+    """Fallback daily history from Yahoo (keyless, but frequently 429-throttled). {} on failure."""
     try:
         d = json.loads(mc._http_get(YH.format(sym=urllib.parse.quote(sym))))
         res = (d.get("chart", {}).get("result") or [None])[0]
@@ -53,6 +107,52 @@ def yahoo_history(sym: str) -> dict:
         return {}
 
 
+def _read_history_cache(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _write_history_cache(path: Path, sym: str, hist: dict, src: str, today: str) -> None:
+    """Atomically persist a symbol's daily bars (temp + os.replace, so a crash can't truncate)."""
+    rec = {"symbol": sym, "source": src, "fetched_date": today,
+           "fetched_ts_et": datetime.now(mc.ET).isoformat(timespec="seconds"),
+           "n_bars": len(hist["closes"]),
+           "closes": hist["closes"], "volumes": hist["volumes"]}
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(rec))
+    os.replace(tmp, path)
+
+
+def load_history(sym: str) -> tuple[dict, str | None]:
+    """Daily history for trend/MA/volume, cached per symbol in data/history/{SYM}.json.
+
+    Daily bars only finalize after the close, so one fetch per symbol per ET day is enough — a cache
+    written today is served as-is. On a stale/missing cache we fetch (Cboe CDN primary, Yahoo
+    fallback) and rewrite the file. If every live fetch fails we fall back to the stale cache, so a
+    brief Cboe outage doesn't blind DD. Returns (hist, source_label).
+    """
+    sym = sym.upper()
+    today = datetime.now(mc.ET).strftime("%Y-%m-%d")
+    path = HISTORY_DIR / f"{sym}.json"
+    cached = _read_history_cache(path)
+    if cached and cached.get("fetched_date") == today and cached.get("closes"):
+        return {"closes": cached["closes"], "volumes": cached["volumes"]}, cached.get("source")
+
+    hist, src = _fetch_cboe_history(sym), "cboe"
+    if not hist.get("closes"):
+        hist, src = yahoo_history(sym), "yahoo"
+    if hist.get("closes"):
+        _write_history_cache(path, sym, hist, src, today)
+        return hist, src
+
+    if cached and cached.get("closes"):   # live fetch failed -> last-known-good beats blind
+        return {"closes": cached["closes"], "volumes": cached["volumes"]}, (cached.get("source") or "cache")
+    return {}, None
+
+
 def cboe_quote(sym: str) -> dict:
     try:
         d = json.loads(mc._http_get(mc.CBOE_URL.format(sym=urllib.parse.quote(sym.upper()))))
@@ -63,25 +163,45 @@ def cboe_quote(sym: str) -> dict:
 
 def probe(sym: str) -> dict:
     sym = sym.upper()
-    hist = yahoo_history(sym)
+    hist, hist_src = load_history(sym)
     cb = cboe_quote(sym)
     closes = hist.get("closes") or []
     vols = hist.get("volumes") or []
 
-    out: dict = {"symbol": sym, "sources": {"yahoo_history": bool(closes), "cboe": bool(cb)}}
+    # history_ok drives the rubric: when false, daily trend/volume flags are null (unknown), NOT
+    # false — a data blackout must never read as 'weak momentum'. Cboe intraday is the primary source.
+    out: dict = {"symbol": sym, "sources": {"history": hist_src or False, "cboe_quote": bool(cb)},
+                 "history_ok": bool(closes)}
 
-    # --- live quote / liquidity / gap (Cboe) ---
+    # --- live quote / liquidity / gap / intraday structure (Cboe — keyless, always-on) ---
     last = mc._fnum(cb.get("current_price")) or (closes[-1] if closes else None)
     bid, ask = mc._fnum(cb.get("bid")), mc._fnum(cb.get("ask"))
     prev_close = mc._fnum(cb.get("prev_day_close"))
     day_open = mc._fnum(cb.get("open"))
+    day_high, day_low = mc._fnum(cb.get("high")), mc._fnum(cb.get("low"))
+    today_vol = mc._fnum(cb.get("volume"))
     spread_pct = round((ask - bid) / ((ask + bid) / 2) * 100, 3) if (bid and ask and ask + bid) else None
+    # intraday move vs prior close, and where in today's range we sit (1.0 = at the high = extended)
+    intraday_pct = mc._fnum(cb.get("price_change_percent"))
+    if intraday_pct is None and last and prev_close:
+        intraday_pct = pct(last, prev_close)
+    range_pos = (round((last - day_low) / (day_high - day_low), 3)
+                 if (last is not None and day_high and day_low and day_high > day_low) else None)
+    dollar_vol = round(today_vol * last, 0) if (today_vol and last) else None
     out.update(
         last=last,
         bid=bid, ask=ask, spread_pct=spread_pct,
         iv30=mc._fnum(cb.get("iv30")),
         gap_pct=pct(day_open, prev_close) if (day_open and prev_close) else None,
+        intraday_pct=intraday_pct, range_pos=range_pos,
+        today_volume=today_vol, dollar_volume_today=dollar_vol,
     )
+    # Hard data problem only when we can't even confirm a live price/liquidity (Cboe down too).
+    if last is None or spread_pct is None:
+        out["error"] = "no_live_quote"
+    out["data_note"] = (f"full history ({hist_src}) + intraday available" if closes
+                        else "daily history unavailable (Cboe CDN + Yahoo both failed) — "
+                             "trend/volume flags are null; judging on intraday + catalyst")
 
     # --- trend / momentum (history) ---
     if closes:
@@ -102,28 +222,40 @@ def probe(sym: str) -> dict:
         if len(c) >= 21:
             rets = [(c[i] / c[i - 1] - 1) for i in range(len(c) - 20, len(c))]
             out["realized_vol_20d_annual_pct"] = round(statistics.pstdev(rets) * (252 ** 0.5) * 100, 1)
-    # --- relative volume ---
+    # --- relative volume (PACE-adjusted: today's partial cumulative volume vs the same fraction of
+    # a normal day, so a heavy-volume name reads as confirmed at midday, not only at the close) ---
     if vols:
-        today_vol = mc._fnum(cb.get("volume")) or (vols[-1] if vols else None)
         avg20 = round(statistics.fmean(vols[-20:]), 0) if len(vols) >= 20 else None
-        out["volume"] = today_vol
+        frac = session_fraction()
         out["avg_volume_20d"] = avg20
-        out["rel_volume"] = round(today_vol / avg20, 2) if (today_vol and avg20) else None
+        out["session_frac"] = round(frac, 2)
+        out["rel_volume"] = (round(today_vol / (avg20 * frac), 2)
+                             if (today_vol and avg20 and frac > 0) else None)
 
-    # --- convenience flags for the commit model (None-safe) ---
+    # --- flags for the commit model ---
+    # KEYLESS (always computed from Cboe — these are the primary gate now):
+    #   spread_ok / liquid / iv_ok = tradeability; parabolic = chase guard.
+    # HISTORY BONUS (null when history_ok is false — never false-on-missing-data):
+    #   trend_up / volume_confirmed / extended / at_high enrich the call when daily data exists.
     d20 = out.get("dist_ma20_pct")
     d50 = out.get("dist_ma50_pct")
     rv = out.get("rel_volume")
     d3h = out.get("dist_3mo_high_pct")
+    iv = out.get("iv30")
     out["flags"] = {
-        "trend_up": (d20 is not None and d20 > 0) and (d50 is not None and d50 > 0),
-        "volume_confirmed": rv is not None and rv >= 1.2,
-        # 'extended' = stretched FAR above its own 20d mean (mean-reversion risk). Being near the
-        # 3-mo high is NOT 'extended' — a breakout to new highs on volume is the momentum setup we
-        # want, not a disqualifier. 'at_high' is reported separately as informational context.
-        "extended": d20 is not None and d20 > 12,
-        "at_high": d3h is not None and d3h > -1.0,  # within ~1% of the 3-mo high (info, not a veto)
+        # keyless tradeability / structure
         "spread_ok": spread_pct is not None and spread_pct < 0.5,
+        "liquid": dollar_vol is not None and dollar_vol >= LIQ_FLOOR_USD,
+        "iv_ok": iv is None or iv < IV_CEIL,           # unknown IV -> don't veto on it
+        "parabolic": bool((out.get("gap_pct") is not None and out["gap_pct"] > PARABOLIC_GAP_PCT)
+                          or (range_pos is not None and range_pos > 0.98
+                              and (intraday_pct or 0) > PARABOLIC_MOVE_PCT)),
+        # history bonus — null (unknown) when history is unavailable, so the model never reads a
+        # data blackout as 'weak momentum'. Present => real confirmation signal.
+        "trend_up": ((d20 > 0 and d50 > 0) if (closes and d20 is not None and d50 is not None) else None),
+        "volume_confirmed": (rv >= 1.2 if (closes and rv is not None) else None),
+        "extended": (d20 > 12 if (closes and d20 is not None) else None),
+        "at_high": (d3h > -1.0 if (closes and d3h is not None) else None),
     }
     return out
 
