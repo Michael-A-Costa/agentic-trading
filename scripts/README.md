@@ -79,7 +79,17 @@ deterministic Python:
      then judges on intraday + catalyst.
 4. **`decide.py`** — for each candidate: run `dd_probe`, then the Stage-2 DD model (`DD_MODEL`,
    default Sonnet, with WebSearch/WebFetch + a live MCP quote) returns commit/reject + size.
-   Per-symbol TTL cache (`DD_CACHE_TTL_MIN`); failures are not cached.
+   Per-symbol cache with split TTLs — commits reused for `DD_CACHE_TTL_MIN`, rejects for the shorter
+   `DD_REJECT_TTL_MIN` (so discovery re-surfacing the same movers doesn't re-burn DD every tick);
+   errors are never cached. Each DD is **primed with our long-term memory** of the name and writes
+   its main points back (see below).
+   - **`stock_memory.py`** — long-term, per-symbol evaluation memory (`data/stock_memory.json`),
+     separate from the short DD cache. Every verdict's main points (decision, summary, catalysts,
+     risks, next earnings) are saved and fed into the *next* DD as `prior_evaluation`. DD can flag a
+     name `never_buy` (structural disqualifier — fraud, going-concern, serial diluter, delisting),
+     which permanently **excludes** it: excluded names are filtered out of discovery and the screen,
+     never quoted or researched again. Manage manually:
+     `python3 scripts/stock_memory.py [show SYM | exclude SYM "why" | allow SYM]`.
 5. **`apply_decision.py`** — the deterministic **executor + gate**: re-validates every action
    against the `.env` caps (the LLM is advisory; this is the real guardrail), simulates the paper
    fill, attaches the synthetic stop / take-profit, and appends the full what+why record to
