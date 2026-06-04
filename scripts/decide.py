@@ -19,6 +19,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from apply_decision import extract_decision  # sibling: robust JSON extraction
@@ -26,7 +27,41 @@ from apply_decision import extract_decision  # sibling: robust JSON extraction
 REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / "scripts"
 TICK = REPO / "data" / "tick"
+DD_CACHE = REPO / "data" / "dd_cache.json"
 PYEXE = sys.executable or "python3"
+
+
+def load_cache() -> dict:
+    try:
+        return json.loads(DD_CACHE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_cache(cache: dict) -> None:
+    DD_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    DD_CACHE.write_text(json.dumps(cache, indent=2))
+
+
+def run_dd(sym: str, screen_reason: str, packet: dict, caps: dict, cash: float, dd_model: str) -> dict:
+    """The expensive Stage-2 work for one symbol: deep quant probe + Sonnet news/catalyst commit."""
+    subprocess.run([PYEXE, str(SCRIPTS / "dd_probe.py"), sym],
+                   capture_output=True, text=True, timeout=60)
+    dd_file = TICK / f"dd_{sym}.json"
+    dd = json.loads(dd_file.read_text()) if dd_file.exists() else {"symbol": sym, "error": "no_dd"}
+    dd_input = json.dumps({
+        "symbol": sym,
+        "screen_reason": screen_reason,
+        "regime": packet.get("regime"),
+        "sizing": {"MAX_POSITION_USD": caps["MAX_POSITION_USD"], "available_cash": round(cash, 2)},
+        "dd": dd,
+    })
+    commit = extract_decision(run_claude((SCRIPTS / "dd_prompt.txt").read_text() + dd_input,
+                                         dd_model, websearch=True, timeout=300))
+    return {"symbol": sym, "decision": (commit.get("decision") or "reject").lower(),
+            "conviction": commit.get("conviction"), "dollar_amount": commit.get("dollar_amount"),
+            "reason": commit.get("reason", ""), "catalysts": commit.get("catalysts", []),
+            "risks": commit.get("risks", [])}
 
 
 def claude_bin() -> str:
@@ -65,38 +100,38 @@ def main() -> int:
     actions = [{"symbol": e.get("symbol"), "side": "sell", "reason": e.get("reason", "")}
                for e in exits if e.get("symbol")]
 
-    # --- Stage 2: deep DD + Opus commit (only on real candidates, only when entries allowed) ---
+    # --- Stage 2: deep DD + commit, with a per-symbol TTL cache ---
+    # If the same name keeps clearing the screen tick-after-tick, we don't re-burn a ~60s
+    # Sonnet+web call each time — we reuse the recent verdict until DD_CACHE_TTL_MIN expires.
+    # Execution still re-checks fresh price + caps + allow_entries in apply_decision, so a cached
+    # commit never trades on a stale price. Tune DD_CACHE_TTL_MIN (60..1440) to taste.
     dd_results = []
+    cache = load_cache()
+    ttl = int(os.environ.get("DD_CACHE_TTL_MIN", "180")) * 60
+    now = time.time()
+    cache_dirty = False
     if context.get("allow_entries") and candidates:
         cash = context["portfolio"]["cash"]
         for c in candidates[:max_dd]:
             sym = str(c.get("symbol", "")).upper().strip()
             if not sym:
                 continue
-            subprocess.run([PYEXE, str(SCRIPTS / "dd_probe.py"), sym],
-                           capture_output=True, text=True, timeout=60)
-            dd_file = TICK / f"dd_{sym}.json"
-            dd = json.loads(dd_file.read_text()) if dd_file.exists() else {"symbol": sym, "error": "no_dd"}
-            dd_input = json.dumps({
-                "symbol": sym,
-                "screen_reason": c.get("reason", ""),
-                "regime": packet.get("regime"),
-                "sizing": {"MAX_POSITION_USD": caps["MAX_POSITION_USD"], "available_cash": round(cash, 2)},
-                "dd": dd,
-            })
-            commit = extract_decision(run_claude((SCRIPTS / "dd_prompt.txt").read_text() + dd_input,
-                                                 dd_model, websearch=True, timeout=300))
-            decision = (commit.get("decision") or "reject").lower()
-            dd_results.append({"symbol": sym, "decision": decision,
-                               "conviction": commit.get("conviction"),
-                               "dollar_amount": commit.get("dollar_amount"),
-                               "reason": commit.get("reason", ""),
-                               "catalysts": commit.get("catalysts", []),
-                               "risks": commit.get("risks", [])})
-            if decision == "commit" and commit.get("dollar_amount"):
+            cached = cache.get(sym)
+            if cached and (now - cached.get("ts", 0)) < ttl:
+                res = {**cached["result"], "cached": True,
+                       "cached_age_min": int((now - cached["ts"]) / 60)}
+            else:
+                res = run_dd(sym, c.get("reason", ""), packet, caps, cash, dd_model)
+                cache[sym] = {"ts": now, "result": res}
+                cache_dirty = True
+            dd_results.append(res)
+            if res.get("decision") == "commit" and res.get("dollar_amount"):
+                tag = f"DD/{res.get('conviction', '?')}" + ("/cached" if res.get("cached") else "")
                 actions.append({"symbol": sym, "side": "buy",
-                                "dollar_amount": commit["dollar_amount"],
-                                "reason": f"[DD/{commit.get('conviction', '?')}] {commit.get('reason', '')}"})
+                                "dollar_amount": res["dollar_amount"],
+                                "reason": f"[{tag}] {res.get('reason', '')}"})
+        if cache_dirty:
+            save_cache(cache)
 
     decision_out = {
         "actions": actions,
