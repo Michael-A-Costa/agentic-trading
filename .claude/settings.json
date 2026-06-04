@@ -33,9 +33,7 @@
       "mcp__robinhood-trading__get_equity_orders",
       "mcp__robinhood-trading__get_equity_tradability",
       "mcp__robinhood-trading__search",
-      "mcp__robinhood-trading__review_equity_order"
-    ],
-    "ask": [
+      "mcp__robinhood-trading__review_equity_order",
       "mcp__robinhood-trading__place_equity_order",
       "mcp__robinhood-trading__cancel_equity_order"
     ]

@@ -18,39 +18,44 @@ The Robinhood MCP is registered in `.mcp.json` and exposes account, quote, and o
 
 ## Critical Rules
 
-Read these first — they override convenience and apply to every task. This repo can move
-real money, so the trading guards are non-negotiable.
+Read these first — they override convenience and apply to every task. This repo moves real
+money **autonomously**, so the risk guardrails are non-negotiable.
 
-### Trading Safety Guards
-- **Never place, modify, or cancel an order without explicit, in-the-moment user approval.**
-  Approval for one order does **not** carry to the next. The global rule against executing
-  trades on the user's behalf applies here in full — `place_equity_order` and
-  `cancel_equity_order` are confirm-first, every time.
-- **Always `review_equity_order` before `place_equity_order`.** Show the user the reviewed
-  order (symbol, side, qty, type, limit/stop, estimated cost, buying-power impact) and wait
-  for a clear "yes" on *that specific order* before placing it.
-- **Read tools are free; write tools are gated.** `get_accounts`, `get_portfolio`,
-  `get_equity_positions`, `get_equity_quotes`, `get_equity_orders`,
-  `get_equity_tradability`, `search`, and `review_equity_order` are safe to call freely.
-  `place_equity_order` and `cancel_equity_order` are not.
-- **State the dollars.** Whenever proposing a trade, surface notional value and resulting
-  position size / portfolio weight. Never propose an order whose size you have not actually
-  computed from live quotes and current buying power.
-- **Quote freshness.** Prices move. Re-pull `get_equity_quotes` immediately before building
-  any order; do not size a trade off a stale quote from earlier in the session.
-- **Default to paper / dry-run.** When backtesting or developing a strategy, simulate. Only
-  reach for live order tools when the user explicitly asks to trade live.
-- **No real-money claims you can't back.** Never assert a fill, a balance, or a P&L number
-  you didn't read from a tool this session. If you're reasoning from a stale value, say so.
+### Operating Model — Autonomous (authorized)
+The account owner (Michael) has **durably authorized fully autonomous trading** in the
+isolated, `agentic_allowed=true` account (`your_account_number`). This is a sanctioned *playground*:
 
-### Risk Discipline
-- Respect any position-size, per-trade-loss, and total-exposure limits defined in the
-  active strategy or `.env`. If a proposed trade would breach a configured limit, stop and
-  flag it rather than placing it.
-- Prefer **limit** orders over market orders unless the user asks otherwise; name the limit
-  price and the reasoning.
-- Surface concentration risk: if a trade pushes a single symbol or sector past a sane weight,
-  say so before proposing it.
+- **No per-trade human approval.** Do **not** stop to ask before placing or cancelling orders.
+  The standing authorization covers the whole strategy, not one order at a time.
+- **Free rein on research & selection.** Do your own due diligence — screen, find names, build
+  conviction. **Not** restricted to a fixed watchlist.
+- **Safety lives in code, not in human approval.** The seatbelt is the **Risk Guardrails**
+  below (hard caps, stop-losses, a daily-loss circuit breaker), full **logging** of every
+  decision and fill, and Robinhood's **kill switch** (disconnect the MCP) as the backstop.
+- **Scope is the agentic account only.** Trade exclusively `your_account_number`. The other accounts are
+  read-only context — **never** place an order against them (the MCP would reject it anyway).
+
+### Risk Guardrails (enforced in code / `.env` — the real safety layer)
+- **Honour every limit in `.env`**: `MAX_POSITION_USD`, `MAX_TOTAL_EXPOSURE_USD`,
+  `MAX_PER_TRADE_LOSS_USD`, `STOP_LOSS_PCT`, and `DAILY_MAX_LOSS_USD`. A trade that would
+  breach a cap is **not placed** — it's skipped and logged. These are tunable by the owner;
+  do not silently exceed them.
+- **Daily-loss circuit breaker.** If realized+unrealized P&L for the day hits
+  `DAILY_MAX_LOSS_USD`, **halt all new entries for the rest of the session** and log it.
+- **Always `review_equity_order` before `place_equity_order`** — not for human sign-off, but to
+  catch broker alerts (PDT, halts, buying power) and to log the preview. If review returns a
+  **blocking** alert, skip the trade and log the reason.
+- **Size from live data.** Compute every order's notional from a **fresh** `get_equity_quotes`
+  (and current buying power via `get_portfolio`) pulled immediately before placing. Never size
+  off a stale quote.
+- **Prefer marketable limits** over naked market orders for price protection; record the price
+  and the reasoning in the log.
+- **Watch concentration.** Don't let one symbol/sector blow past a sane portfolio weight; the
+  exposure caps exist to enforce this.
+- **Log everything.** Every decision (including no-trades and skips) and every fill goes to
+  `data/` as an append-only record, so P&L and behaviour are auditable after the fact.
+- **No real-money claims you can't back.** Never assert a fill, balance, or P&L number you
+  didn't read from a tool. If reasoning from a stale value, say so.
 
 ### Git Commit Rules
 - Never mention Claude or any AI assistant in commit messages (no `Co-Authored-By` lines, no
@@ -78,7 +83,8 @@ real money, so the trading guards are non-negotiable.
 ## MCP Tools — `robinhood-trading`
 
 Registered in `.mcp.json` (`https://agent.robinhood.com/mcp/trading`). Schemas load on
-demand. Read tools are safe; the two write tools are confirm-first (see Trading Safety Guards).
+demand. Read tools are free; the two write tools execute autonomously within the **Risk
+Guardrails** above (no human approval — caps + logging are the gate).
 
 | Tool | Kind | Purpose |
 |------|------|---------|
@@ -90,12 +96,13 @@ demand. Read tools are safe; the two write tools are confirm-first (see Trading 
 | `mcp__robinhood-trading__get_equity_tradability` | read | Whether a symbol is tradable |
 | `mcp__robinhood-trading__search` | read | Search instruments |
 | `mcp__robinhood-trading__review_equity_order` | read | Pre-trade review (no execution) |
-| `mcp__robinhood-trading__place_equity_order` | **write — confirm first** | Place an order |
-| `mcp__robinhood-trading__cancel_equity_order` | **write — confirm first** | Cancel an order |
+| `mcp__robinhood-trading__place_equity_order` | **write — auto, capped** | Place an order |
+| `mcp__robinhood-trading__cancel_equity_order` | **write — auto, capped** | Cancel an order |
 
-Typical safe flow for a trade idea: `search` / `get_equity_tradability` → `get_equity_quotes`
-→ `get_portfolio` (buying power) → size the order → `review_equity_order` → **ask the user** →
-`place_equity_order` only on explicit approval.
+Autonomous flow for a trade idea: DD / `search` / `get_equity_tradability` →
+`get_equity_quotes` → `get_portfolio` (buying power) → size within `.env` caps →
+`review_equity_order` (alert/log check) → `place_equity_order` → log the decision + fill to
+`data/`. Skip + log if a cap or a blocking broker alert would be hit.
 
 ## Directory Structure
 
