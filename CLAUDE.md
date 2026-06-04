@@ -55,7 +55,11 @@ isolated, `agentic_allowed=true` account (`your_account_number`). This is a sanc
 - **Watch concentration.** Don't let one symbol/sector blow past a sane portfolio weight; the
   exposure caps exist to enforce this.
 - **Log everything.** Every decision (including no-trades and skips) and every fill goes to
-  `data/` as an append-only record, so P&L and behaviour are auditable after the fact.
+  `data/` as an append-only record, so P&L and behaviour are auditable after the fact. Two layers:
+  the fat per-tick `engine-log.jsonl` (what the engine saw + decided), and a dedicated **trade
+  history** — `data/trades.jsonl` + a daily `data/journal/trades-<date>.md` blotter — written by
+  `trade_log.py` for every executed fill (paper or live). Read it with `scripts/trade_ledger.py`
+  (blotter + FIFO round-trips) and `scripts/pnl_report.py` (realized P&L + exit-type breakdown).
 - **No real-money claims you can't back.** Never assert a fill, balance, or P&L number you
   didn't read from a tool. If reasoning from a stale value, say so.
 

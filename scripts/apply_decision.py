@@ -26,6 +26,9 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import trade_log  # shared trade-history writer (paper + live)
+
 REPO = Path(__file__).resolve().parent.parent
 DATA = REPO / "data"
 STATE_PATH = DATA / "paper_state.json"
@@ -442,6 +445,11 @@ def main() -> int:
     ENGINE_LOG.parent.mkdir(parents=True, exist_ok=True)
     with ENGINE_LOG.open("a") as f:
         f.write(json.dumps(record) + "\n")
+
+    # Mirror every executed fill to the unified trade history (data/trades.jsonl + daily blotter),
+    # independent of this per-tick record. Best-effort: never let history I/O break a tick.
+    trade_log.record_fills(record.get("results", []), ts_utc=record["ts_utc"],
+                           ts_et=record.get("ts_et"), mode=record["mode"])
 
     print(f"[{record['ts_et']}] {record['mode'].upper()} {summary}")
     return 0

@@ -109,6 +109,27 @@ tail -n 30 data/logs/tick_$(date +%F).log   # human trail: per-candidate WHY (co
 tail -n 5  data/engine-log.jsonl            # full machine audit trail (dd reason/catalysts/risks)
 ```
 
+### Trade history (what was actually done)
+
+Separate from the fat per-tick `engine-log.jsonl`, **every executed fill** (paper fill *or* live
+placed order) is mirrored to a dedicated, mode-tagged trade history via **`trade_log.py`** (shared by
+both executors, so paper/live never drift):
+
+- **`data/trades.jsonl`** — one compact JSON row per trade (greppable: `grep NVDA data/trades.jsonl`).
+- **`data/journal/trades-<ET-date>.md`** — human-readable daily blotter, one bullet per trade.
+
+```bash
+python3 scripts/trade_ledger.py             # blotter + reconstructed round-trips (FIFO entry→exit)
+python3 scripts/trade_ledger.py --symbol NVDA   # one name's whole life
+python3 scripts/trade_ledger.py --round-trips --since 2026-06-04  # closed trips: hold time, P&L, P&L%
+python3 scripts/pnl_report.py               # realized P&L + exit-type breakdown (off the engine log)
+cat data/journal/trades-$(date +%F).md      # today's blotter at a glance
+```
+
+`trade_ledger.py` reconstructs round-trips (hold time, entry/exit price, P&L%) the per-tick log
+can't show; `pnl_report.py` stays the realized-P&L/exit-type summary. Both share one exit-type
+classifier (`trade_log.classify_exit`).
+
 Each tick's console/`tick_*.log` now spells out the **why**, not just counts: every screened
 candidate's signal, its Stage-2 DD verdict (`COMMIT`/`REJECT`/`ERROR`) with the model's reason and
 whether it was a `[fresh Ns]` call or a `[cached Nm]` reuse, any cap rejections, and the final

@@ -37,6 +37,9 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import trade_log  # shared trade-history writer (paper + live)
+
 REPO = Path(__file__).resolve().parent.parent
 DATA = REPO / "data"
 SNAPSHOT_PATH = DATA / "tick" / "broker_snapshot.json"
@@ -555,6 +558,11 @@ def main() -> int:
     ENGINE_LOG.parent.mkdir(parents=True, exist_ok=True)
     with ENGINE_LOG.open("a") as f:
         f.write(json.dumps(record) + "\n")
+
+    # Mirror every PLACED live order to the unified trade history (data/trades.jsonl + daily
+    # blotter), tagged with mode_tag (live / live-dryrun). Best-effort; never break a tick.
+    trade_log.record_fills(results, ts_utc=record["ts_utc"], ts_et=record.get("ts_et"),
+                           mode=mode_tag)
 
     placed = record["n_placed"]
     note = "DRY-RUN" if is_dryrun else "ARMED"

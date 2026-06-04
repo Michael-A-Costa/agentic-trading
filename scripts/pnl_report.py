@@ -20,25 +20,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections import defaultdict
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from trade_log import classify_exit  # single source of truth for exit-type classification
 
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_LOG = REPO / "data" / "engine-log.jsonl"
 DEFAULT_STATE = REPO / "data" / "paper_state.json"
 
-# Exit-type classifier: ordered (first match wins) substring rules against the sell `reason`.
-# The strings mirror what tick_context.py emits; the [breaker-exit] prefix is stripped first.
-EXIT_RULES = [
-    ("scale_out",   ("scale-out",)),
-    ("take_profit", ("take-profit",)),
-    ("winddown",    ("wind-down",)),
-    ("stop",        ("synthetic stop", "stop-loss")),
-    ("eod_flatten", ("eod flatten",)),
-    ("time_stop",   ("max-hold",)),
-    ("test",        ("unit-test",)),
-]
-# Display order + labels for the breakdown table.
+# Display order + labels for the breakdown table (keys match trade_log.classify_exit()).
 EXIT_ORDER = ["take_profit", "scale_out", "winddown", "stop", "eod_flatten", "time_stop", "test", "other"]
 EXIT_LABEL = {
     "take_profit": "take-profit (full)", "scale_out": "scale-out (partial)",
@@ -46,16 +39,6 @@ EXIT_LABEL = {
     "stop": "stop-loss", "eod_flatten": "EOD flatten", "time_stop": "time-stop (stalled)",
     "test": "unit-test", "other": "other/discretionary",
 }
-
-
-def classify_exit(reason: str) -> str:
-    r = (reason or "").lower()
-    if r.startswith("[breaker-exit]"):
-        r = r[len("[breaker-exit]"):].strip()
-    for name, needles in EXIT_RULES:
-        if any(n in r for n in needles):
-            return name
-    return "other"
 
 
 def load_records(log_path: Path, since: str | None) -> list[dict]:
