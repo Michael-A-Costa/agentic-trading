@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -96,10 +97,24 @@ def main() -> int:
     allow_offhours = env("ALLOW_OFFHOURS", "0") == "1"
 
     state = load_state()
-    candidates = [s.strip().upper() for s in env(
-        "CANDIDATES", "AAPL,NVDA,TSLA,AMD,MSFT,AMZN,META,GOOGL,SPY,QQQ,F,PLTR").split(",") if s.strip()]
+    # Universe = dynamic discovery (today's top eligible movers) + always-watch pins + held.
+    # Discovery replaces a static stock allowlist: a momentum engine has to see what's actually
+    # moving market-wide, not a fixed watchlist. The pins (CANDIDATES) stay screened every tick and
+    # are the fallback if discovery is disabled/down. See scripts/discover.py for the eligibility filter.
+    pinned = [s.strip().upper() for s in env(
+        "CANDIDATES", "AAPL,NVDA,TSLA,AMD,MSFT,AMZN,META,GOOGL,F,PLTR").split(",") if s.strip()]
+    discovered = []
+    if env("DISCOVERY_ENABLED", "1") == "1":
+        try:
+            import discover  # sibling; keyless Nasdaq screener + eligibility filter, cached per tick
+            discovered = discover.discover()
+        except Exception as e:  # discovery must NEVER break a tick — fall back to the pins
+            sys.stderr.write(f"[tick] discovery failed, using pinned candidates only: {e}\n")
+    candidates = list(dict.fromkeys(discovered + pinned))  # ordered de-dupe (movers first)
     held = list(state["positions"].keys())
-    symbols = sorted(set(candidates) | set(held))
+    # Index ETFs are ALWAYS fetched: SPY is the rel-strength benchmark and the market-data gate
+    # needs index data — but they are excluded from entry candidates below (never momentum-buy beta).
+    symbols = sorted(set(candidates) | set(held) | set(mc.INDEXES))
 
     quotes, source = {}, None
     fetch_error = None
@@ -234,11 +249,23 @@ def main() -> int:
             except (ValueError, TypeError):
                 continue
 
+    # Never momentum-buy the benchmark / index ETFs (that's just buying beta — the rel-strength
+    # bar exists precisely to filter beta out), nor any name on the long-term never-buy exclusion
+    # list (DD-flagged structural disqualifiers). Configurable extras via NON_TRADABLE_SYMBOLS.
+    try:
+        import stock_memory
+        excluded = stock_memory.excluded_symbols()
+    except Exception:
+        excluded = set()
+    non_tradable = (set(mc.INDEXES) | excluded
+                    | {s.strip().upper() for s in env("NON_TRADABLE_SYMBOLS", "").split(",") if s.strip()})
     entry_candidates = []
     if allow_entries and not hostile:
         spy_move = mc.intraday_pct(quotes.get("SPY") or {})  # SPY already fetched — no extra call
         movers = []
         for c in cand:
+            if c["symbol"] in non_tradable:
+                continue
             ip = c.get("intraday_pct")
             if ip is None or ip < sig:
                 continue
@@ -262,7 +289,7 @@ def main() -> int:
 
     # --- GATE decision (deterministic; the wrapper branches on this) ---
     gate, reason = "TRADE", ""
-    if fetch_error or not mc._has_indexes({s: quotes.get(s, {}) for s in candidates}):
+    if fetch_error or not mc._has_indexes(quotes):  # indexes always fetched; check the full set
         gate, reason = "SKIP", f"no_market_data ({fetch_error or 'empty quotes'})"
     elif day_pnl <= -caps["DAILY_MAX_LOSS_USD"]:
         gate, reason = "SKIP", f"circuit_breaker day_pnl={day_pnl} <= -{caps['DAILY_MAX_LOSS_USD']}"
