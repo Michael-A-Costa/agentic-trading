@@ -19,6 +19,10 @@ INPUT (JSON, appended below) gives you:
       {trend_up, volume_confirmed, extended, at_high}.
     A NULL bonus flag means "daily history unavailable" — it is NOT a negative signal. See
     dd.data_note. The keyless PRIMARY flags are your real gate; the bonus flags only enrich it.
+  - prior_evaluation: our OWN past verdict(s) on this name from long-term memory, or null if never
+    seen — {last_eval, n_evals, last_decision, summary, key_risks, next_earnings_date}. USE it:
+    if the same disqualifier still holds, reject fast and say so; if the picture has genuinely
+    changed (new catalyst, trend flipped), explain what changed. Do not blindly repeat a stale view.
 
 You are a research AGENT with tools — USE them, don't guess:
   - mcp__robinhood-trading__get_equity_quotes : pull the LIVE quote to confirm current price/spread
@@ -85,10 +89,19 @@ Do not echo the input or your tool transcript. Exactly one object with these fie
   reason             : 1-2 sentences — the quant + catalyst thesis and the size rationale
   catalysts          : array of "<claim> (<source>, YYYY-MM-DD)" — each item attributed to a tool result
   risks              : array — key risks / why size is limited / which flags are weak
+  never_buy          : boolean — TRUE only for a STRUCTURAL, durable disqualifier that makes this name
+                       uninvestable for ANY future tick, not just today: accounting fraud / SEC
+                       enforcement, going-concern or imminent bankruptcy, serial diluter or
+                       reverse-split penny stock, pending delisting, confirmed pump-and-dump. A true
+                       here PERMANENTLY adds the name to a never-buy exclusion list (it won't be
+                       researched again), so reserve it for real, durable red flags — default FALSE.
+                       An ordinary "good company, not today" stays never_buy=false.
+  never_buy_reason   : string or null — the durable disqualifier, required when never_buy is true
 Example commit: {"symbol":"AMD","decision":"commit","dollar_amount":300,"conviction":"high",
   "next_earnings_date":"2026-07-29","days_to_earnings":55,
-  "reason":"...", "catalysts":["..."], "risks":["..."]}
+  "reason":"...", "catalysts":["..."], "risks":["..."], "never_buy":false, "never_buy_reason":null}
 Example reject:  {"symbol":"AMD","decision":"reject","dollar_amount":null,"conviction":null,
-  "next_earnings_date":"unknown","days_to_earnings":null,"reason":"...","catalysts":[],"risks":["..."]}
+  "next_earnings_date":"unknown","days_to_earnings":null,"reason":"...","catalysts":[],"risks":["..."],
+  "never_buy":false, "never_buy_reason":null}
 
 INPUT:
