@@ -45,15 +45,30 @@ Derived from `research/agentic-robinhood-mcp-landscape.md`. An **autonomous** mo
 > doubles as the per-name concentration cap (it replaced the old `MAX_SYMBOL_WEIGHT`, which was the
 > same `symbol_value / equity` formula once sizing became a fraction of equity).
 
-### Stop protection: synthetic now, resting-broker later
-Every buy attaches an explicit `stop_price` (−`STOP_LOSS_PCT`) and `take_profit_price`
-(+`TAKE_PROFIT_PCT`), tagged `stop_type: "synthetic"`. **Synthetic = our engine sells when it
-checks the level at tick time (~5 min) and the host is awake.** It is *not* a resting broker
-order, so it does **not** cover between-tick moves, overnight/pre-market gaps, or a crashed/asleep
-engine. Logs say "synthetic stop hit" so this is never mistaken for broker-grade protection.
+### Order execution model: marketable limits + slippage + hybrid stops (paper-modelled now)
+Fills are no longer free prints at the last quote. `apply_decision.py` models a real **marketable
+order** on both sides (knobs in `.env`):
+- **Entries** are a **marketable BUY limit**: limit capped `MARKETABLE_LIMIT_PCT` above the touch
+  (price protection), filled at the touch **+ `SLIPPAGE_BPS`** (you pay up). A modeled fill past the
+  limit is skipped — the same gate the live executor will reuse. The order is recorded with
+  `order_type`, `limit_price`, `ref_price`, `slippage_bps` on the trail.
+- **Exits** give up `SLIPPAGE_BPS` below the touch; `order_type` is `stop_market` for stop hits,
+  `market` for EOD-flatten / wind-down / max-hold, else `marketable_limit`. Risk-rule exits carry no
+  limit cap (they must complete).
+- Sizing is off the **fill price**, so slippage costs shares, not hidden P&L — paper P&L is now a
+  conservative floor, not an optimistic one.
 
-- **Paper / now:** keep synthetic. Fractional sizing stays; agent is always free to sell; no
-  open-order lock to manage. Good enough to validate the strategy.
+### Stop protection: hybrid tag now, resting-broker enforcement live
+Every buy attaches an explicit `stop_price` (−`STOP_LOSS_PCT`) and `take_profit_price`
+(+`TAKE_PROFIT_PCT`). The lot is tagged **`stop_type: "resting"`** when it's a whole-share lot
+(`PREFER_WHOLE_SHARES=1` floors affordable buys to whole shares) and **`"synthetic"`** when
+fractional. **Synthetic = our engine sells when it checks the level at tick time (~5 min) and the
+host is awake** — *not* a resting broker order, so it does **not** cover between-tick moves,
+overnight/pre-market gaps, or a crashed/asleep engine.
+
+- **Paper / now:** both tags still **sell at the next tick** — resting vs synthetic fill identically
+  in the sim. The tag exists for record fidelity and to drive the live executor; the real protection
+  edge of a resting order only materializes live. Agent is always free to sell; no open-order lock.
 - **Live, later (not whole-share-by-default):** Robinhood resting stops need **whole shares**, and
   fractional is market-only — so a real resting stop can only ride on whole-share-eligible lots. Plan
   is a **hybrid**: real resting **stop-market** (not stop-limit — a limit can gap through and never

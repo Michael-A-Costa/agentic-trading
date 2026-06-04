@@ -104,6 +104,15 @@ def cand_last(context: dict, sym: str) -> float | None:
     return None
 
 
+def fill_price(ref: float, side: str, caps: dict) -> float:
+    """Model adverse slippage on a paper fill: a buy pays UP through the touch, a sell gives up
+    edge BELOW it, by SLIPPAGE_BPS of the reference quote. The old sim filled at the raw last
+    (zero spread/slippage) which flatters P&L — this makes every fill honestly worse than the
+    quote, which is the floor of what a real marketable order would get on the volatile universe."""
+    bps = caps.get("SLIPPAGE_BPS", 0.0) / 10000.0
+    return ref * (1 + bps) if side == "buy" else ref * (1 - bps)
+
+
 def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> dict:
     """Validate one action against caps and (if ok) simulate a paper fill, mutating state."""
     sym = str(action.get("symbol", "")).upper().strip()
@@ -128,21 +137,45 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
             result["reject_reason"] = f"entries disabled ({context.get('stale_reason') or 'market closed/stale'})"
             return result
 
-        # Resolve quantity from dollar_amount or qty.
+        # --- marketable-limit entry (paper model of a real marketable BUY limit) ---
+        # Cross the spread with a LIMIT capped at MARKETABLE_LIMIT_PCT above the touch (price
+        # protection vs a runaway print), and fill at the slipped price. If the modeled fill would
+        # print past the limit the order is NOT marketable -> no fill. This gate rarely bites in
+        # same-tick paper (the quote can't drift between decide and fill), but it's the exact rule
+        # the live executor will reuse, so it lives here and the limit is recorded on every entry.
+        limit_price = round(price * (1 + caps.get("MARKETABLE_LIMIT_PCT", 0.5) / 100.0), 4)
+        buy_px = fill_price(price, "buy", caps)
+        if buy_px > limit_price + 1e-9:
+            result["reject_reason"] = (f"not marketable: modeled fill {round(buy_px, 4)} > "
+                                       f"limit {limit_price}")
+            return result
+
+        # Resolve quantity from dollar_amount or qty, SIZED OFF THE FILL PRICE (so slippage costs
+        # shares, not hidden P&L). NaN/inf from a bad LLM dollar_amount is rejected before it can
+        # sail past the cap comparisons and corrupt state.
         if action.get("dollar_amount") is not None:
             notional = float(action["dollar_amount"])
-            qty = notional / price
+            qty = notional / buy_px
         elif action.get("qty") is not None:
             qty = float(action["qty"])
-            notional = qty * price
+            notional = qty * buy_px
         else:
             result["reject_reason"] = "no qty/dollar_amount"
             return result
-        # Reject non-finite / non-positive sizes (NaN or inf from a bad LLM dollar_amount
-        # would otherwise sail past the comparisons below and corrupt state).
         if not (math.isfinite(qty) and math.isfinite(notional)) or qty <= 0 or notional <= 0:
             result["reject_reason"] = "non-positive / non-finite qty"
             return result
+
+        # Hybrid stop eligibility: prefer a WHOLE-SHARE lot so it can carry a real resting
+        # stop-market in live (Robinhood fractional lots are broker market-only -> synthetic engine
+        # stop only). Floor to whole shares when >=1 is affordable; never force whole shares on a
+        # name the budget can't reach a share of. Flooring only ever LOWERS notional, so no cap is
+        # breached by it. Off (PREFER_WHOLE_SHARES=0) keeps pure fractional dollar sizing.
+        if bool(caps.get("PREFER_WHOLE_SHARES", 1)) and action.get("dollar_amount") is not None \
+                and math.floor(qty) >= 1:
+            qty = float(math.floor(qty))
+            notional = qty * buy_px
+
         min_pos = caps.get("MIN_POSITION_USD", 0.0)
         if min_pos > 0 and notional < min_pos - 1e-6:
             result["reject_reason"] = f"below MIN_POSITION_USD ({min_pos})"
@@ -197,24 +230,37 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
         # does NOT cover between-tick moves, overnight/pre-market gaps, or an
         # asleep/crashed engine. Treat it as best-effort intraday protection, not
         # broker-grade. See strategies/momentum-v0-plan.md (live = real resting stop).
-        prev = positions.get(sym, {"qty": 0.0, "entry_price": price})
+        prev = positions.get(sym, {"qty": 0.0, "entry_price": buy_px})
         new_qty = prev["qty"] + qty
-        new_entry = (prev["qty"] * prev["entry_price"] + qty * price) / new_qty
+        new_entry = (prev["qty"] * prev["entry_price"] + qty * buy_px) / new_qty
         sl, tp = caps.get("STOP_LOSS_PCT", 2.0), caps.get("TAKE_PROFIT_PCT", 4.0)
+        # Hybrid stop tag: a WHOLE-SHARE lot is resting-eligible (a real broker stop-market in live,
+        # armed continuously); any fractional remainder (incl. when averaging in) forces synthetic.
+        # NOTE: in PAPER both still sell at the next tick, so resting vs synthetic fill identically
+        # here — the tag drives the live executor + record fidelity, and the protection edge
+        # (continuous arming, surviving between-tick/overnight gaps and engine downtime) only
+        # materializes once live places the resting order. See momentum-v0-plan.md.
+        resting = (bool(caps.get("PREFER_WHOLE_SHARES", 1))
+                   and new_qty == math.floor(new_qty) and new_qty >= 1)
+        stop_type = "resting" if resting else "synthetic"
+        stop_note = ("resting stop-market on whole-share lot (broker-armed in live; paper still "
+                     "settles at tick)" if resting
+                     else "engine-tick enforced (~5m); no gap/overnight/engine-down cover")
         positions[sym] = {"qty": new_qty, "entry_price": round(new_entry, 4),
                           "init_qty": round(new_qty, 6),  # scale-out base: fractions are of this entry qty
                           "entry_ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                           "stop_price": round(new_entry * (1 - sl / 100), 4),
                           "take_profit_price": round(new_entry * (1 + tp / 100), 4),
-                          "stop_type": "synthetic",
+                          "stop_type": stop_type,
                           "scaled": prev.get("scaled", [])}  # tiers already taken (preserved when averaging in)
         state["cash"] -= notional
-        result.update(status="filled", qty=round(qty, 6), price=price,
+        result.update(status="filled", qty=round(qty, 6), price=round(buy_px, 4),
+                      ref_price=round(price, 4), order_type="marketable_limit",
+                      limit_price=limit_price, slippage_bps=caps.get("SLIPPAGE_BPS", 0.0),
                       notional=round(notional, 2),
                       stop_price=positions[sym]["stop_price"],
                       take_profit_price=positions[sym]["take_profit_price"],
-                      stop_type="synthetic",
-                      stop_note="engine-tick enforced (~5m); no gap/overnight/engine-down cover")
+                      stop_type=stop_type, stop_note=stop_note)
         return result
 
     # side == "sell"
@@ -222,14 +268,27 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
         result["reject_reason"] = "no position to sell"
         return result
     held = positions[sym]["qty"]
+    lot_stop_type = positions[sym].get("stop_type")  # capture before a full exit deletes the lot
+    # Exit fill: model adverse slippage on the way OUT. A risk-rule exit (stop / EOD flatten /
+    # wind-down / max-hold) is a market or stop-market order — it must complete, so no limit cap;
+    # a discretionary or scale-out sell is treated as a marketable limit. order_type is recorded on
+    # the trail either way; slippage applies to all of them so paper exits aren't flattered.
+    reason_l = reason.lower()
+    if "stop" in reason_l:
+        order_type = "stop_market"
+    elif any(k in reason_l for k in ("flatten", "wind-down", "max-hold")):
+        order_type = "market"
+    else:
+        order_type = "marketable_limit"
+    sell_px = fill_price(price, "sell", caps)
     qty = float(action["qty"]) if action.get("qty") is not None else (
-        float(action["dollar_amount"]) / price if action.get("dollar_amount") is not None else held)
+        float(action["dollar_amount"]) / sell_px if action.get("dollar_amount") is not None else held)
     qty = min(qty, held)
     if qty <= 0:
         result["reject_reason"] = "non-positive sell qty"
         return result
-    proceeds = qty * price
-    realized = (price - positions[sym]["entry_price"]) * qty
+    proceeds = qty * sell_px
+    realized = (sell_px - positions[sym]["entry_price"]) * qty
     state["cash"] += proceeds
     state["realized_total"] += realized
     remaining = held - qty
@@ -251,7 +310,9 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
                 entry = positions[sym]["entry_price"]
                 if positions[sym].get("stop_price") is None or positions[sym]["stop_price"] < entry:
                     positions[sym]["stop_price"] = round(entry, 4)
-    result.update(status="filled", qty=round(qty, 6), price=price,
+    result.update(status="filled", qty=round(qty, 6), price=round(sell_px, 4),
+                  ref_price=round(price, 4), order_type=order_type,
+                  slippage_bps=caps.get("SLIPPAGE_BPS", 0.0), stop_type=lot_stop_type,
                   notional=round(proceeds, 2), realized_usd=round(realized, 2),
                   **({"scale_tiers": scale_tiers} if scale_tiers else {}))
     return result

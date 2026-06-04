@@ -226,6 +226,11 @@ def main() -> int:
         "MAX_PER_TRADE_LOSS_PCT": per_trade_pct,
         "MAX_PER_TRADE_LOSS_USD": round(per_trade_pct * equity, 2),  # = pct * live equity (slack backstop)
         "MIN_POSITION_USD": envf("MIN_POSITION_USD", 0.0),  # 0 = no floor; >0 rejects dust fills
+        # --- order execution model (marketable limits + slippage + hybrid stops) ---
+        "SLIPPAGE_BPS": envf("SLIPPAGE_BPS", 10.0),          # adverse bps applied to every paper fill
+        "MARKETABLE_LIMIT_PCT": envf("MARKETABLE_LIMIT_PCT", 0.5),  # buy limit cap above the touch
+        "PREFER_WHOLE_SHARES": 1 if str(os.environ.get("PREFER_WHOLE_SHARES", "1")).strip().lower()
+        not in ("0", "false", "no", "") else 0,             # floor buys to whole shares -> resting-stop eligible
     }
     regime = latest_regime()
 
