@@ -53,15 +53,13 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
     # log the skipped tick deterministically; no LLM call
     "$PYTHON" "${REPO}/scripts/apply_decision.py" --context "$CTX" --skip | tee -a "$RUN_LOG"
   else
-    # 3) decision (LLM only) — packet in, JSON out; no MCP (paper uses public data)
-    PROMPT="$(cat "${REPO}/scripts/tick_prompt.txt")$(cat "${REPO}/data/tick/packet_latest.json")"
+    # 3) decide: Stage-1 screen (cheap) -> Stage-2 deep DD + commit (Opus + web) on candidates
     DEC="${REPO}/data/tick/decision_latest.json"
-    if "$CLAUDE_BIN" -p "$PROMPT" --model "$TICK_MODEL" --strict-mcp-config \
-         --output-format text >"$DEC" 2>>"$RUN_LOG"; then
-      # 4) apply + log (script)
+    if "$PYTHON" "${REPO}/scripts/decide.py" 2>>"$RUN_LOG" | tee -a "$RUN_LOG"; then
+      # 4) apply + log (script) — re-checks caps, simulates fills, writes the what+why record
       "$PYTHON" "${REPO}/scripts/apply_decision.py" --context "$CTX" --decision "$DEC" | tee -a "$RUN_LOG"
     else
-      log "claude decision call failed — logging as skip"
+      log "decide.py failed — logging as skip"
       "$PYTHON" "${REPO}/scripts/apply_decision.py" --context "$CTX" --skip | tee -a "$RUN_LOG"
     fi
   fi

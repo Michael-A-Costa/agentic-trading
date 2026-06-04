@@ -204,6 +204,10 @@ def main() -> int:
                              "day_pnl": day_pnl, "open_positions": len(state["positions"]),
                              "realized_total": round(state["realized_total"], 2)},
         )
+        if isinstance(decision.get("dd"), list) and decision["dd"]:
+            record["dd"] = decision["dd"]          # Stage-2 commit/reject DD + catalysts (audit)
+        if decision.get("screen"):
+            record["screen"] = decision["screen"]  # Stage-1 exits + entry candidates (audit)
         if decision.get("_parse_error"):
             record["parse_error"] = True
         parts = [f"{r['side'].upper()} {r.get('qty', '?')} {r['symbol']} @ {r.get('price', '?')}"
