@@ -19,7 +19,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -31,6 +34,16 @@ ENGINE_LOG = DATA / "engine-log.jsonl"
 
 def load_json(p: Path) -> dict:
     return json.loads(p.read_text())
+
+
+def write_json_atomic(path: Path, obj) -> None:
+    """Write JSON via temp + os.replace so a crash mid-write can't truncate the file.
+    A truncated paper_state.json would wipe positions and silently re-baseline the
+    daily-loss circuit breaker — so every state write goes through here."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2))
+    os.replace(tmp, path)
 
 
 def extract_decision(raw: str) -> dict:
@@ -96,16 +109,25 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
         else:
             result["reject_reason"] = "no qty/dollar_amount"
             return result
-        if qty <= 0:
-            result["reject_reason"] = "non-positive qty"
+        # Reject non-finite / non-positive sizes (NaN or inf from a bad LLM dollar_amount
+        # would otherwise sail past the comparisons below and corrupt state).
+        if not (math.isfinite(qty) and math.isfinite(notional)) or qty <= 0 or notional <= 0:
+            result["reject_reason"] = "non-positive / non-finite qty"
+            return result
+        min_pos = caps.get("MIN_POSITION_USD", 0.0)
+        if min_pos > 0 and notional < min_pos - 1e-6:
+            result["reject_reason"] = f"below MIN_POSITION_USD ({min_pos})"
             return result
 
-        # --- cap checks (deterministic guardrails) ---
+        # --- cap checks (deterministic guardrails; every cap CLAUDE.md names is enforced here) ---
         existing_val = positions.get(sym, {}).get("qty", 0.0) * price
         if existing_val + notional > caps["MAX_POSITION_USD"] + 1e-6:
             result["reject_reason"] = f"exceeds MAX_POSITION_USD ({caps['MAX_POSITION_USD']})"
             return result
-        cur_exposure = sum(p["qty"] * (cand_last(context, s) or p["entry_price"])
+        # Exposure is valued at the live quote, falling back to entry_price ONLY when a held
+        # quote is missing — and we take max(last, entry) so a missing quote can only *raise*
+        # the exposure estimate (fail-safe: never under-count what we're risking).
+        cur_exposure = sum(p["qty"] * max(cand_last(context, s) or 0.0, p["entry_price"])
                            for s, p in positions.items())
         if cur_exposure + notional > caps["MAX_TOTAL_EXPOSURE_USD"] + 1e-6:
             result["reject_reason"] = f"exceeds MAX_TOTAL_EXPOSURE_USD ({caps['MAX_TOTAL_EXPOSURE_USD']})"
@@ -113,6 +135,32 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
         if sym not in positions and len(positions) >= caps["MAX_OPEN_POSITIONS"]:
             result["reject_reason"] = f"MAX_OPEN_POSITIONS ({caps['MAX_OPEN_POSITIONS']}) reached"
             return result
+        # Concentration cap: one symbol's post-buy value as a FRACTION of equity. A paper buy is
+        # equity-neutral (cash down, position up by the same notional), so pre-buy equity is the
+        # right denominator. Guard equity<=0 (fail-closed: reject rather than divide).
+        equity_now = state["cash"] + cur_exposure
+        max_weight = caps.get("MAX_SYMBOL_WEIGHT", 0.25)
+        if equity_now <= 0 or (existing_val + notional) / equity_now > max_weight + 1e-6:
+            result["reject_reason"] = f"exceeds MAX_SYMBOL_WEIGHT ({max_weight})"
+            return result
+        # Per-trade-loss budget: bound the dollar loss if the stop fills at stop_price. (This bounds
+        # *sizing at the stop*, not realized loss — a synthetic stop can gap through; that's why
+        # MAX_POSITION_USD and the EOD flatten also exist.)
+        implied_stop_loss = notional * caps["STOP_LOSS_PCT"] / 100.0
+        max_trade_loss = caps.get("MAX_PER_TRADE_LOSS_USD", 60.0)
+        if implied_stop_loss > max_trade_loss + 1e-6:
+            result["reject_reason"] = (f"exceeds MAX_PER_TRADE_LOSS_USD: "
+                                       f"{round(implied_stop_loss, 2)} > {max_trade_loss}")
+            return result
+        # Re-check the daily-loss circuit breaker AT FILL (not just at the gate). The gate runs on
+        # pre-tick equity; a buy that pushes day P&L past the limit must still be blocked.
+        sod = state.get("start_of_day_equity")
+        if sod is not None:
+            day_pnl_now = equity_now - sod
+            if day_pnl_now <= -caps.get("DAILY_MAX_LOSS_USD", 150.0):
+                result["reject_reason"] = (f"circuit_breaker day_pnl={round(day_pnl_now, 2)} "
+                                           f"<= -{caps.get('DAILY_MAX_LOSS_USD', 150.0)}")
+                return result
         if notional > state["cash"] + 1e-6:
             result["reject_reason"] = f"insufficient cash ({round(state['cash'], 2)})"
             return result
@@ -161,9 +209,20 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
         del positions[sym]
     else:
         positions[sym]["qty"] = remaining
+    # Record the exit so the screen can enforce a re-entry cooldown (anti-whipsaw).
+    state.setdefault("last_exit", {})[sym] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     result.update(status="filled", qty=round(qty, 6), price=price,
                   notional=round(proceeds, 2), realized_usd=round(realized, 2))
     return result
+
+
+def recompute_portfolio(state: dict, context: dict) -> tuple[float, float]:
+    """(equity, day_pnl) valued at this tick's quotes — single source of truth for both branches."""
+    pos_val = sum(p["qty"] * (cand_last(context, s) or p["entry_price"])
+                  for s, p in state["positions"].items())
+    equity = round(state["cash"] + pos_val, 2)
+    day_pnl = round(equity - (state.get("start_of_day_equity") or equity), 2)
+    return equity, day_pnl
 
 
 def main() -> int:
@@ -177,10 +236,33 @@ def main() -> int:
     caps = context["caps"]
     now = datetime.now(timezone.utc)
 
-    state_path = STATE_PATH
-    state = json.loads(state_path.read_text()) if state_path.exists() else {
-        "cash": 0.0, "positions": {}, "realized_total": 0.0, "day": None, "start_of_day_equity": None}
+    # Defense in depth: this executor ONLY simulates paper fills — there is no
+    # review_equity_order/place_equity_order path here. Refuse to run if mislabeled live.
+    if str(context.get("mode", "paper")).lower() == "live":
+        print("[apply_decision] FATAL: TRADING_MODE=live but no live executor exists — refusing.",
+              file=sys.stderr)
+        return 2
 
+    state_path = STATE_PATH
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text())
+        except json.JSONDecodeError:
+            # Corrupt state would silently re-baseline to a wiped portfolio AND reset the
+            # circuit-breaker baseline. Back it up, log loudly, and refuse — never overwrite.
+            bak = state_path.with_suffix(f".corrupt-{now.strftime('%Y%m%dT%H%M%S')}.json")
+            try:
+                os.replace(state_path, bak)
+            except OSError:
+                pass
+            print(f"[apply_decision] FATAL: paper_state.json unreadable; backed up to {bak.name}",
+                  file=sys.stderr)
+            return 2
+    else:
+        state = {"cash": 0.0, "positions": {}, "realized_total": 0.0, "day": None,
+                 "start_of_day_equity": None}
+
+    gate_reason = context.get("gate_reason", "")
     record = {
         "ts_utc": now.isoformat(timespec="seconds"),
         "ts_et": context.get("ts_et"),
@@ -193,19 +275,47 @@ def main() -> int:
     }
 
     if args.skip or not args.decision:
-        record.update(action="skip", gate_reason=context.get("gate_reason", ""),
-                      results=[], rationale="")
-        summary = f"SKIP — {context.get('gate_reason', 'gated')}"
+        # A circuit-breaker SKIP halts new ENTRIES — it must NOT strand open positions without
+        # their protective stops. So on a breaker SKIP we still run the deterministic exits, but
+        # only when the market is open with fresh data (never sell on a stale/closed quote).
+        exit_results = []
+        run_exits = (gate_reason.startswith("circuit_breaker")
+                     and context.get("market_open") and not context.get("data_stale"))
+        if run_exits:
+            exits = (context.get("screen") or {}).get("exits") or []
+            exit_actions = [{"symbol": e.get("symbol"), "side": "sell",
+                             "reason": f"[breaker-exit] {e.get('reason', '')}"}
+                            for e in exits if e.get("symbol")]
+            exit_results = [validate_and_fill(a, context, state, caps) for a in exit_actions]
+            write_json_atomic(state_path, state)
+        equity, day_pnl = recompute_portfolio(state, context)
+        filled = [r for r in exit_results if r["status"] == "filled"]
+        record.update(
+            action=("manage_exits" if run_exits else "skip"),
+            gate_reason=gate_reason, rationale="", results=exit_results,
+            n_filled=len(filled), n_rejected=len(exit_results) - len(filled),
+            # Audit: keep enough context to reconstruct what a skipped tick saw (held positions,
+            # the screen, whether entries were allowed) — half of all records are skips.
+            allow_entries=context.get("allow_entries"),
+            positions=context.get("positions"),
+            screen=context.get("screen"),
+            portfolio_after={"cash": round(state["cash"], 2), "equity": equity, "day_pnl": day_pnl,
+                             "open_positions": len(state["positions"]),
+                             "realized_total": round(state["realized_total"], 2)},
+        )
+        if filled:
+            parts = [f"SELL {r.get('qty', '?')} {r['symbol']} @ {r.get('price', '?')}" for r in filled]
+            summary = (f"BREAKER-EXIT {len(filled)} sold | equity={equity} day_pnl={day_pnl} | "
+                       + " ; ".join(parts))
+        else:
+            summary = f"SKIP — {gate_reason or 'gated'}"
     else:
         raw = Path(args.decision).read_text()
         decision = extract_decision(raw)
         results = [validate_and_fill(a, context, state, caps) for a in decision["actions"]]
         # Recompute equity post-fills with the same quotes used this tick.
-        pos_val = sum(p["qty"] * (cand_last(context, s) or p["entry_price"])
-                      for s, p in state["positions"].items())
-        equity = round(state["cash"] + pos_val, 2)
-        day_pnl = round(equity - (state.get("start_of_day_equity") or equity), 2)
-        state_path.write_text(json.dumps(state, indent=2))
+        equity, day_pnl = recompute_portfolio(state, context)
+        write_json_atomic(state_path, state)
         filled = [r for r in results if r["status"] == "filled"]
         rejected = [r for r in results if r["status"] != "filled"]
         record.update(

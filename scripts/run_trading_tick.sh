@@ -20,11 +20,19 @@ set +a
 PYTHON="${AGENTIC_PYTHON:-/Library/Frameworks/Python.framework/Versions/3.11/bin/python3}"
 [ -x "$PYTHON" ] || PYTHON="$(command -v python3)"
 CLAUDE_BIN="${AGENTIC_CLAUDE:-$(command -v claude || echo "$HOME/.local/bin/claude")}"
-TICK_MODEL="${TICK_MODEL:-claude-haiku-4-5-20251001}"
+DD_MODEL="${DD_MODEL:-claude-sonnet-4-6}"
 
 LOG_DIR="${REPO}/data/logs"; mkdir -p "$LOG_DIR"
 RUN_LOG="${LOG_DIR}/tick_$(date +%Y-%m-%d).log"
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$RUN_LOG"; }
+
+# Live mode is NOT yet wired into the executor — apply_decision.py only simulates paper fills
+# (there is no review_equity_order -> place_equity_order path). Refuse to run live so flipping
+# the flag can't silently no-op (or, worse, half-execute through the simulator).
+if [ "${TRADING_MODE:-paper}" = "live" ]; then
+  log "FATAL: TRADING_MODE=live but no live executor exists — refusing. Build the live path first."
+  exit 1
+fi
 
 # --- single-flight lock (atomic mkdir); treat >15-min-old lock as stale ---
 LOCK="${REPO}/data/.tick.lock"
@@ -38,7 +46,7 @@ fi
 trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 
 {
-  log "=== tick start (mode=${TRADING_MODE:-paper} model=${TICK_MODEL}) ==="
+  log "=== tick start (mode=${TRADING_MODE:-paper} screen=deterministic dd_model=${DD_MODEL}) ==="
 
   # 1) market regime (public data; appends to market_conditions.jsonl)
   "$PYTHON" "${REPO}/scripts/market_conditions.py" --quiet || log "market_conditions failed (continuing)"
@@ -53,7 +61,7 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
     # log the skipped tick deterministically; no LLM call
     "$PYTHON" "${REPO}/scripts/apply_decision.py" --context "$CTX" --skip | tee -a "$RUN_LOG"
   else
-    # 3) decide: Stage-1 screen (cheap) -> Stage-2 deep DD + commit (Opus + web) on candidates
+    # 3) decide: Stage-1 screen (deterministic) -> Stage-2 deep DD + commit (Sonnet + web) on candidates
     DEC="${REPO}/data/tick/decision_latest.json"
     if "$PYTHON" "${REPO}/scripts/decide.py" 2>>"$RUN_LOG" | tee -a "$RUN_LOG"; then
       # 4) apply + log (script) — re-checks caps, simulates fills, writes the what+why record

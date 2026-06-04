@@ -4,7 +4,7 @@ dd_probe.py — deep, script-side due-diligence on ONE candidate before committi
 
 Runs only in Stage 2 (when the cheap screen flags a real entry candidate), so cost is bounded.
 Gathers quantitative DD from public sources — NO LLM tokens spent here — and writes a compact
-JSON the Stage-2 commit model (Opus, with web news search) then judges.
+JSON the Stage-2 commit model (DD_MODEL, default Sonnet, with web news search) then judges.
 
 Signals:
   - multi-timeframe trend: 1/5/20-day returns, vs 20/50-day MA, distance from 3-mo high/low
@@ -118,7 +118,11 @@ def probe(sym: str) -> dict:
     out["flags"] = {
         "trend_up": (d20 is not None and d20 > 0) and (d50 is not None and d50 > 0),
         "volume_confirmed": rv is not None and rv >= 1.2,
-        "extended": (d3h is not None and d3h > -1.0) or (d20 is not None and d20 > 8),
+        # 'extended' = stretched FAR above its own 20d mean (mean-reversion risk). Being near the
+        # 3-mo high is NOT 'extended' — a breakout to new highs on volume is the momentum setup we
+        # want, not a disqualifier. 'at_high' is reported separately as informational context.
+        "extended": d20 is not None and d20 > 12,
+        "at_high": d3h is not None and d3h > -1.0,  # within ~1% of the 3-mo high (info, not a veto)
         "spread_ok": spread_pct is not None and spread_pct < 0.5,
     }
     return out

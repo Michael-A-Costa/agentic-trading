@@ -1,8 +1,18 @@
 # scripts/
 
-Headless, read-only jobs for the agentic-trading engine. None of these touch the Robinhood
-account or place orders — they assess the market and log. Order execution lives in the (future)
-engine, which is agent-driven via the MCP.
+Headless jobs for the agentic-trading engine. Two groups:
+
+1. **Market-data / regime** (`market_conditions.py`, `run_market_check.sh`) — read-only, public
+   data, touch no account. Stdlib-only.
+2. **Trading tick pipeline** (`run_trading_tick.sh` → `tick_context.py` → `dd_probe.py` →
+   `decide.py` → `apply_decision.py`) — the actual engine. In **PAPER mode it simulates fills**
+   against live public quotes and tracks a local portfolio in `data/paper_state.json`; it places
+   **no real orders**. Live mode (real MCP `review → place`) is not yet wired — the wrapper refuses
+   to run with `TRADING_MODE=live`. See the **Trading engine** section below.
+
+**Prereqs:** the data/regime scripts are stdlib-only. The tick pipeline additionally needs the
+`claude` CLI on `PATH` (or `AGENTIC_CLAUDE`) for the Stage-2 DD call, and Python 3.11 (or
+`AGENTIC_PYTHON`). Config is sourced from `.env` (see `.env.example`).
 
 ## `market_conditions.py` — market-regime checker
 Pulls index ETFs (SPY/QQQ/IWM/DIA) + VIXY (VIX proxy), classifies the session's
@@ -38,6 +48,41 @@ scripts/run_market_check.sh
 ```
 
 Override the interpreter if needed: `AGENTIC_PYTHON=/path/to/python3 scripts/run_market_check.sh`.
+
+---
+
+## Trading engine (one tick) — `run_trading_tick.sh`
+
+One PAPER tick, driven by the launchd agent every 5 min (`com.agentic.trading-tick.plist`). The
+LLM is invoked for **one thing only** — the Stage-2 DD commit/reject call — so a tick costs just
+the DD tokens. Everything else (gather, screen, exits, sizing checks, fills, logging) is
+deterministic Python:
+
+1. **`market_conditions.py`** — refresh the market regime (posture / volatility / breadth).
+2. **`tick_context.py`** — gather quotes + portfolio, compute P&L, and run the **deterministic
+   Stage-1 screen**: protective exits (stop / take-profit / EOD-flatten / max-hold) and entry
+   candidates (intraday movers that also clear a relative-strength-vs-SPY bar, not held, not in
+   post-exit cooldown). Decides the **GATE** (`TRADE` / `SKIP:<reason>`), including the daily-loss
+   circuit breaker. Writes `data/tick/context_latest.json`.
+3. **`dd_probe.py`** (Stage-2, per candidate) — deterministic quant DD (trend / MA / rel-volume /
+   vol / spread). No LLM.
+4. **`decide.py`** — for each candidate: run `dd_probe`, then the Stage-2 DD model (`DD_MODEL`,
+   default Sonnet, with WebSearch/WebFetch + a live MCP quote) returns commit/reject + size.
+   Per-symbol TTL cache (`DD_CACHE_TTL_MIN`); failures are not cached.
+5. **`apply_decision.py`** — the deterministic **executor + gate**: re-validates every action
+   against the `.env` caps (the LLM is advisory; this is the real guardrail), simulates the paper
+   fill, attaches the synthetic stop / take-profit, and appends the full what+why record to
+   `data/engine-log.jsonl`.
+
+On a `circuit_breaker` SKIP the engine still runs **protective exits** (it halts new entries, not
+stops). On `market_closed` / stale-data SKIPs it stays fully idle. `TRADING_MODE=live` is refused
+until the live executor is built.
+
+```bash
+scripts/run_trading_tick.sh                 # one paper tick by hand
+ALLOW_OFFHOURS=1 scripts/run_trading_tick.sh # force a tick when the market is closed (testing)
+tail -n 5 data/engine-log.jsonl             # the decision/fill audit trail
+```
 
 ---
 

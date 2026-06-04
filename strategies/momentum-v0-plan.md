@@ -28,8 +28,18 @@ Derived from `research/agentic-robinhood-mcp-landscape.md`. An **autonomous** mo
 | `MAX_OPEN_POSITIONS` | `6` | diversification |
 | `STOP_LOSS_PCT` / `TAKE_PROFIT_PCT` | `2.0` / `4.0` | per-position exits |
 | `MAX_PER_TRADE_LOSS_USD` | `60` | absolute per-trade stop budget |
-| `DAILY_MAX_LOSS_USD` | `150` | **circuit breaker** — halt new entries for the day |
-| `SIGNAL_THRESHOLD_PCT` | `2.0` | entry trigger; ≥ 2× spread |
+| `DAILY_MAX_LOSS_USD` | `150` | **circuit breaker** — halt new entries (re-checked at fill; exits still run) |
+| `SIGNAL_THRESHOLD_PCT` | `2.0` | absolute intraday entry trigger; ≥ 2× spread |
+| `REL_STRENGTH_PCT` | `1.0` | also require this much intraday % **above SPY** (don't just buy beta) |
+| `MIN_POSITION_USD` | `0` | reject dust fills (0 = off) |
+| `COOLDOWN_MIN` | `30` | no re-entry into a name within N min of exiting (anti-whipsaw) |
+| `FLATTEN_BEFORE_CLOSE_MIN` / `NO_ENTRY_LAST_MIN` | `15` / `15` | EOD flatten + block late entries |
+| `MAX_HOLD_MIN` | `0` | force-exit a stale position (0 = off) |
+| `DD_MODEL` / `MAX_DD_CANDIDATES` / `DD_CACHE_TTL_MIN` | Sonnet / `2` / `180` | Stage-2 commit model + cost bounds |
+
+> **All caps above are enforced deterministically** in `apply_decision.py` (buy branch) and
+> `tick_context.py` — `MAX_SYMBOL_WEIGHT` (fraction of live equity) and `MAX_PER_TRADE_LOSS_USD`
+> (bounds size so `notional × STOP_LOSS_PCT ≤` budget) are real reject branches, not just config.
 
 ### Stop protection: synthetic now, resting-broker later
 Every buy attaches an explicit `stop_price` (−`STOP_LOSS_PCT`) and `take_profit_price`
@@ -83,5 +93,35 @@ engine. Logs say "synthetic stop hit" so this is never mistaken for broker-grade
 
 ## Status / next
 - ✅ Authorized autonomous mode; CLAUDE.md + settings + `.env` updated.
-- ⏳ Waiting on the deposit (a few thousand). Until then: build the read-only DD + paper engine so we're ready
-  to flip to `live` the moment funds + market-open coincide.
+- ✅ Paper engine live (deterministic gather/screen/exits + Stage-2 LLM DD commit), logging to `data/`.
+- ⏳ Waiting on the deposit (a few thousand). Until then: run `paper`, review the log/P&L, tune knobs,
+  then build the live `review → place` path and flip to `live`.
+
+## Engine review — hardening applied (2026-06-04)
+A multi-dimension review (safety / algo / prompts / flows / code / docs) drove these fixes:
+- **Guardrails now real:** `MAX_SYMBOL_WEIGHT` + `MAX_PER_TRADE_LOSS_USD` enforced at fill (were
+  dead config); daily circuit breaker re-checked at fill (not just the gate); NaN/inf sizes and
+  dust (`MIN_POSITION_USD`) rejected; exposure valued at `max(last, entry)` (never under-counts).
+- **Risk inversion fixed:** on a `circuit_breaker` SKIP the engine still runs **protective exits**
+  (it halts entries, not stops) — but stays idle on stale/closed-market SKIPs.
+- **Atomic state writes** + refuse-on-corrupt-state (no silent re-baseline of the breaker).
+- **Live-mode fail-closed:** the wrapper and executor refuse `TRADING_MODE=live` until a real
+  `review → place` path exists.
+- **Flow:** a DD model timeout/parse-failure is now `error` (retried next tick), never a cached
+  "reject"; a `commit` without a valid size downgrades to reject; Stage-2 is portfolio-aware
+  (headroom, open positions, held names) and gets `range_pos` / relative strength.
+- **Algo:** relative-strength-vs-SPY screen, post-exit cooldown, EOD-flatten / max-hold time exits,
+  `extended` flag no longer vetoes volume-backed breakouts.
+- **Prompt:** hard-reject rubric (data-quality, earnings blackout, unexplained move, unconfirmed
+  momentum), conviction→size table capped at headroom, synthetic-stop risk awareness, strict JSON.
+
+### Deferred (needs backtest / more plumbing — flagged for owner judgment)
+- **`prev_close`-based momentum** (gap-and-go): screen on `max(move-from-open, move-from-prev-close)`;
+  needs prev_close threaded through the fetchers + `SIGNAL_THRESHOLD` re-tune.
+- **Volatility/ATR-scaled sizing** layered under the notional cap (high-IV names sized down).
+- **`dd_probe` history fallback** (Yahoo-only today → blind on a Yahoo miss, e.g. GOOGL); add a
+  second daily-history source so trend/MA/volume flags aren't false-on-missing-data.
+- **Deterministic earnings backstop** (fetch the date in `dd_probe`, enforce the blackout in code,
+  re-check at execution) instead of trusting the LLM-self-reported date.
+- **Trailing stop** (persist a high-water mark), **slippage model** for honest paper fills, a
+  **US-holiday calendar** in `session_state`, and **cache-keying on price/regime** drift.
