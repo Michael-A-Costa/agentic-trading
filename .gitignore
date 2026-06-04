@@ -1,0 +1,30 @@
+# Secrets & local config
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Account / market data, run artifacts (never commit real positions or balances)
+data/
+*.csv
+*.parquet
+*.sqlite
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.venv-*/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Claude Code — keep settings.local.json out of git (machine-specific)
+.claude/settings.local.json
+
+# OS
+.DS_Store
