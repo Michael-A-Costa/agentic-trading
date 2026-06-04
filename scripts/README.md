@@ -64,8 +64,19 @@ deterministic Python:
    candidates (intraday movers that also clear a relative-strength-vs-SPY bar, not held, not in
    post-exit cooldown). Decides the **GATE** (`TRADE` / `SKIP:<reason>`), including the daily-loss
    circuit breaker. Writes `data/tick/context_latest.json`.
-3. **`dd_probe.py`** (Stage-2, per candidate) — deterministic quant DD (trend / MA / rel-volume /
-   vol / spread). No LLM.
+3. **`dd_probe.py`** (Stage-2, per candidate) — deterministic quant DD. No LLM. All **keyless**.
+   - Intraday (Cboe live quote): move %, gap, range position, $-volume, spread, IV → flags
+     `spread_ok`/`liquid`/`iv_ok`/`parabolic`.
+   - Daily history (Cboe's CDN `…/charts/historical/{SYM}.json` — keyless, deep, reliable; Yahoo is
+     a 429-prone fallback): MA20/50, multi-day returns, 3-mo high/low, and **pace-adjusted**
+     rel-volume (today's partial volume scaled by session-elapsed) → flags `trend_up`/
+     `volume_confirmed`/`extended`/`at_high`.
+   - Daily bars are **cached per symbol** in `data/history/{SYM}.json`, refreshed once per ET day
+     (bars only finalize after the close), so history is fetched once/symbol/day instead of every
+     tick — and if Cboe is briefly unreachable, the last-known-good file keeps DD running.
+   - If every history source fails *and* there's no cache, `history_ok=false` and those last flags
+     are `null` (unknown, never `false`) so a data gap can't masquerade as weak momentum; the model
+     then judges on intraday + catalyst.
 4. **`decide.py`** — for each candidate: run `dd_probe`, then the Stage-2 DD model (`DD_MODEL`,
    default Sonnet, with WebSearch/WebFetch + a live MCP quote) returns commit/reject + size.
    Per-symbol TTL cache (`DD_CACHE_TTL_MIN`); failures are not cached.
@@ -81,8 +92,15 @@ until the live executor is built.
 ```bash
 scripts/run_trading_tick.sh                 # one paper tick by hand
 ALLOW_OFFHOURS=1 scripts/run_trading_tick.sh # force a tick when the market is closed (testing)
-tail -n 5 data/engine-log.jsonl             # the decision/fill audit trail
+tail -n 30 data/logs/tick_$(date +%F).log   # human trail: per-candidate WHY (commit/reject + reason)
+tail -n 5  data/engine-log.jsonl            # full machine audit trail (dd reason/catalysts/risks)
 ```
+
+Each tick's console/`tick_*.log` now spells out the **why**, not just counts: every screened
+candidate's signal, its Stage-2 DD verdict (`COMMIT`/`REJECT`/`ERROR`) with the model's reason and
+whether it was a `[fresh Ns]` call or a `[cached Nm]` reuse, any cap rejections, and the final
+HOLD/fill line — so a no-trade tick says *why* nobody traded. `tick end (Ns)` shows tick latency
+(cached ≈1s, a fresh DD ≈50s).
 
 ---
 
