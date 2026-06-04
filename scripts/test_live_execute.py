@@ -148,10 +148,46 @@ def test_order_obj_and_place_failure():
     check("relay junk -> None", le.order_obj("not a dict") is None)
 
 
+def test_reconcile_round_trip_on_close():
+    # a lot WE entered (not adopted) that the broker no longer holds -> a real round-trip; the
+    # canary cap must lift, and the close must be booked.
+    state = {"lots": {"ABC": {"qty": 5, "entry_price": 50.0, "adopted": False,
+                              "resting_stop_order_id": "s1"}},
+             "_caps": {"STOP_LOSS_PCT": 4.0, "TAKE_PROFIT_PCT": 12.0}, "live_round_trip_done": False}
+    le.reconcile(state, {"positions": {}, "orders": [], "quotes": {}}, log := [])
+    check("closed lot dropped", "ABC" not in state["lots"])
+    check("our close flips round-trip", state["live_round_trip_done"] is True)
+    check("close booked as closed_external", any(e["event"] == "closed_external" for e in log))
+    check("last_exit recorded", "ABC" in (state.get("last_exit") or {}))
+
+
+def test_reconcile_adopted_close_no_round_trip():
+    # an ADOPTED position (we didn't enter it) closing is NOT our round-trip -> canary stays on.
+    state = {"lots": {"XYZ": {"qty": 3, "entry_price": 10.0, "adopted": True}},
+             "_caps": {}, "live_round_trip_done": False}
+    le.reconcile(state, {"positions": {}, "orders": [], "quotes": {}}, [])
+    check("adopted close keeps canary", state["live_round_trip_done"] is False)
+
+
+def test_reconcile_pending_not_booked_closed():
+    # a PENDING entry from a prior tick that never filled must NOT be booked as a closed position,
+    # must not count as a round-trip, and must not leave a cooldown stamp. (Unarmed -> no cancel.)
+    state = {"lots": {"PEND": {"pending": True, "entry_order_id": "o9"}},
+             "_caps": {}, "live_round_trip_done": False}
+    le.reconcile(state, {"positions": {}, "orders": [], "quotes": {}}, log := [])
+    check("pending lot dropped", "PEND" not in state["lots"])
+    check("pending NOT booked as closed", not any(e["event"] == "closed_external" for e in log))
+    check("pending logged unfilled", any(e["event"] == "entry_unfilled" for e in log))
+    check("pending does not flip round-trip", state["live_round_trip_done"] is False)
+    check("no cooldown for unfilled entry", "PEND" not in (state.get("last_exit") or {}))
+
+
 if __name__ == "__main__":
     tests = [test_whole_share_entry, test_fractional_entry, test_canary_caps_notional,
              test_cap_rejects, test_sell_specs, test_review_gating, test_snapshot_parse_real_shapes,
-             test_buying_power_fallback_to_cash, test_order_obj_and_place_failure]
+             test_buying_power_fallback_to_cash, test_order_obj_and_place_failure,
+             test_reconcile_round_trip_on_close, test_reconcile_adopted_close_no_round_trip,
+             test_reconcile_pending_not_booked_closed]
     for fn in tests:
         fn()
     print(f"OK — {_passed} assertions passed across {len(tests)} tests")

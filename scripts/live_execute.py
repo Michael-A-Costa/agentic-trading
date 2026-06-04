@@ -325,6 +325,7 @@ def reconcile(state: dict, broker: dict, log: list) -> None:
                                     "scaled": [], "stop_type": "synthetic", "resting_stop_order_id": None,
                                     "adopted": sym not in lots})
         lot["qty"] = bp["qty"]
+        lot.pop("pending", None)  # broker shows the position -> entry confirmed, no longer pending
         if bp.get("avg_cost"):
             lot["entry_price"] = bp["avg_cost"]
         sl = state.get("_caps", {}).get("STOP_LOSS_PCT", 4.0)
@@ -354,14 +355,32 @@ def reconcile(state: dict, broker: dict, log: list) -> None:
                 lot["stop_type"] = "synthetic"  # dry-run: rely on the engine-tick synthetic stop
                 log.append({"event": "arm_stop_dryrun", "symbol": sym, "stop_price": lot.get("stop_price")})
 
-    # 2) lots we track but the broker no longer holds: closed (stop fired / sold while asleep).
+    # 2) lots we track but the broker no longer holds. Two cases:
+    #    a) a PENDING entry from a prior tick that never showed as a position -> it didn't fill
+    #       (marketable limit gapped away / GFD expired). Cancel any still-open entry order and drop
+    #       the lot — do NOT book it as a closed position (it was never opened), and do NOT count it
+    #       as a round-trip.
+    #    b) a position we actually held that's now gone -> a real closure (stop fired / sold while
+    #       asleep). Record the exit; if it was a lot we entered ourselves (not adopted), one full
+    #       live round-trip is now complete, so the canary notional cap can lift.
     for sym in list(lots.keys()):
         if sym not in bpos:
-            closed = lots.pop(sym)
+            stale = lots.pop(sym)
+            if stale.get("pending"):
+                eoid = stale.get("entry_order_id")
+                if eoid and do_arm:
+                    c = rh_mcp.cancel(eoid)
+                    log.append({"event": "entry_unfilled_cancelled", "symbol": sym,
+                                "order_id": eoid, "result": c})
+                else:
+                    log.append({"event": "entry_unfilled", "symbol": sym, "order_id": eoid})
+                continue
             state.setdefault("last_exit", {})[sym] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             log.append({"event": "closed_external", "symbol": sym,
                         "note": "position gone from broker — resting stop fired or sold while engine asleep",
-                        "had_stop": closed.get("resting_stop_order_id")})
+                        "had_stop": stale.get("resting_stop_order_id")})
+            if not stale.get("adopted"):
+                state["live_round_trip_done"] = True
 
 
 def execute_sell(sym: str, action: dict, state: dict, broker: dict, caps: dict, log: list) -> dict:
@@ -409,7 +428,8 @@ def execute_sell(sym: str, action: dict, state: dict, broker: dict, caps: dict, 
 
 
 def execute_buy(sym: str, action: dict, state: dict, broker: dict, caps: dict,
-                exposure: float, day_pnl: float | None, log: list) -> dict:
+                exposure: float, buying_power: float, n_positions: int,
+                day_pnl: float | None, log: list) -> dict:
     import rh_mcp
     lots = state["lots"]
     res = {"symbol": sym, "side": "buy", "reason": action.get("reason", ""), "status": "skipped"}
@@ -428,8 +448,8 @@ def execute_buy(sym: str, action: dict, state: dict, broker: dict, caps: dict,
     existing_val = (broker["positions"].get(sym, {}).get("qty", 0.0)
                     * (quote.get("last") or quote.get("ask") or 0.0))
     ok, reason = check_entry_caps(plan, existing_val=existing_val, exposure=exposure,
-                                  buying_power=broker["buying_power"],
-                                  n_positions=len(broker["positions"]), held=sym in broker["positions"],
+                                  buying_power=buying_power,
+                                  n_positions=n_positions, held=sym in broker["positions"],
                                   caps=caps, day_pnl=day_pnl)
     if not ok:
         res.update(reject_reason=reason, plan=plan)
@@ -466,7 +486,8 @@ def execute_buy(sym: str, action: dict, state: dict, broker: dict, caps: dict,
     # arms the resting stop off the real cost basis.
     lots[sym] = {**lots.get(sym, {}), "entry_ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                  "scaled": lots.get(sym, {}).get("scaled", []), "stop_type": plan["stop_type"],
-                 "resting_stop_order_id": None, "last_entry_ref_id": ref_id, "pending": True}
+                 "resting_stop_order_id": None, "last_entry_ref_id": ref_id, "pending": True,
+                 "entry_order_id": order_id}
     res.update(status="placed", ref_id=ref_id, order_id=order_id, order=placed)
     log.append({"event": "buy_placed", "symbol": sym, "spec": spec, "ref_id": ref_id,
                 "order_id": order_id, "plan": plan, "order": placed})
@@ -520,7 +541,13 @@ def main() -> int:
             results.append(execute_sell(str(a.get("symbol", "")).upper(), a, state, broker, caps, log))
         # re-check the breaker once before any entry (deterministic, on broker numbers)
         breaker = day_pnl <= -caps.get("DAILY_MAX_LOSS_USD", 150.0)
+        # Running tallies so multiple buys in ONE tick respect the caps CUMULATIVELY: a placed buy
+        # consumes buying power, adds exposure, and may open a new position slot. Without this each
+        # buy checks against the pre-tick snapshot and N buys could collectively breach the caps.
+        # Mirrors paper's per-fill recompute (apply_decision.validate_and_fill).
+        run_exposure, run_bp, run_npos = exposure, broker["buying_power"], len(broker["positions"])
         for a in [x for x in actions if str(x.get("side")).lower() == "buy"]:
+            sym = str(a.get("symbol", "")).upper()
             if breaker:
                 results.append({"symbol": a.get("symbol"), "side": "buy", "status": "skipped",
                                 "reject_reason": f"circuit_breaker day_pnl={day_pnl}"})
@@ -529,13 +556,18 @@ def main() -> int:
                 results.append({"symbol": a.get("symbol"), "side": "buy", "status": "skipped",
                                 "reject_reason": "entries disabled (market closed/stale)"})
                 continue
-            results.append(execute_buy(str(a.get("symbol", "")).upper(), a, state, broker, caps,
-                                       exposure, day_pnl, log))
+            r = execute_buy(sym, a, state, broker, caps, run_exposure, run_bp, run_npos, day_pnl, log)
+            results.append(r)
+            if r.get("status") == "placed":
+                notional = (r.get("plan") or {}).get("notional") or 0.0
+                run_exposure += notional
+                run_bp = max(0.0, run_bp - notional)
+                if sym not in broker["positions"]:
+                    run_npos += 1
 
-    # mark a completed round-trip so the canary cap lifts (a placed buy that later fully exits)
-    if armed() and any(r.get("status") == "placed" and r.get("side") == "buy" for r in results):
-        state["live_round_trip_done"] = True
-
+    # NOTE: the canary round-trip flag (state["live_round_trip_done"]) is now set in reconcile() when
+    # a lot we entered actually closes — NOT on a placed buy. The cap must survive until a real
+    # entry->exit cycle completes, not lift the moment the first order fills.
     state.pop("_caps", None)
     write_json_atomic(STATE_PATH, state)
 
