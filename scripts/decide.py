@@ -43,38 +43,20 @@ def save_cache(cache: dict) -> None:
     DD_CACHE.write_text(json.dumps(cache, indent=2))
 
 
-def run_dd(sym: str, screen_reason: str, packet: dict, caps: dict, cash: float, dd_model: str) -> dict:
-    """The expensive Stage-2 work for one symbol: deep quant probe + Sonnet news/catalyst commit."""
-    subprocess.run([PYEXE, str(SCRIPTS / "dd_probe.py"), sym],
-                   capture_output=True, text=True, timeout=60)
-    dd_file = TICK / f"dd_{sym}.json"
-    dd = json.loads(dd_file.read_text()) if dd_file.exists() else {"symbol": sym, "error": "no_dd"}
-    dd_input = json.dumps({
-        "symbol": sym,
-        "screen_reason": screen_reason,
-        "regime": packet.get("regime"),
-        "sizing": {"MAX_POSITION_USD": caps["MAX_POSITION_USD"], "available_cash": round(cash, 2)},
-        "dd": dd,
-    })
-    commit = extract_decision(run_claude((SCRIPTS / "dd_prompt.txt").read_text() + dd_input,
-                                         dd_model, websearch=True, timeout=300))
-    return {"symbol": sym, "decision": (commit.get("decision") or "reject").lower(),
-            "conviction": commit.get("conviction"), "dollar_amount": commit.get("dollar_amount"),
-            "reason": commit.get("reason", ""), "catalysts": commit.get("catalysts", []),
-            "risks": commit.get("risks", [])}
-
-
 def claude_bin() -> str:
     return (os.environ.get("AGENTIC_CLAUDE") or shutil.which("claude")
             or str(Path.home() / ".local/bin/claude"))
 
 
-def run_claude(prompt: str, model: str, websearch: bool = False, timeout: int = 240) -> str:
-    cmd = [claude_bin(), "-p", prompt, "--model", model, "--output-format", "text"]
-    if websearch:
-        cmd += ["--allowedTools", "WebSearch", "--dangerously-skip-permissions"]
-    else:
-        cmd += ["--strict-mcp-config"]  # no MCP/tools needed for the cheap screen
+def run_claude(prompt: str, model: str, tools: list | None = None, mcp: bool = False,
+               timeout: int = 360) -> str:
+    """Headless Claude. --strict-mcp-config => only the servers we pass (none, or the RH MCP)."""
+    cmd = [claude_bin(), "-p", prompt, "--model", model, "--output-format", "text",
+           "--strict-mcp-config"]
+    if mcp:
+        cmd += ["--mcp-config", str(REPO / ".mcp.json")]
+    if tools:
+        cmd += ["--allowedTools", *tools, "--dangerously-skip-permissions"]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return r.stdout or ""
@@ -82,18 +64,41 @@ def run_claude(prompt: str, model: str, websearch: bool = False, timeout: int = 
         return ""
 
 
+# Stage-2 DD agent toolset: quant is script-gathered; the agent adds live quote + news research.
+DD_TOOLS = ["WebSearch", "WebFetch", "mcp__robinhood-trading__get_equity_quotes"]
+
+
+def run_dd(sym: str, screen_reason: str, regime: dict, caps: dict, cash: float, dd_model: str) -> dict:
+    """Stage-2 research agent for one symbol: deep quant probe + multi-tool news/catalyst commit."""
+    subprocess.run([PYEXE, str(SCRIPTS / "dd_probe.py"), sym],
+                   capture_output=True, text=True, timeout=60)
+    dd_file = TICK / f"dd_{sym}.json"
+    dd = json.loads(dd_file.read_text()) if dd_file.exists() else {"symbol": sym, "error": "no_dd"}
+    dd_input = json.dumps({
+        "symbol": sym,
+        "screen_reason": screen_reason,
+        "regime": regime,
+        "sizing": {"MAX_POSITION_USD": caps["MAX_POSITION_USD"], "available_cash": round(cash, 2)},
+        "dd": dd,
+    })
+    out = run_claude((SCRIPTS / "dd_prompt.txt").read_text() + dd_input,
+                     dd_model, tools=DD_TOOLS, mcp=True, timeout=420)
+    commit = extract_decision(out)
+    return {"symbol": sym, "decision": (commit.get("decision") or "reject").lower(),
+            "conviction": commit.get("conviction"), "dollar_amount": commit.get("dollar_amount"),
+            "reason": commit.get("reason", ""), "catalysts": commit.get("catalysts", []),
+            "risks": commit.get("risks", [])}
+
+
 def main() -> int:
     context = json.loads((TICK / "context_latest.json").read_text())
-    packet = json.loads((TICK / "packet_latest.json").read_text())
     caps = context["caps"]
-    screen_model = os.environ.get("SCREEN_MODEL", "claude-haiku-4-5-20251001")
-    dd_model = os.environ.get("DD_MODEL", "claude-opus-4-8")
+    regime = context.get("regime", {})
+    dd_model = os.environ.get("DD_MODEL", "claude-sonnet-4-6")
     max_dd = int(os.environ.get("MAX_DD_CANDIDATES", "2"))
 
-    # --- Stage 1: screen ---
-    screen_raw = run_claude((SCRIPTS / "tick_prompt.txt").read_text() + json.dumps(packet),
-                            screen_model, timeout=90)
-    screen = extract_decision(screen_raw)  # tolerant; gives {} fields if malformed
+    # --- Stage 1 is now DETERMINISTIC (computed in tick_context.py) — just read it ---
+    screen = context.get("screen", {})
     exits = screen.get("exits") or []
     candidates = screen.get("entry_candidates") or []
 
@@ -121,7 +126,7 @@ def main() -> int:
                 res = {**cached["result"], "cached": True,
                        "cached_age_min": int((now - cached["ts"]) / 60)}
             else:
-                res = run_dd(sym, c.get("reason", ""), packet, caps, cash, dd_model)
+                res = run_dd(sym, c.get("reason", ""), regime, caps, cash, dd_model)
                 cache[sym] = {"ts": now, "result": res}
                 cache_dirty = True
             dd_results.append(res)
@@ -133,10 +138,13 @@ def main() -> int:
         if cache_dirty:
             save_cache(cache)
 
+    rationale = (f"{len(exits)} rule-exit(s), {len(candidates)} screened candidate(s)"
+                 + (" [hostile regime: entries off]" if screen.get("hostile_regime") else "")
+                 + (" [entries gated: market closed/stale]" if not context.get("allow_entries") else ""))
     decision_out = {
         "actions": actions,
-        "rationale": screen.get("rationale", ""),
-        "screen": {"exits": exits, "entry_candidates": candidates},
+        "rationale": rationale,
+        "screen": screen,
         "dd": dd_results,
     }
     TICK.mkdir(parents=True, exist_ok=True)

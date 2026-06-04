@@ -158,7 +158,24 @@ def main() -> int:
     }
     regime = latest_regime()
 
-    # --- data freshness / entry permission ---
+    # --- DETERMINISTIC screen (rules, no LLM): exits + entry candidates ---
+    # Exits are pure risk rules (stop-loss / take-profit) — never a model decision.
+    tp, sl = caps["TAKE_PROFIT_PCT"], caps["STOP_LOSS_PCT"]
+    sig = caps["SIGNAL_THRESHOLD_PCT"]
+    exits = []
+    for p in positions:
+        pp = p.get("pnl_pct")
+        if pp is None:
+            continue
+        if pp >= tp:
+            exits.append({"symbol": p["symbol"], "reason": f"take-profit {pp}% >= {tp}%"})
+        elif pp <= -sl:
+            exits.append({"symbol": p["symbol"], "reason": f"stop-loss {pp}% <= -{sl}%"})
+
+    # Entry candidates = movers above the signal threshold, in a non-hostile regime, not already
+    # held. Ranked by intraday strength. Stage 2 (Sonnet + DD) makes the real commit decision.
+    hostile = (regime.get("posture") == "risk_off") or (regime.get("volatility_regime") == "elevated")
+    held = {p["symbol"] for p in positions}
     # A quote is only a LIVE signal during regular hours AND when it carries today's date.
     # Off-hours quotes are the prior session's close — never a basis for a NEW entry.
     spy_date = (quotes.get("SPY") or {}).get("date")
@@ -166,6 +183,18 @@ def main() -> int:
     allow_entries = bool(is_open and not data_stale)
     stale_reason = ("market_not_open" if not is_open
                     else f"stale_quote_date={spy_date}" if data_stale else "")
+
+    entry_candidates = []
+    if allow_entries and not hostile:
+        movers = [c for c in cand
+                  if c.get("intraday_pct") is not None and c["intraday_pct"] >= sig
+                  and c["symbol"] not in held]
+        movers.sort(key=lambda c: c["intraday_pct"], reverse=True)
+        entry_candidates = [{"symbol": c["symbol"],
+                             "reason": f"+{c['intraday_pct']}% intraday >= {sig}%, "
+                                       f"{regime.get('posture')} regime"} for c in movers]
+    screen = {"exits": exits, "entry_candidates": entry_candidates,
+              "hostile_regime": hostile}
 
     # --- GATE decision (deterministic; the wrapper branches on this) ---
     gate, reason = "TRADE", ""
@@ -199,6 +228,7 @@ def main() -> int:
         },
         "positions": positions,
         "candidates": cand,
+        "screen": screen,
         "caps": caps,
         "gate": gate,
         "gate_reason": reason,
