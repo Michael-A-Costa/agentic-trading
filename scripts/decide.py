@@ -23,6 +23,7 @@ import sys
 import time
 from pathlib import Path
 
+import stock_memory as memory                # sibling: long-term per-symbol eval memory + exclusions
 from apply_decision import extract_decision  # sibling: robust JSON extraction
 
 REPO = Path(__file__).resolve().parent.parent
@@ -142,6 +143,9 @@ def run_dd(c: dict, regime: dict, caps: dict, portfolio: dict, dd_model: str) ->
         "portfolio": {"open_positions": portfolio.get("open_positions", 0),
                       "max_open_positions": caps["MAX_OPEN_POSITIONS"],
                       "held_symbols": portfolio.get("held", [])},
+        # Prime with our OWN past verdicts on this name (None if never evaluated): if the same
+        # disqualifier still holds, the model rejects fast; if the picture changed, it says so.
+        "prior_evaluation": memory.get_note(sym),
         "dd": dd,
     })
     out = run_claude((SCRIPTS / "dd_prompt.txt").read_text() + dd_input,
@@ -168,7 +172,10 @@ def run_dd(c: dict, regime: dict, caps: dict, portfolio: dict, dd_model: str) ->
             commit["reason"] = f"commit returned without a valid size; {commit.get('reason', '')}".strip()
     return {"symbol": sym, "decision": decision, "conviction": commit.get("conviction"),
             "dollar_amount": dollar, "reason": commit.get("reason", ""),
-            "catalysts": commit.get("catalysts", []), "risks": commit.get("risks", [])}
+            "catalysts": commit.get("catalysts", []), "risks": commit.get("risks", []),
+            "next_earnings_date": commit.get("next_earnings_date"),
+            "never_buy": bool(commit.get("never_buy")),          # structural disqualifier -> exclude
+            "never_buy_reason": commit.get("never_buy_reason")}
 
 
 def main() -> int:
@@ -186,16 +193,18 @@ def main() -> int:
     actions = [{"symbol": e.get("symbol"), "side": "sell", "reason": e.get("reason", "")}
                for e in exits if e.get("symbol")]
 
-    # --- Stage 2: deep DD + commit, with a per-symbol COMMIT-ONLY TTL cache ---
-    # We cache COMMITS only: a commit is the expensive verdict to recompute, and execution still
+    # --- Stage 2: deep DD + commit, with a per-symbol TTL cache (split commit/reject TTLs) ---
+    # Commits are cached for DD_CACHE_TTL_MIN (longer): expensive to recompute, and execution still
     # re-checks fresh price + caps + allow_entries in apply_decision, so reusing one briefly never
-    # trades on a stale price. REJECTS are never cached — an improving setup (volume finally
-    # confirms, a catalyst lands) must be free to re-clear DD on the very next tick instead of
-    # being suppressed for the whole TTL. DD only runs when a name has cleared the screen as a
-    # potential BUY, so the cache is short by design. Tune DD_CACHE_TTL_MIN (default 30) to taste.
+    # trades on a stale price. Rejects are cached for a SHORTER DD_REJECT_TTL_MIN so a name whose
+    # setup is improving re-evaluates within the hour — but NOT every tick, which (with dynamic
+    # discovery surfacing the same top movers repeatedly) would re-burn a ~85s Sonnet+web call on the
+    # same reject every 5 minutes. Errors are never cached (retry next tick). Set DD_REJECT_TTL_MIN=0
+    # to disable reject caching (re-DD every tick).
     dd_results = []
     cache = load_cache()
-    ttl = int(os.environ.get("DD_CACHE_TTL_MIN", "30")) * 60
+    commit_ttl = int(os.environ.get("DD_CACHE_TTL_MIN", "30")) * 60
+    reject_ttl = int(os.environ.get("DD_REJECT_TTL_MIN", "20")) * 60
     now = time.time()
     cache_dirty = False
     if context.get("allow_entries") and candidates:
@@ -210,21 +219,29 @@ def main() -> int:
             sym = str(c.get("symbol", "")).upper().strip()
             if not sym:
                 continue
+            # Serve a fresh cached verdict, applying the right TTL per decision: commits live longer
+            # than rejects; errors are never cached so they retry. reject_ttl=0 disables reject reuse.
+            res = None
             cached = cache.get(sym)
-            # Serve from cache ONLY a fresh commit. The decision guard makes the cache self-correct
-            # even if an older file still holds reject entries — they're ignored and left to expire.
-            if (cached and (now - cached.get("ts", 0)) < ttl
-                    and (cached.get("result") or {}).get("decision") == "commit"):
-                res = {**cached["result"], "cached": True,
-                       "cached_age_min": int((now - cached["ts"]) / 60)}
-            else:
+            if cached:
+                cdec = (cached.get("result") or {}).get("decision")
+                age = now - cached.get("ts", 0)
+                ttl = commit_ttl if cdec == "commit" else (reject_ttl if cdec == "reject" else 0)
+                if ttl > 0 and age < ttl:
+                    res = {**cached["result"], "cached": True, "cached_age_min": int(age / 60)}
+            if res is None:
                 t0 = time.time()
                 res = run_dd(c, regime, caps, portfolio, dd_model)
-                # Cache COMMITS only. A reject (or an error) is never frozen: it must be re-run next
-                # tick so a name whose setup improves isn't locked out for the whole TTL.
-                if res.get("decision") == "commit":
+                # Cache commits and rejects (each reused under its own TTL at read time); never cache
+                # an error — a transient model/timeout failure must be retried, not frozen.
+                if res.get("decision") in ("commit", "reject"):
                     cache[sym] = {"ts": now, "result": res}
                     cache_dirty = True
+                    # Persist the main points to long-term memory and auto-exclude a never-buy name.
+                    memory.record(sym, decision=res["decision"], conviction=res.get("conviction"),
+                                  reason=res.get("reason", ""), catalysts=res.get("catalysts"),
+                                  risks=res.get("risks"), next_earnings_date=res.get("next_earnings_date"),
+                                  never_buy=res.get("never_buy"), never_buy_reason=res.get("never_buy_reason"))
                 res = {**res, "dd_elapsed_s": round(time.time() - t0, 1)}  # annotate in-memory copy
             dd_results.append(res)
             if res.get("decision") == "commit" and res.get("dollar_amount"):
