@@ -65,6 +65,31 @@ def extract_decision(raw: str) -> dict:
     return d
 
 
+def decide_summary(filled: list, rejected: list, decision: dict, equity, day_pnl) -> str:
+    """Final one-line tick summary — always explains WHY, so a HOLD is never a silent dead-end.
+
+    Three cases, in priority order:
+      - something filled / a cap rejected a proposed trade -> list each with its reason
+      - nothing happened but the screen DID find names -> show the per-candidate DD verdict + reason
+      - nothing happened and no candidates -> the screen rationale
+    """
+    parts = [f"{r['side'].upper()} {r.get('qty', '?')} {r['symbol']} @ {r.get('price', '?')}"
+             f" — {str(r.get('reason', ''))[:60]}" for r in filled]
+    # A post-commit cap rejection is its own important 'why': the LLM wanted in, a guardrail blocked it.
+    rej = [f"{r['symbol']} {r['side']} REJECTED: {r.get('reject_reason')}" for r in rejected]
+    if parts or rej:
+        return (f"{len(filled)} filled, {len(rejected)} rejected | equity={equity} "
+                f"day_pnl={day_pnl} | " + " ; ".join(parts + rej))
+    # No actions at all -> the screen surfaced candidates but Stage-2 DD committed to none. Surface
+    # each candidate's verdict + reason so the operator sees why no entry was taken.
+    dd = decision.get("dd") or []
+    if dd:
+        why = " ; ".join(f"{d.get('symbol')} {(d.get('decision') or '?').upper()}: "
+                         f"{(d.get('reason') or d.get('error') or '').strip()[:90]}" for d in dd)
+        return f"HOLD — 0 of {len(dd)} candidate(s) committed: {why} | equity={equity}"
+    return f"HOLD ({decision.get('rationale', 'no action')[:80]}) | equity={equity}"
+
+
 def cand_last(context: dict, sym: str) -> float | None:
     for c in context.get("candidates", []):
         if c["symbol"] == sym:
@@ -308,7 +333,7 @@ def main() -> int:
             summary = (f"BREAKER-EXIT {len(filled)} sold | equity={equity} day_pnl={day_pnl} | "
                        + " ; ".join(parts))
         else:
-            summary = f"SKIP — {gate_reason or 'gated'}"
+            summary = f"SKIP — {gate_reason or 'gated'} | equity={equity} day_pnl={day_pnl}"
     else:
         raw = Path(args.decision).read_text()
         decision = extract_decision(raw)
@@ -333,12 +358,7 @@ def main() -> int:
             record["screen"] = decision["screen"]  # Stage-1 exits + entry candidates (audit)
         if decision.get("_parse_error"):
             record["parse_error"] = True
-        parts = [f"{r['side'].upper()} {r.get('qty', '?')} {r['symbol']} @ {r.get('price', '?')}"
-                 f" — {r['reason'][:60]}" for r in filled]
-        rej = [f"{r['symbol']} {r['side']} rejected: {r.get('reject_reason')}" for r in rejected]
-        summary = (f"{len(filled)} filled, {len(rejected)} rejected | equity={equity} "
-                   f"day_pnl={day_pnl} | " + " ; ".join(parts + rej) if (parts or rej)
-                   else f"HOLD ({decision.get('rationale', 'no action')[:80]}) | equity={equity}")
+        summary = decide_summary(filled, rejected, decision, equity, day_pnl)
 
     ENGINE_LOG.parent.mkdir(parents=True, exist_ok=True)
     with ENGINE_LOG.open("a") as f:

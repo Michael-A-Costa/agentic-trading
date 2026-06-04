@@ -77,6 +77,30 @@ def run_claude(prompt: str, model: str, tools: list | None = None, mcp: bool = F
 DD_TOOLS = ["WebSearch", "WebFetch", "mcp__robinhood-trading__get_equity_quotes"]
 
 
+def fmt_candidate(c: dict) -> str:
+    """One screened entry candidate -> compact signal string for the log."""
+    return f"{c.get('symbol', '?')}(+{c.get('intraday_pct')}% rel {c.get('rel_strength')})"
+
+
+def fmt_dd_line(d: dict) -> str:
+    """One Stage-2 DD verdict -> a human line explaining WHY it committed / rejected / errored.
+
+    Shows the verdict, whether it came from a fresh model call or the TTL cache (and how old),
+    the size on a commit, and the model's own reason — so a reject is never a silent count.
+    """
+    sym = d.get("symbol", "?")
+    dec = (d.get("decision") or "?").upper()
+    if d.get("cached"):
+        src = f"cached {d.get('cached_age_min', '?')}m"   # reused verdict — explains a fast tick
+    elif d.get("dd_elapsed_s") is not None:
+        src = f"fresh {d['dd_elapsed_s']}s"                # live Sonnet+web call — explains a slow tick
+    else:
+        src = "fresh"
+    reason = (d.get("reason") or d.get("error") or "(no reason given)").strip().replace("\n", " ")
+    size = f" ${d.get('dollar_amount')} {d.get('conviction')}" if dec == "COMMIT" else ""
+    return f"  DD {sym}: {dec} [{src}]{size} — {reason[:300]}"
+
+
 def run_dd(c: dict, regime: dict, caps: dict, portfolio: dict, dd_model: str) -> dict:
     """Stage-2 research agent for one symbol: deep quant probe + multi-tool news/catalyst commit.
 
@@ -162,14 +186,16 @@ def main() -> int:
     actions = [{"symbol": e.get("symbol"), "side": "sell", "reason": e.get("reason", "")}
                for e in exits if e.get("symbol")]
 
-    # --- Stage 2: deep DD + commit, with a per-symbol TTL cache ---
-    # If the same name keeps clearing the screen tick-after-tick, we don't re-burn a ~60s
-    # Sonnet+web call each time — we reuse the recent verdict until DD_CACHE_TTL_MIN expires.
-    # Execution still re-checks fresh price + caps + allow_entries in apply_decision, so a cached
-    # commit never trades on a stale price. Tune DD_CACHE_TTL_MIN (60..1440) to taste.
+    # --- Stage 2: deep DD + commit, with a per-symbol COMMIT-ONLY TTL cache ---
+    # We cache COMMITS only: a commit is the expensive verdict to recompute, and execution still
+    # re-checks fresh price + caps + allow_entries in apply_decision, so reusing one briefly never
+    # trades on a stale price. REJECTS are never cached — an improving setup (volume finally
+    # confirms, a catalyst lands) must be free to re-clear DD on the very next tick instead of
+    # being suppressed for the whole TTL. DD only runs when a name has cleared the screen as a
+    # potential BUY, so the cache is short by design. Tune DD_CACHE_TTL_MIN (default 30) to taste.
     dd_results = []
     cache = load_cache()
-    ttl = int(os.environ.get("DD_CACHE_TTL_MIN", "180")) * 60
+    ttl = int(os.environ.get("DD_CACHE_TTL_MIN", "30")) * 60
     now = time.time()
     cache_dirty = False
     if context.get("allow_entries") and candidates:
@@ -185,16 +211,21 @@ def main() -> int:
             if not sym:
                 continue
             cached = cache.get(sym)
-            if cached and (now - cached.get("ts", 0)) < ttl:
+            # Serve from cache ONLY a fresh commit. The decision guard makes the cache self-correct
+            # even if an older file still holds reject entries — they're ignored and left to expire.
+            if (cached and (now - cached.get("ts", 0)) < ttl
+                    and (cached.get("result") or {}).get("decision") == "commit"):
                 res = {**cached["result"], "cached": True,
                        "cached_age_min": int((now - cached["ts"]) / 60)}
             else:
+                t0 = time.time()
                 res = run_dd(c, regime, caps, portfolio, dd_model)
-                # Never cache a failure — a transient timeout / parse error must be retried next
-                # tick, not frozen as a verdict that suppresses a good name for the whole TTL.
-                if res.get("decision") != "error":
+                # Cache COMMITS only. A reject (or an error) is never frozen: it must be re-run next
+                # tick so a name whose setup improves isn't locked out for the whole TTL.
+                if res.get("decision") == "commit":
                     cache[sym] = {"ts": now, "result": res}
                     cache_dirty = True
+                res = {**res, "dd_elapsed_s": round(time.time() - t0, 1)}  # annotate in-memory copy
             dd_results.append(res)
             if res.get("decision") == "commit" and res.get("dollar_amount"):
                 tag = f"DD/{res.get('conviction', '?')}" + ("/cached" if res.get("cached") else "")
@@ -219,9 +250,28 @@ def main() -> int:
     n_commit = sum(1 for d in dd_results if d["decision"] == "commit")
     n_error = sum(1 for d in dd_results if d["decision"] == "error")
     n_reject = len(dd_results) - n_commit - n_error
-    print(f"screen: {len(exits)} exit(s), {len(candidates)} candidate(s); "
-          f"DD: {n_commit} commit / {n_reject} reject / {n_error} error; "
-          f"final actions: {len(actions)}")
+
+    # --- human-readable decision trail: WHY each name did / didn't trade (counts alone hide it) ---
+    for e in exits:
+        print(f"  EXIT {e.get('symbol', '?')}: {e.get('reason', '')}")
+    if candidates:
+        print(f"screen: {len(exits)} exit(s), {len(candidates)} candidate(s): "
+              + ", ".join(fmt_candidate(c) for c in candidates))
+    else:
+        # No candidates -> say why (gate / regime / nothing cleared the bar), not just "0".
+        if not context.get("allow_entries"):
+            note = f" [entries gated: {context.get('stale_reason') or 'market closed/stale'}]"
+        elif screen.get("hostile_regime"):
+            note = " [hostile regime: entries off]"
+        else:
+            note = " [no mover cleared the screen]"
+        print(f"screen: {len(exits)} exit(s), 0 candidate(s){note}")
+    for d in dd_results:
+        print(fmt_dd_line(d))
+    not_dd = len(candidates) - len(dd_results)
+    if context.get("allow_entries") and not_dd > 0:
+        print(f"  (+{not_dd} more candidate(s) not DD'd this tick — MAX_DD_CANDIDATES={max_dd})")
+    print(f"DD: {n_commit} commit / {n_reject} reject / {n_error} error -> {len(actions)} action(s)")
     return 0
 
 

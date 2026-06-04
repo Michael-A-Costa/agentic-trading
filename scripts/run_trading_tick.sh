@@ -46,6 +46,7 @@ fi
 trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 
 {
+  SECONDS=0   # bash builtin: elapsed wall-clock for this tick (cached ticks ~1s; fresh DD ~50s)
   log "=== tick start (mode=${TRADING_MODE:-paper} screen=deterministic dd_model=${DD_MODEL}) ==="
 
   # 1) market regime (public data; appends to market_conditions.jsonl)
@@ -71,7 +72,7 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
       "$PYTHON" "${REPO}/scripts/apply_decision.py" --context "$CTX" --skip | tee -a "$RUN_LOG"
     fi
   fi
-  log "=== tick end ==="
+  log "=== tick end (${SECONDS}s) ==="
 }
 
 # log() and the apply_decision `tee` already append to RUN_LOG; their stdout copy lands in
