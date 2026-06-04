@@ -191,16 +191,40 @@ def main() -> int:
             "date": q.get("date"),  # per-symbol freshness (fail-closed: stale candidate is excluded)
         })
 
+    # Sizing caps are a FRACTION OF LIVE EQUITY, resolved to dollars against THIS tick's equity so
+    # they auto-scale as the account compounds or draws down (no stale hard-$ ceiling frozen at the
+    # funding balance). MAX_POSITION_PCT is the SINGLE per-name concentration cap — it replaced the
+    # old MAX_SYMBOL_WEIGHT, which was the same formula (symbol_value / equity) once sizing is a %.
+    # Downstream (decide.py headroom, apply_decision checks) consumes the derived *_USD values, so we
+    # expose both the configured pct and the resolved dollars.
+    max_pos_pct = envf("MAX_POSITION_PCT", 0.10)
+    max_exp_pct = envf("MAX_TOTAL_EXPOSURE_PCT", 0.80)
+    # Daily-loss circuit breaker: a fraction of START-OF-DAY equity, but never more than a hard $
+    # ceiling. The % lets the breaker scale with the account; the cap bounds absolute daily pain once
+    # the book is large (at 5% / $500 the cap overtakes the % at $10k equity). Anchored to
+    # start-of-day equity (not live) so the day's threshold is fixed, not shrinking intraday as P&L drops.
+    sod_equity = state.get("start_of_day_equity") or equity
+    daily_pct = envf("DAILY_MAX_LOSS_PCT", 0.05)
+    daily_cap = envf("DAILY_MAX_LOSS_CAP_USD", 500.0)
+    daily_max_loss = round(min(daily_pct * sod_equity, daily_cap), 2)
+    # Per-trade loss budget: a fraction of LIVE equity (matches the sizing caps). At a 4% stop this
+    # implies a max notional of 25x the budget = 25% of equity, comfortably above MAX_POSITION_PCT, so
+    # it stays a slack backstop at every account size (only bites if STOP_LOSS_PCT is widened).
+    per_trade_pct = envf("MAX_PER_TRADE_LOSS_PCT", 0.01)
     caps = {
-        "MAX_POSITION_USD": envf("MAX_POSITION_USD", 600.0),
-        "MAX_TOTAL_EXPOSURE_USD": envf("MAX_TOTAL_EXPOSURE_USD", 2400.0),
-        "MAX_OPEN_POSITIONS": int(envf("MAX_OPEN_POSITIONS", 6)),
-        "MAX_SYMBOL_WEIGHT": envf("MAX_SYMBOL_WEIGHT", 0.25),
-        "STOP_LOSS_PCT": envf("STOP_LOSS_PCT", 2.0),
+        "MAX_POSITION_PCT": max_pos_pct,
+        "MAX_TOTAL_EXPOSURE_PCT": max_exp_pct,
+        "MAX_POSITION_USD": round(max_pos_pct * equity, 2),        # per-name ceiling, % of live equity
+        "MAX_TOTAL_EXPOSURE_USD": round(max_exp_pct * equity, 2),  # total invested ceiling, % of equity
+        "MAX_OPEN_POSITIONS": int(envf("MAX_OPEN_POSITIONS", 10)),
+        "STOP_LOSS_PCT": envf("STOP_LOSS_PCT", 4.0),
         "TAKE_PROFIT_PCT": envf("TAKE_PROFIT_PCT", 4.0),
         "SIGNAL_THRESHOLD_PCT": envf("SIGNAL_THRESHOLD_PCT", 2.0),
-        "DAILY_MAX_LOSS_USD": envf("DAILY_MAX_LOSS_USD", 150.0),
-        "MAX_PER_TRADE_LOSS_USD": envf("MAX_PER_TRADE_LOSS_USD", 60.0),
+        "DAILY_MAX_LOSS_PCT": daily_pct,
+        "DAILY_MAX_LOSS_CAP_USD": daily_cap,
+        "DAILY_MAX_LOSS_USD": daily_max_loss,                      # = min(pct * start-of-day equity, cap)
+        "MAX_PER_TRADE_LOSS_PCT": per_trade_pct,
+        "MAX_PER_TRADE_LOSS_USD": round(per_trade_pct * equity, 2),  # = pct * live equity (slack backstop)
         "MIN_POSITION_USD": envf("MIN_POSITION_USD", 0.0),  # 0 = no floor; >0 rejects dust fills
     }
     regime = latest_regime()

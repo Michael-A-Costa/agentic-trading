@@ -22,13 +22,12 @@ Derived from `research/agentic-robinhood-mcp-landscape.md`. An **autonomous** mo
 | Param | v0 default (~$3k) | Note |
 |---|---|---|
 | `TRADING_MODE` | `paper` → `live` when funded | sim until the deposit lands |
-| `MAX_POSITION_USD` | `600` | ~20% per name |
-| `MAX_TOTAL_EXPOSURE_USD` | `2400` | ~80% invested, keep cash buffer |
-| `MAX_SYMBOL_WEIGHT` | `0.25` | concentration cap |
-| `MAX_OPEN_POSITIONS` | `6` | diversification |
-| `STOP_LOSS_PCT` / `TAKE_PROFIT_PCT` | `2.0` / `4.0` | per-position exits |
-| `MAX_PER_TRADE_LOSS_USD` | `60` | absolute per-trade stop budget |
-| `DAILY_MAX_LOSS_USD` | `150` | **circuit breaker** — halt new entries (re-checked at fill; exits still run) |
+| `MAX_POSITION_PCT` | `0.10` | per-name ceiling = 10% of **live equity** (resolved to $ each tick); SINGLE concentration cap |
+| `MAX_TOTAL_EXPOSURE_PCT` | `0.80` | ~80% of equity invested, keep a 20% cash buffer (fraction of live equity) |
+| `MAX_OPEN_POSITIONS` | `10` | diversification (≥8 needed to reach 80% exposure at the 10% per-name cap) |
+| `STOP_LOSS_PCT` / `TAKE_PROFIT_PCT` | `4.0` / `12.0` | per-position exits (~1:3 R:R) |
+| `MAX_PER_TRADE_LOSS_PCT` | `0.01` | per-trade stop budget = 1% of live equity (=$30 at $3k); slack backstop at a 4% stop |
+| `DAILY_MAX_LOSS_PCT` / `DAILY_MAX_LOSS_CAP_USD` | `0.05` / `500` | **circuit breaker** = min(5% of start-of-day equity, $500) — halt new entries (re-checked at fill; exits still run) |
 | `SIGNAL_THRESHOLD_PCT` | `2.0` | absolute intraday entry trigger; ≥ 2× spread |
 | `REL_STRENGTH_PCT` | `1.0` | also require this much intraday % **above SPY** (don't just buy beta) |
 | `MIN_POSITION_USD` | `0` | reject dust fills (0 = off) |
@@ -40,8 +39,11 @@ Derived from `research/agentic-robinhood-mcp-landscape.md`. An **autonomous** mo
 | `DD_MODEL` / `MAX_DD_CANDIDATES` / `DD_CACHE_TTL_MIN` | Sonnet / `2` / `180` | Stage-2 commit model + cost bounds |
 
 > **All caps above are enforced deterministically** in `apply_decision.py` (buy branch) and
-> `tick_context.py` — `MAX_SYMBOL_WEIGHT` (fraction of live equity) and `MAX_PER_TRADE_LOSS_USD`
-> (bounds size so `notional × STOP_LOSS_PCT ≤` budget) are real reject branches, not just config.
+> `tick_context.py` — the sizing caps (`MAX_POSITION_PCT`, `MAX_TOTAL_EXPOSURE_PCT`) are resolved to
+> dollars against this tick's live equity, and `MAX_PER_TRADE_LOSS_USD` (bounds size so
+> `notional × STOP_LOSS_PCT ≤` budget) is a real reject branch, not just config. `MAX_POSITION_PCT`
+> doubles as the per-name concentration cap (it replaced the old `MAX_SYMBOL_WEIGHT`, which was the
+> same `symbol_value / equity` formula once sizing became a fraction of equity).
 
 ### Stop protection: synthetic now, resting-broker later
 Every buy attaches an explicit `stop_price` (−`STOP_LOSS_PCT`) and `take_profit_price`
@@ -101,7 +103,8 @@ engine. Logs say "synthetic stop hit" so this is never mistaken for broker-grade
 
 ## Engine review — hardening applied (2026-06-04)
 A multi-dimension review (safety / algo / prompts / flows / code / docs) drove these fixes:
-- **Guardrails now real:** `MAX_SYMBOL_WEIGHT` + `MAX_PER_TRADE_LOSS_USD` enforced at fill (were
+- **Guardrails now real:** the per-name concentration cap (`MAX_POSITION_PCT`, formerly
+  `MAX_SYMBOL_WEIGHT`) + `MAX_PER_TRADE_LOSS_USD` enforced at fill (were
   dead config); daily circuit breaker re-checked at fill (not just the gate); NaN/inf sizes and
   dust (`MIN_POSITION_USD`) rejected; exposure valued at `max(last, entry)` (never under-counts).
 - **Risk inversion fixed:** on a `circuit_breaker` SKIP the engine still runs **protective exits**

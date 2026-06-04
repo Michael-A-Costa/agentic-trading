@@ -36,12 +36,14 @@ isolated, `agentic_allowed=true` account (`your_account_number`). This is a sanc
   read-only context — **never** place an order against them (the MCP would reject it anyway).
 
 ### Risk Guardrails (enforced in code / `.env` — the real safety layer)
-- **Honour every limit in `.env`**: `MAX_POSITION_USD`, `MAX_TOTAL_EXPOSURE_USD`,
-  `MAX_PER_TRADE_LOSS_USD`, `STOP_LOSS_PCT`, and `DAILY_MAX_LOSS_USD`. A trade that would
-  breach a cap is **not placed** — it's skipped and logged. These are tunable by the owner;
-  do not silently exceed them.
-- **Daily-loss circuit breaker.** If realized+unrealized P&L for the day hits
-  `DAILY_MAX_LOSS_USD`, **halt all new entries for the rest of the session** and log it.
+- **Honour every limit in `.env`**: `MAX_POSITION_PCT`, `MAX_TOTAL_EXPOSURE_PCT`,
+  `MAX_PER_TRADE_LOSS_PCT` (fractions of **live equity**), `STOP_LOSS_PCT`, and
+  `DAILY_MAX_LOSS_PCT` (a fraction of **start-of-day** equity, capped at `DAILY_MAX_LOSS_CAP_USD`).
+  All are resolved to dollars each tick (`caps.*_USD`). A trade that would breach a cap is **not
+  placed** — it's skipped and logged. These are tunable by the owner; do not silently exceed them.
+- **Daily-loss circuit breaker.** If realized+unrealized P&L for the day hits the resolved
+  `DAILY_MAX_LOSS_USD` (`= min(DAILY_MAX_LOSS_PCT × start-of-day equity, DAILY_MAX_LOSS_CAP_USD)`),
+  **halt all new entries for the rest of the session** and log it.
 - **Always `review_equity_order` before `place_equity_order`** — not for human sign-off, but to
   catch broker alerts (PDT, halts, buying power) and to log the preview. If review returns a
   **blocking** alert, skip the trade and log the reason.

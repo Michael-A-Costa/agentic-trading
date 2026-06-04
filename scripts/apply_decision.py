@@ -164,14 +164,11 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
         if sym not in positions and len(positions) >= caps["MAX_OPEN_POSITIONS"]:
             result["reject_reason"] = f"MAX_OPEN_POSITIONS ({caps['MAX_OPEN_POSITIONS']}) reached"
             return result
-        # Concentration cap: one symbol's post-buy value as a FRACTION of equity. A paper buy is
-        # equity-neutral (cash down, position up by the same notional), so pre-buy equity is the
-        # right denominator. Guard equity<=0 (fail-closed: reject rather than divide).
+        # Per-name concentration is enforced by MAX_POSITION_USD above, which is itself a fraction of
+        # live equity (MAX_POSITION_PCT) — so there is no separate symbol-weight cap. equity_now
+        # (cash + live exposure) is still needed as the denominator for the at-fill daily-loss
+        # re-check below.
         equity_now = state["cash"] + cur_exposure
-        max_weight = caps.get("MAX_SYMBOL_WEIGHT", 0.25)
-        if equity_now <= 0 or (existing_val + notional) / equity_now > max_weight + 1e-6:
-            result["reject_reason"] = f"exceeds MAX_SYMBOL_WEIGHT ({max_weight})"
-            return result
         # Per-trade-loss budget: bound the dollar loss if the stop fills at stop_price. (This bounds
         # *sizing at the stop*, not realized loss — a synthetic stop can gap through; that's why
         # MAX_POSITION_USD and the EOD flatten also exist.)
