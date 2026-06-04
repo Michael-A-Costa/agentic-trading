@@ -117,7 +117,12 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
             result["reject_reason"] = f"insufficient cash ({round(state['cash'], 2)})"
             return result
 
-        # --- fill + attach a protective stop / take-profit level (engine-enforced each tick) ---
+        # --- fill + attach a protective stop / take-profit level ---
+        # NOTE: this stop is SYNTHETIC — enforced by our engine only when it ticks
+        # (~5 min) and the host is awake. It is NOT a resting broker stop order, so it
+        # does NOT cover between-tick moves, overnight/pre-market gaps, or an
+        # asleep/crashed engine. Treat it as best-effort intraday protection, not
+        # broker-grade. See strategies/momentum-v0-plan.md (live = real resting stop).
         prev = positions.get(sym, {"qty": 0.0, "entry_price": price})
         new_qty = prev["qty"] + qty
         new_entry = (prev["qty"] * prev["entry_price"] + qty * price) / new_qty
@@ -125,12 +130,15 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
         positions[sym] = {"qty": new_qty, "entry_price": round(new_entry, 4),
                           "entry_ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                           "stop_price": round(new_entry * (1 - sl / 100), 4),
-                          "take_profit_price": round(new_entry * (1 + tp / 100), 4)}
+                          "take_profit_price": round(new_entry * (1 + tp / 100), 4),
+                          "stop_type": "synthetic"}
         state["cash"] -= notional
         result.update(status="filled", qty=round(qty, 6), price=price,
                       notional=round(notional, 2),
                       stop_price=positions[sym]["stop_price"],
-                      take_profit_price=positions[sym]["take_profit_price"])
+                      take_profit_price=positions[sym]["take_profit_price"],
+                      stop_type="synthetic",
+                      stop_note="engine-tick enforced (~5m); no gap/overnight/engine-down cover")
         return result
 
     # side == "sell"

@@ -31,6 +31,24 @@ Derived from `research/agentic-robinhood-mcp-landscape.md`. An **autonomous** mo
 | `DAILY_MAX_LOSS_USD` | `150` | **circuit breaker** — halt new entries for the day |
 | `SIGNAL_THRESHOLD_PCT` | `2.0` | entry trigger; ≥ 2× spread |
 
+### Stop protection: synthetic now, resting-broker later
+Every buy attaches an explicit `stop_price` (−`STOP_LOSS_PCT`) and `take_profit_price`
+(+`TAKE_PROFIT_PCT`), tagged `stop_type: "synthetic"`. **Synthetic = our engine sells when it
+checks the level at tick time (~5 min) and the host is awake.** It is *not* a resting broker
+order, so it does **not** cover between-tick moves, overnight/pre-market gaps, or a crashed/asleep
+engine. Logs say "synthetic stop hit" so this is never mistaken for broker-grade protection.
+
+- **Paper / now:** keep synthetic. Fractional sizing stays; agent is always free to sell; no
+  open-order lock to manage. Good enough to validate the strategy.
+- **Live, later (not whole-share-by-default):** Robinhood resting stops need **whole shares**, and
+  fractional is market-only — so a real resting stop can only ride on whole-share-eligible lots. Plan
+  is a **hybrid**: real resting **stop-market** (not stop-limit — a limit can gap through and never
+  fill) when the lot is whole-share-eligible, synthetic otherwise. Keep fractional sizing as the
+  default; never force whole-share trading just to get a resting stop. Hybrid adds: read
+  `get_equity_orders` each tick (know the resting stop + its id), **cancel-stop → sell** for
+  discretionary exits, and reconcile the "stop already fired while asleep" case (position gone →
+  book realized P&L, don't re-sell).
+
 ## DD / discovery (the "find stocks" half)
 - **Universe per tick** = discovered, not fixed: liquid, fractional-eligible names with real intraday
   momentum. Sources: `search` for thematic baskets, plus a movers list (web/`MARKET_DATA_API_KEY`), filtered

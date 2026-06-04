@@ -126,6 +126,7 @@ def main() -> int:
             "symbol": sym, "qty": round(qty, 6), "entry_price": entry,
             "last": lp, "value": round(val, 2), "pnl_usd": round(pnl, 2), "pnl_pct": pnl_pct,
             "stop_price": p.get("stop_price"), "take_profit_price": p.get("take_profit_price"),
+            "stop_type": p.get("stop_type", "synthetic"),  # synthetic = engine-tick only, not a resting broker stop
         })
 
     equity = round(state["cash"] + pos_value, 2)
@@ -170,8 +171,9 @@ def main() -> int:
         if lp is None:
             continue
         # Prefer the explicit per-position stop/TP levels set at buy; fall back to the % rule.
+        # "synthetic stop" = enforced here at tick time, NOT a resting broker order (no gap cover).
         if sp is not None and lp <= sp:
-            exits.append({"symbol": p["symbol"], "reason": f"stop hit: {lp} <= stop {sp} ({pp}%)"})
+            exits.append({"symbol": p["symbol"], "reason": f"synthetic stop hit: {lp} <= stop {sp} ({pp}%)"})
         elif tpp is not None and lp >= tpp:
             exits.append({"symbol": p["symbol"], "reason": f"take-profit hit: {lp} >= {tpp} ({pp}%)"})
         elif sp is None and pp is not None and pp <= -sl:
