@@ -61,7 +61,17 @@ tail -f data/logs/market_check_$(date +%F).log     # run log
 tail -n 5 data/market_conditions.jsonl             # structured records
 ```
 
-> The market-conditions cron is independent and robust. Wiring the **trading engine** to run
-> headless is a separate step with one open question — whether the interactively-authed Robinhood
-> MCP is reachable from a headless `claude -p` / `/schedule` run. We validate that before any
-> unattended order placement.
+## Headless MCP — VERIFIED working (2026-06-04)
+The trading engine needs the Robinhood MCP (account data + orders), and **headless access is
+confirmed**. A non-interactive probe reused the stored OAuth token with no browser step:
+```bash
+claude -p 'Call get_accounts and report only the count' \
+  --mcp-config /Users/mcosta/Documents/workrepos/agentic-trading/.mcp.json \
+  --allowedTools 'mcp__robinhood-trading__get_accounts' \
+  --dangerously-skip-permissions --output-format text
+# -> {"ok": true, "num_accounts": 4}  (exit 0, ~15s, no interactive auth)
+```
+So the autonomous engine path is: **cron → `claude -p` (headless) in this repo → MCP tools**,
+scoped by `--allowedTools` and the `.env` risk caps. For live order placement, the allow-list
+expands to include `place_equity_order` / `cancel_equity_order`. The market-conditions cron above
+stays independent (public data, no auth) as a robust regime feed the engine can read.

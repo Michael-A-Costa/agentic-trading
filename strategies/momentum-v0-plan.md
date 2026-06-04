@@ -48,11 +48,14 @@ Derived from `research/agentic-robinhood-mcp-landscape.md`. An **autonomous** mo
    review → place.
 6. Append every decision (incl. skips/no-trades) + fill to `data/engine-log.jsonl`; update daily P&L.
 
-## Scheduling (how "autonomous" actually runs)
-- Unattended: **`/schedule`** (cron) wakes the agent on a cadence during regular hours (9:30–16:00 ET) to run
-  a tick; or a long-running **`/loop`** within a session. Either is our equivalent of JC Merlo's Task
-  Scheduler — minus the babysitting, plus the caps.
-- **Kill switch**: disconnect the `robinhood-trading` MCP, set `TRADING_MODE=paper`, or stop the schedule.
+## Scheduling (how "autonomous" actually runs) — headless MCP VERIFIED
+- **Headless `claude -p` reaches the MCP** (probed 2026-06-04: `get_accounts` returned 4 accounts from a
+  non-interactive process, no browser auth — see `scripts/README.md`). So the unattended path is real:
+  **OS cron → `claude -p` in this repo → MCP tools**, scoped by `--allowedTools` + `.env` caps.
+- Alternatives: a long-running **`/loop`** within a session, or **`/schedule`** for a managed routine.
+- This is our equivalent of JC Merlo's Windows Task Scheduler — minus the babysitting, plus the caps.
+- **Kill switch**: disconnect the `robinhood-trading` MCP, set `TRADING_MODE=paper`, drop the write tools
+  from `--allowedTools`, or stop the cron/schedule.
 
 ## Build order
 1. `scripts/quote_snapshot.py` — read-only: pull candidate quotes + spreads + % moves. **Runnable now.**
