@@ -216,6 +216,10 @@ def main() -> int:
     cache = load_cache()
     commit_ttl = int(os.environ.get("DD_CACHE_TTL_MIN", "30")) * 60
     reject_ttl = int(os.environ.get("DD_REJECT_TTL_MIN", "20")) * 60
+    # Drift-aware invalidation: even INSIDE its TTL, a cached verdict is re-DD'd if the name's live
+    # price has moved more than this % since the DD — so a stale BUY/REJECT thesis is never reused
+    # after the setup has materially changed (the cost/freshness balance for ENTRY candidates).
+    drift_pct = float(os.environ.get("DD_CACHE_DRIFT_PCT", "3.0"))
     now = time.time()
     cache_dirty = False
     if context.get("allow_entries") and candidates:
@@ -244,7 +248,11 @@ def main() -> int:
                 cdec = (cached.get("result") or {}).get("decision")
                 age = now - cached.get("ts", 0)
                 ttl = commit_ttl if cdec == "commit" else (reject_ttl if cdec == "reject" else 0)
-                if ttl > 0 and age < ttl:
+                # Reuse only if fresh in TIME *and* the price hasn't drifted past DD_CACHE_DRIFT_PCT
+                # since the verdict; a name that's moved materially is re-evaluated on fresh data.
+                ref, cur = cached.get("ref_price"), c.get("last")
+                drifted = bool(ref and cur and abs(cur / ref - 1) * 100 > drift_pct)
+                if ttl > 0 and age < ttl and not drifted:
                     res = {**cached["result"], "cached": True, "cached_age_min": int(age / 60)}
             if res is not None:
                 cache_hits[sym] = res
@@ -284,7 +292,8 @@ def main() -> int:
             # Cache commits and rejects (each reused under its own TTL at read time); never cache an
             # error — a transient model/timeout failure must be retried, not frozen.
             if not res.get("cached") and res.get("decision") in ("commit", "reject"):
-                cache[sym] = {"ts": now, "result": {k: v for k, v in res.items() if k != "dd_elapsed_s"}}
+                cache[sym] = {"ts": now, "ref_price": c.get("last"),   # price at DD time (drift invalidation)
+                              "result": {k: v for k, v in res.items() if k != "dd_elapsed_s"}}
                 cache_dirty = True
                 # Persist the main points to long-term memory and auto-exclude a never-buy name.
                 memory.record(sym, decision=res["decision"], conviction=res.get("conviction"),
