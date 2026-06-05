@@ -23,7 +23,7 @@ import math
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -85,7 +85,7 @@ def decide_summary(filled: list, rejected: list, decision: dict, equity, day_pnl
     # A post-commit cap rejection is its own important 'why': the LLM wanted in, a guardrail blocked it.
     rej = [f"{r['symbol']} {r['side']} REJECTED: {r.get('reject_reason')}" for r in rejected]
     if parts or rej:
-        return (f"{len(filled)} filled, {len(rejected)} rejected | equity={equity} "
+        return (f"{len(filled)} filled, {len(rejected)} rejected | "
                 f"day_pnl={day_pnl} | " + " ; ".join(parts + rej))
     # No actions at all -> the screen surfaced candidates but Stage-2 DD committed to none. Surface
     # each candidate's verdict + reason so the operator sees why no entry was taken.
@@ -93,8 +93,8 @@ def decide_summary(filled: list, rejected: list, decision: dict, equity, day_pnl
     if dd:
         why = " ; ".join(f"{d.get('symbol')} {(d.get('decision') or '?').upper()}: "
                          f"{(d.get('reason') or d.get('error') or '').strip()[:90]}" for d in dd)
-        return f"HOLD — 0 of {len(dd)} candidate(s) committed: {why} | equity={equity}"
-    return f"HOLD ({decision.get('rationale', 'no action')[:80]}) | equity={equity}"
+        return f"HOLD — 0 of {len(dd)} candidate(s) committed: {why}"
+    return f"HOLD ({decision.get('rationale', 'no action')[:80]})"
 
 
 def cand_last(context: dict, sym: str) -> float | None:
@@ -325,6 +325,50 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
     return result
 
 
+def arm_entry(action: dict, state: dict, now: datetime) -> dict:
+    """Stash a level-triggered entry for the SENTINEL to fire on a price cross, instead of buying
+    now (the "LLM arms, fast loop fires" path). We persist only intent here — the sentinel re-runs
+    the full cap gate (validate_and_fill) at fire time, so a stale/oversized armed entry is still
+    caught. A planner buy without an entry_trigger fills immediately (process_action below), so the
+    default entry behaviour is unchanged; arming is opt-in from the DD output."""
+    sym = str(action.get("symbol", "")).upper().strip()
+    trig = action.get("entry_trigger") or {}
+    direction = str(trig.get("direction") or "above").lower()
+    result: dict[str, object] = {"symbol": sym, "side": "buy",
+                                 "reason": str(action.get("reason", "")).strip(), "status": "armed"}
+    if not sym:
+        result.update(status="rejected", reject_reason="bad symbol"); return result
+    try:
+        price = float(trig.get("price"))
+    except (TypeError, ValueError):
+        result.update(status="rejected", reject_reason="bad entry_trigger price"); return result
+    if not (price > 0) or direction not in ("above", "below"):
+        result.update(status="rejected", reject_reason="bad entry_trigger"); return result
+    if action.get("dollar_amount") is None and action.get("qty") is None:
+        result.update(status="rejected", reject_reason="no qty/dollar_amount to arm"); return result
+    ttl_min = float(os.environ.get("ENTRY_ARM_TTL_MIN", "10"))
+    expires = (now + timedelta(minutes=ttl_min)).isoformat(timespec="seconds")
+    state.setdefault("armed_entries", {})[sym] = {
+        "trigger_price": round(price, 4), "direction": direction,
+        "dollar_amount": action.get("dollar_amount"), "qty": action.get("qty"),
+        "conviction": action.get("conviction"), "hold_intent": action.get("hold_intent"),
+        "thesis_type": action.get("thesis_type"), "reason": result["reason"],
+        "armed_ts": now.isoformat(timespec="seconds"), "expires_ts": expires,
+    }
+    result.update(trigger_price=round(price, 4), direction=direction,
+                  dollar_amount=action.get("dollar_amount"), qty=action.get("qty"),
+                  expires_ts=expires)
+    return result
+
+
+def process_action(action: dict, context: dict, state: dict, caps: dict, now: datetime) -> dict:
+    """Route one planner action: an armed buy (side=buy + arm) is stashed for the sentinel; anything
+    else fills immediately under the cap gate. Keeps validate_and_fill the single execution path."""
+    if str(action.get("side", "")).lower() == "buy" and action.get("arm"):
+        return arm_entry(action, state, now)
+    return validate_and_fill(action, context, state, caps)
+
+
 def recompute_portfolio(state: dict, context: dict) -> tuple[float, float]:
     """(equity, day_pnl) valued at this tick's quotes — single source of truth for both branches."""
     pos_val = sum(p["qty"] * (cand_last(context, s) or p["entry_price"])
@@ -416,24 +460,31 @@ def main() -> int:
         )
         if filled:
             parts = [f"SELL {r.get('qty', '?')} {r['symbol']} @ {r.get('price', '?')}" for r in filled]
-            summary = (f"BREAKER-EXIT {len(filled)} sold | equity={equity} day_pnl={day_pnl} | "
+            summary = (f"BREAKER-EXIT {len(filled)} sold | day_pnl={day_pnl} | "
                        + " ; ".join(parts))
         else:
-            summary = f"SKIP — {gate_reason or 'gated'} | equity={equity} day_pnl={day_pnl}"
+            summary = f"SKIP — {gate_reason or 'gated'} | day_pnl={day_pnl}"
     else:
         raw = Path(args.decision).read_text()
         decision = extract_decision(raw)
-        results = [validate_and_fill(a, context, state, caps) for a in decision["actions"]]
+        results = [process_action(a, context, state, caps, now) for a in decision["actions"]]
+        # A fresh immediate buy supersedes any pending armed entry for that name, so a name can't be
+        # both bought now AND fired again later by the sentinel (double-entry guard).
+        armed_map = state.get("armed_entries") or {}
+        for r in results:
+            if r.get("status") == "filled" and r.get("side") == "buy":
+                armed_map.pop(r["symbol"], None)
         # Recompute equity post-fills with the same quotes used this tick.
         equity, day_pnl = recompute_portfolio(state, context)
         write_json_atomic(state_path, state)
         filled = [r for r in results if r["status"] == "filled"]
-        rejected = [r for r in results if r["status"] != "filled"]
+        armed = [r for r in results if r["status"] == "armed"]   # stashed for the sentinel, not a fill
+        rejected = [r for r in results if r["status"] not in ("filled", "armed")]
         record.update(
             action="decide",
             rationale=decision.get("rationale", ""),
             results=results,
-            n_filled=len(filled), n_rejected=len(rejected),
+            n_filled=len(filled), n_armed=len(armed), n_rejected=len(rejected),
             portfolio_after={"cash": round(state["cash"], 2), "equity": equity,
                              "day_pnl": day_pnl, "open_positions": len(state["positions"]),
                              "realized_total": round(state["realized_total"], 2)},
@@ -442,9 +493,14 @@ def main() -> int:
             record["dd"] = decision["dd"]          # Stage-2 commit/reject DD + catalysts (audit)
         if decision.get("screen"):
             record["screen"] = decision["screen"]  # Stage-1 exits + entry candidates (audit)
+        if decision.get("token_usage"):
+            record["token_usage"] = decision["token_usage"]  # per-tick headless-Claude token + cost rollup
         if decision.get("_parse_error"):
             record["parse_error"] = True
         summary = decide_summary(filled, rejected, decision, equity, day_pnl)
+        if armed:
+            summary += " | ARMED " + ", ".join(
+                f"{r['symbol']} {r.get('direction')} {r.get('trigger_price')}" for r in armed)
 
     ENGINE_LOG.parent.mkdir(parents=True, exist_ok=True)
     with ENGINE_LOG.open("a") as f:
@@ -455,7 +511,7 @@ def main() -> int:
     trade_log.record_fills(record.get("results", []), ts_utc=record["ts_utc"],
                            ts_et=record.get("ts_et"), mode=record["mode"])
 
-    print(f"[{record['ts_et']}] {record['mode'].upper()} {summary}")
+    print(f"[{record['ts_et']}] equity={equity} {record['mode'].upper()} {summary}")
     return 0
 
 

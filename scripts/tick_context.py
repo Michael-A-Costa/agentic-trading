@@ -180,8 +180,13 @@ def latest_regime() -> dict:
     }
 
 
-def main() -> int:
-    now_utc = datetime.now(timezone.utc)
+def build_context(now_utc: datetime | None = None) -> dict:
+    """Gather one tick's full deterministic view — fresh quotes, equity-resolved caps, per-position
+    P&L, the rule-based exit screen, and the GATE — and return it as the context dict. SHARED by the
+    5-min planner (tick_context.main below) and the 1-min sentinel (sentinel.py), so both evaluate
+    the identical exit rules and caps. The only side effect is the once-a-day start-of-day-equity
+    rollover write to paper_state.json (paper mode); callers serialize that via data/.tick.lock."""
+    now_utc = now_utc or datetime.now(timezone.utc)
     now_et = now_utc.astimezone(mc.ET)
     today = now_et.strftime("%Y-%m-%d")
     session, is_open = mc.session_state(now_et)
@@ -202,7 +207,10 @@ def main() -> int:
             discovered = discover.discover()
         except Exception as e:  # discovery must NEVER break a tick — fall back to the pins
             sys.stderr.write(f"[tick] discovery failed, using pinned candidates only: {e}\n")
-    candidates = list(dict.fromkeys(discovered + pinned))  # ordered de-dupe (movers first)
+    # Armed entries (set by the planner, fired by the sentinel) must always get a fresh quote so the
+    # sentinel can test their trigger — fold them into the universe even if discovery didn't surface them.
+    armed_syms = list((state.get("armed_entries") or {}).keys())
+    candidates = list(dict.fromkeys(discovered + pinned + armed_syms))  # ordered de-dupe (movers first)
     held = list(state["positions"].keys())
     # Index ETFs are ALWAYS fetched: SPY is the rel-strength benchmark and the market-data gate
     # needs index data — but they are excluded from entry candidates below (never momentum-buy beta).
@@ -458,12 +466,13 @@ def main() -> int:
         excluded = set()
     non_tradable = (set(mc.INDEXES) | excluded
                     | {s.strip().upper() for s in env("NON_TRADABLE_SYMBOLS", "").split(",") if s.strip()})
+    armed_set = set((state.get("armed_entries") or {}).keys())  # already have a pending trigger -> don't re-DD
     entry_candidates = []
     if allow_entries and not hostile:
         movers = []
         for c in cand:
             sym = c["symbol"]
-            if sym in non_tradable or sym in held or sym in cooling:
+            if sym in non_tradable or sym in held or sym in cooling or sym in armed_set:
                 continue
             q = quotes.get(sym) or {}
             if q.get("last") is None:
@@ -518,17 +527,27 @@ def main() -> int:
         "gate_reason": reason,
     }
 
+    return context
+
+
+def main() -> int:
+    """Planner entry point: build the shared context, write the audit snapshot + the compact LLM
+    packet, and print the GATE line the wrapper branches on."""
+    context = build_context()
+    regime = context["regime"]
+    caps = context["caps"]
+
     # Compact packet for the LLM (only what it needs to decide).
     packet = {
         "mode": context["mode"],
-        "allow_entries": allow_entries,   # false => exits/HOLD only; no new positions
-        "data_stale": data_stale,
+        "allow_entries": context["allow_entries"],   # false => exits/HOLD only; no new positions
+        "data_stale": context["data_stale"],
         "regime": {k: regime.get(k) for k in
                    ("posture", "volatility_regime", "breadth_regime", "daily_trend", "session")},
         "portfolio": context["portfolio"],
         "positions": [{k: p[k] for k in ("symbol", "qty", "entry_price", "last", "pnl_pct")}
-                      for p in positions],
-        "candidates": [c for c in cand if c["last"] is not None],
+                      for p in context["positions"]],
+        "candidates": [c for c in context["candidates"] if c["last"] is not None],
         "caps": caps,
     }
 
@@ -536,7 +555,7 @@ def main() -> int:
     (TICK / "context_latest.json").write_text(json.dumps(context, indent=2))
     (TICK / "packet_latest.json").write_text(json.dumps(packet))
 
-    print(f"GATE={gate}" + (f":{reason}" if reason else ""))
+    print(f"GATE={context['gate']}" + (f":{context['gate_reason']}" if context['gate_reason'] else ""))
     return 0
 
 

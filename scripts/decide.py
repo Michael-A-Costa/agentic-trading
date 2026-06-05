@@ -21,9 +21,13 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+ET = ZoneInfo("America/New_York")            # cache freshness is measured in ET calendar days
 
 import stock_memory as memory                # sibling: long-term per-symbol eval memory + exclusions
 import catalyst_log                          # sibling: forward filter-lift ledger (gap event -> verdict)
@@ -66,28 +70,98 @@ def claude_bin() -> str:
             or str(Path.home() / ".local/bin/claude"))
 
 
+# --- Per-tick token accounting ----------------------------------------------------------------
+# Every model call in a tick funnels through run_claude (entry DDs, manage DDs, and the live
+# MCP relay), and those calls run in a ThreadPoolExecutor. Each call appends its usage to this
+# ledger under a lock, so usage_summary() at end-of-tick is an exact per-tick token/cost total.
+_USAGE_LOCK = threading.Lock()
+_USAGE_LEDGER: list[dict] = []
+
+
+def reset_usage() -> None:
+    with _USAGE_LOCK:
+        _USAGE_LEDGER.clear()
+
+
+def _record_usage(label: str, model: str, usage: dict | None, cost_usd: float | None,
+                  elapsed_s: float, error: str | None = None) -> None:
+    """Thread-safe append of one headless-Claude call's token + cost figures."""
+    rec = {"label": label, "model": model, "elapsed_s": round(elapsed_s, 1)}
+    if error:
+        rec["error"] = error
+    if isinstance(usage, dict):
+        for k in ("input_tokens", "output_tokens",
+                  "cache_creation_input_tokens", "cache_read_input_tokens"):
+            rec[k] = usage.get(k)
+    if cost_usd is not None:
+        rec["cost_usd"] = cost_usd
+    with _USAGE_LOCK:
+        _USAGE_LEDGER.append(rec)
+
+
+def usage_summary() -> dict:
+    """Roll the tick's headless-Claude calls into a token/cost total + per-call breakdown."""
+    with _USAGE_LOCK:
+        calls = list(_USAGE_LEDGER)
+
+    def _sum(key: str) -> int:
+        return sum(int(c.get(key) or 0) for c in calls)
+
+    inp, out = _sum("input_tokens"), _sum("output_tokens")
+    cc, cr = _sum("cache_creation_input_tokens"), _sum("cache_read_input_tokens")
+    return {
+        "n_calls": len(calls),
+        "input_tokens": inp,
+        "output_tokens": out,
+        "cache_creation_input_tokens": cc,
+        "cache_read_input_tokens": cr,
+        "total_tokens": inp + out + cc + cr,    # all billed tokens (cached input is billed too)
+        "cost_usd": round(sum(float(c.get("cost_usd") or 0.0) for c in calls), 4),
+        "calls": calls,
+    }
+
+
+def _parse_claude_json(stdout: str) -> tuple[str | None, dict | None, float | None]:
+    """Pull (result_text, usage, total_cost_usd) out of `claude --output-format json`. Falls back
+    to treating stdout as raw text with no usage if it isn't the expected JSON envelope."""
+    try:
+        obj = json.loads(stdout)
+    except (ValueError, TypeError):
+        return (stdout or None), None, None
+    if not isinstance(obj, dict):
+        return (stdout or None), None, None
+    return obj.get("result"), obj.get("usage"), obj.get("total_cost_usd")
+
+
 def run_claude(prompt: str, model: str, tools: list | None = None, mcp: bool = False,
-               timeout: int = 360) -> str | None:
+               timeout: int = 360, label: str = "claude") -> str | None:
     """Headless Claude. --strict-mcp-config => only the servers we pass (none, or the RH MCP).
 
-    Returns stdout on success, or None on timeout / non-zero exit / empty output — so the caller
-    can tell a model FAILURE (retry next tick, don't cache) apart from a real 'reject' verdict.
+    Returns the model's result text on success, or None on timeout / non-zero exit / empty output —
+    so the caller can tell a model FAILURE (retry next tick, don't cache) apart from a real 'reject'
+    verdict. Uses --output-format json so each call's token usage + cost are captured into the tick
+    ledger (see usage_summary()); `label` attributes the spend (e.g. "dd:AAPL", "manage:MSFT").
     """
-    cmd = [claude_bin(), "-p", prompt, "--model", model, "--output-format", "text",
+    cmd = [claude_bin(), "-p", prompt, "--model", model, "--output-format", "json",
            "--strict-mcp-config"]
     if mcp:
         cmd += ["--mcp-config", str(REPO / ".mcp.json")]
     if tools:
         cmd += ["--allowedTools", *tools, "--dangerously-skip-permissions"]
+    t0 = time.time()
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except (subprocess.TimeoutExpired, OSError) as e:
         sys.stderr.write(f"[decide] claude invocation failed: {e}\n")
+        _record_usage(label, model, None, None, time.time() - t0, error=str(e)[:120])
         return None
     if r.returncode != 0:
         sys.stderr.write(f"[decide] claude exit {r.returncode}: {(r.stderr or '')[:300]}\n")
+        _record_usage(label, model, None, None, time.time() - t0, error=f"exit_{r.returncode}")
         return None
-    return r.stdout if (r.stdout and r.stdout.strip()) else None
+    text, usage, cost = _parse_claude_json(r.stdout)
+    _record_usage(label, model, usage, cost, time.time() - t0)
+    return text if (text and text.strip()) else None
 
 
 # Stage-2 DD agent toolset: quant is script-gathered; the agent adds live quote + news research.
@@ -168,7 +242,7 @@ def run_dd(c: dict, regime: dict, caps: dict, portfolio: dict, dd_model: str) ->
     # parallel — one slow web-research call can't push the tick past the ~5-min launchd cadence.
     dd_timeout = int(os.environ.get("DD_CLAUDE_TIMEOUT_S", "240"))
     out = run_claude((SCRIPTS / "dd_prompt.txt").read_text() + dd_input,
-                     dd_model, tools=DD_TOOLS, mcp=True, timeout=dd_timeout)
+                     dd_model, tools=DD_TOOLS, mcp=True, timeout=dd_timeout, label=f"dd:{sym}")
     if out is None:
         return {"symbol": sym, "decision": "error", "error": "dd_model_failed", "conviction": None,
                 "dollar_amount": None, "reason": "", "catalysts": [], "risks": []}
@@ -193,6 +267,7 @@ def run_dd(c: dict, regime: dict, caps: dict, portfolio: dict, dd_model: str) ->
             "dollar_amount": dollar, "reason": commit.get("reason", ""),
             "catalyst_type": commit.get("thesis_type") or commit.get("catalyst_type"),  # the agent's thesis tag
             "hold_intent": commit.get("hold_intent"),            # scalp | swing | runner — agent's horizon call
+            "entry_trigger": commit.get("entry_trigger"),        # optional {price,direction} -> sentinel-armed entry
             "catalysts": commit.get("catalysts", []), "risks": commit.get("risks", []),
             "next_earnings_date": commit.get("next_earnings_date"),
             "never_buy": bool(commit.get("never_buy")),          # structural disqualifier -> exclude
@@ -247,7 +322,7 @@ def run_manage_dd(p: dict, regime: dict, caps: dict, portfolio: dict, dd_model: 
     })
     dd_timeout = int(os.environ.get("DD_CLAUDE_TIMEOUT_S", "240"))
     out = run_claude((SCRIPTS / "dd_manage_prompt.txt").read_text() + manage_input,
-                     dd_model, tools=MANAGE_TOOLS, mcp=True, timeout=dd_timeout)
+                     dd_model, tools=MANAGE_TOOLS, mcp=True, timeout=dd_timeout, label=f"manage:{sym}")
     if out is None:
         return {"symbol": sym, "action": "keep", "error": "manage_model_failed",
                 "reason": "manage model failed -> keep (stop + Tier-1 still protect)"}
@@ -265,6 +340,7 @@ def run_manage_dd(p: dict, regime: dict, caps: dict, portfolio: dict, dd_model: 
 
 
 def main() -> int:
+    reset_usage()   # start this tick's token ledger clean
     context = json.loads((TICK / "context_latest.json").read_text())
     caps = context["caps"]
     regime = context.get("regime", {})
@@ -283,24 +359,46 @@ def main() -> int:
                 **({"scale_tiers": e["scale_tiers"]} if e.get("scale_tiers") else {})}
                for e in exits if e.get("symbol")]
 
-    # --- Stage 2: deep DD + commit, with a per-symbol TTL cache (split commit/reject TTLs) ---
-    # Commits are cached for DD_CACHE_TTL_MIN (longer): expensive to recompute, and execution still
-    # re-checks fresh price + caps + allow_entries in apply_decision, so reusing one briefly never
-    # trades on a stale price. Rejects are cached for a SHORTER DD_REJECT_TTL_MIN so a name whose
-    # setup is improving re-evaluates within the hour — but NOT every tick, which (with dynamic
-    # discovery surfacing the same top movers repeatedly) would re-burn a ~85s Sonnet+web call on the
-    # same reject every 5 minutes. Errors are never cached (retry next tick). Set DD_REJECT_TTL_MIN=0
-    # to disable reject caching (re-DD every tick).
+    # --- Stage 2: deep DD + commit, with a per-symbol ONCE-A-DAY cache (re-DD only on a real move) ---
+    # A DD is a ~85s Sonnet+web-research call — the tick's dominant token/latency cost. Dynamic
+    # discovery keeps surfacing the SAME top movers every 5-min tick, so a short rolling TTL re-burned
+    # that call many times a day on names whose thesis hadn't changed. Policy: one fresh DD per name
+    # per ET calendar day (commit AND reject), reused all day, UNLESS the setup materially changes.
+    # The invalidation trigger is ASYMMETRIC by verdict, because the two verdicts go stale differently:
+    #   * COMMIT  -> re-DD on a move in EITHER direction past DD_CACHE_DRIFT_PCT. A committed bullish
+    #               thesis is broken by a drop AND blown by a run-up (entering late = chasing).
+    #   * REJECT  -> re-DD only on an UPSIDE breakout (price up past DD_REJECT_REDD_PCT, or range_pos
+    #               pushed into a fresh intraday-high zone). There is no independent news feed in this
+    #               repo, so the "fresh catalyst" that should overturn a reject is read from price/range
+    #               action — the market revealing it, which is exactly what this gap-drift strategy
+    #               trades. A downside continuation only CONFIRMS the reject, so we don't re-burn on it.
+    # Execution still re-checks fresh price + caps + allow_entries in apply_decision, so reusing a
+    # day-old commit never trades on a stale price. Errors are never cached (retry next tick).
+    # DD_CACHE_TTL_MIN (default 0 = day-scoped) adds an optional sub-day rolling cap; set any trigger
+    # %% to 0 to disable it.
     dd_results = []
     cache = load_cache()
-    commit_ttl = int(os.environ.get("DD_CACHE_TTL_MIN", "30")) * 60
-    reject_ttl = int(os.environ.get("DD_REJECT_TTL_MIN", "20")) * 60
-    # Drift-aware invalidation: even INSIDE its TTL, a cached verdict is re-DD'd if the name's live
-    # price has moved more than this % since the DD — so a stale BUY/REJECT thesis is never reused
-    # after the setup has materially changed (the cost/freshness balance for ENTRY candidates).
+    today_et = datetime.now(ET).strftime("%Y-%m-%d")   # cache keyed to the ET trading day
+    rolling_ttl = int(os.environ.get("DD_CACHE_TTL_MIN", "0")) * 60   # 0 = no sub-day cap (once/day)
+    # A cached COMMIT is re-DD'd mid-day if the live price has moved more than this % (either way)
+    # since the DD — the "significant price movement" that invalidates a same-day entry thesis.
     drift_pct = float(os.environ.get("DD_CACHE_DRIFT_PCT", "3.0"))
+    # A cached REJECT is overturned only by an UPSIDE breakout since the verdict (no news feed exists,
+    # so price/range action is the catalyst proxy): live price up past DD_REJECT_REDD_PCT, OR range_pos
+    # pushed into a fresh intraday-high zone (>= DD_REJECT_REDD_RANGE and higher than at reject time).
+    reject_redd_pct = float(os.environ.get("DD_REJECT_REDD_PCT", "2.0"))
+    reject_redd_range = float(os.environ.get("DD_REJECT_REDD_RANGE", "0.90"))
     now = time.time()
     cache_dirty = False
+    # Prune dead entries so the file doesn't grow every session: verdicts stamped for a prior ET day,
+    # plus legacy entries (no "day" stamp) past the 24h fallback. Both can no longer ever be a cache
+    # hit, so dropping them is loss-free and keeps each tick's read+rewrite of the blob small.
+    stale_keys = [k for k, e in cache.items()
+                  if (e.get("day") not in (None, today_et))
+                  or (e.get("day") is None and now - e.get("ts", 0) >= 86400)]
+    for k in stale_keys:
+        cache.pop(k, None)
+    cache_dirty = bool(stale_keys)
     book_full = False
     entry_did_fresh = False   # did the entry pass run any FRESH (uncached) DDs this tick? (gates the manage wave)
     headroom = None
@@ -336,9 +434,9 @@ def main() -> int:
                 if sym:
                     shortlist.append((sym, c))
 
-        # Serve fresh cached verdicts synchronously (commits live longer than rejects; errors are
-        # never cached so they retry; reject_ttl=0 disables reject reuse). Cache misses need a fresh
-        # Stage-2 call and go to the parallel pool below.
+        # Serve cached verdicts synchronously: reuse a commit OR reject DD'd EARLIER TODAY (same ET
+        # day), unless price has drifted past DD_CACHE_DRIFT_PCT since the verdict. Errors are never
+        # cached so they retry. Cache misses need a fresh Stage-2 call and go to the parallel pool.
         cache_hits = {}
         fresh_jobs = []
         for sym, c in shortlist:
@@ -347,12 +445,24 @@ def main() -> int:
             if cached:
                 cdec = (cached.get("result") or {}).get("decision")
                 age = now - cached.get("ts", 0)
-                ttl = commit_ttl if cdec == "commit" else (reject_ttl if cdec == "reject" else 0)
-                # Reuse only if fresh in TIME *and* the price hasn't drifted past DD_CACHE_DRIFT_PCT
-                # since the verdict; a name that's moved materially is re-evaluated on fresh data.
+                # Same-day reuse (fall back to ts age for pre-existing entries without a "day" stamp);
+                # an optional rolling_ttl can further cap reuse to sub-day if set.
+                cday = cached.get("day")
+                same_day = (cday == today_et) if cday else (age < 86400)
+                within_rolling = rolling_ttl <= 0 or age < rolling_ttl
+                # Asymmetric re-DD trigger (see policy comment above): commit = move either way;
+                # reject = upside breakout only (price OR range_pos). move_pct is signed: + is up.
                 ref, cur = cached.get("ref_price"), c.get("last")
-                drifted = bool(ref and cur and abs(cur / ref - 1) * 100 > drift_pct)
-                if ttl > 0 and age < ttl and not drifted:
+                move_pct = (cur / ref - 1) * 100 if (ref and cur) else 0.0
+                if cdec == "commit":
+                    stale = drift_pct > 0 and abs(move_pct) > drift_pct
+                else:  # reject — overturn only on an upside breakout, never on downside follow-through
+                    ref_rp, cur_rp = cached.get("ref_range_pos"), c.get("range_pos")
+                    broke_up = reject_redd_pct > 0 and move_pct > reject_redd_pct
+                    broke_range = bool(ref_rp is not None and cur_rp is not None
+                                       and cur_rp >= reject_redd_range and cur_rp > ref_rp)
+                    stale = broke_up or broke_range
+                if cdec in ("commit", "reject") and same_day and within_rolling and not stale:
                     res = {**cached["result"], "cached": True, "cached_age_min": int(age / 60)}
             if res is not None:
                 cache_hits[sym] = res
@@ -390,10 +500,12 @@ def main() -> int:
             res = cache_hits.get(sym) or fresh_results.get(sym)
             if res is None:
                 continue
-            # Cache commits and rejects (each reused under its own TTL at read time); never cache an
-            # error — a transient model/timeout failure must be retried, not frozen.
+            # Cache commits and rejects (each reused under its asymmetric trigger at read time); never
+            # cache an error — a transient model/timeout failure must be retried, not frozen.
             if not res.get("cached") and res.get("decision") in ("commit", "reject"):
-                cache[sym] = {"ts": now, "ref_price": c.get("last"),   # price at DD time (drift invalidation)
+                cache[sym] = {"ts": now, "day": today_et,          # ET day -> once-a-day reuse
+                              "ref_price": c.get("last"),           # price at DD time (drift trigger)
+                              "ref_range_pos": c.get("range_pos"),  # range pos at DD time (reject breakout trigger)
                               "result": {k: v for k, v in res.items() if k != "dd_elapsed_s"}}
                 cache_dirty = True
                 # Persist the main points to long-term memory and auto-exclude a never-buy name.
@@ -404,12 +516,23 @@ def main() -> int:
             dd_results.append(res)
             if res.get("decision") == "commit" and res.get("dollar_amount"):
                 tag = f"DD/{res.get('conviction', '?')}" + ("/cached" if res.get("cached") else "")
-                actions.append({"symbol": sym, "side": "buy",
-                                "dollar_amount": res["dollar_amount"],
-                                "conviction": res.get("conviction"),     # OG DD -> persisted on the position
-                                "hold_intent": res.get("hold_intent"),   #   so the Tier-1 risk monitor can reason
-                                "thesis_type": res.get("catalyst_type"),
-                                "reason": f"[{tag}] {res.get('reason', '')}"})
+                act = {"symbol": sym, "side": "buy",
+                       "dollar_amount": res["dollar_amount"],
+                       "conviction": res.get("conviction"),     # OG DD -> persisted on the position
+                       "hold_intent": res.get("hold_intent"),   #   so the Tier-1 risk monitor can reason
+                       "thesis_type": res.get("catalyst_type"),
+                       "reason": f"[{tag}] {res.get('reason', '')}"}
+                # Optional level-triggered entry: if the DD returned an entry_trigger, ARM it for the
+                # sentinel to fire on the cross instead of buying now (LLM arms, fast loop fires). No
+                # trigger -> immediate buy (default, unchanged). ENTRY_ARMING=0 forces immediate.
+                trig = res.get("entry_trigger")
+                arming_on = os.environ.get("ENTRY_ARMING", "1").strip().lower() not in ("0", "false", "no", "")
+                if (arming_on and isinstance(trig, dict) and trig.get("price")
+                        and str(trig.get("direction")).lower() in ("above", "below")):
+                    act["arm"] = True
+                    act["entry_trigger"] = {"price": trig["price"],
+                                            "direction": str(trig["direction"]).lower()}
+                actions.append(act)
         if cache_dirty:
             save_cache(cache)
 
@@ -511,6 +634,7 @@ def main() -> int:
         "screen": screen,
         "dd": dd_results,
         "manage": manage_results,        # Tier-2 hold re-assessments (keep/trim/exit/add)
+        "token_usage": usage_summary(),  # exact per-tick headless-Claude token + cost rollup
     }
     TICK.mkdir(parents=True, exist_ok=True)
     (TICK / "decision_latest.json").write_text(json.dumps(decision_out, indent=2))
@@ -548,6 +672,11 @@ def main() -> int:
     if manage_results:
         n_act = sum(1 for m in manage_results if m.get('action') in ('trim', 'exit', 'add'))
         print(f"MANAGE: {len(manage_results)} holding(s) re-checked, {n_act} acted")
+    tu = decision_out["token_usage"]
+    if tu["n_calls"]:
+        print(f"TOKENS: {tu['n_calls']} call(s), {tu['total_tokens']:,} tok "
+              f"(in {tu['input_tokens']:,} / out {tu['output_tokens']:,} / "
+              f"cache_read {tu['cache_read_input_tokens']:,}) ~${tu['cost_usd']:.4f}")
     return 0
 
 
