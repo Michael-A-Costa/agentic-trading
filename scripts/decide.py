@@ -302,6 +302,7 @@ def main() -> int:
     now = time.time()
     cache_dirty = False
     book_full = False
+    entry_did_fresh = False   # did the entry pass run any FRESH (uncached) DDs this tick? (gates the manage wave)
     headroom = None
     book_full_note = ""   # set inside the entries block (where portfolio is in scope) if full
     if context.get("allow_entries") and candidates:
@@ -357,6 +358,7 @@ def main() -> int:
                 cache_hits[sym] = res
             else:
                 fresh_jobs.append((sym, c))
+        entry_did_fresh = bool(fresh_jobs)   # entries did real DD work this tick -> defer manage to a quieter tick
 
         # Run the cache-miss DDs CONCURRENTLY. Each run_dd is subprocess-bound (dd_probe + a headless
         # `claude` web-research call), so it releases the GIL and threads give true parallelism.
@@ -419,7 +421,11 @@ def main() -> int:
     manage_results = []
     try:
         positions_ctx = context.get("positions", [])
-        if context.get("market_open") and not context.get("data_stale") and positions_ctx:
+        # Interleave the two DD waves: only run the manage wave on a tick that did NOT already run fresh
+        # entry DDs, so a single tick never pays for BOTH waves (~2x). Tier-1 protective sells run every
+        # tick regardless (tick_context), so a deferred manage-DD never leaves a critical holding unwatched.
+        if (context.get("market_open") and not context.get("data_stale") and positions_ctx
+                and not entry_did_fresh):
             mcache = load_manage_cache()
             exiting = {a.get("symbol") for a in actions if a.get("side") == "sell"}  # already exiting this tick
             due = []
