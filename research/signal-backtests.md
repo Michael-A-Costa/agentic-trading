@@ -2,7 +2,8 @@
 
 **Date:** 2026-06-04
 **Scripts:** [`scripts/backtest_signal.py`](../scripts/backtest_signal.py),
-[`scripts/backtest_xsection.py`](../scripts/backtest_xsection.py)
+[`scripts/backtest_xsection.py`](../scripts/backtest_xsection.py),
+[`scripts/backtest_gap_drift.py`](../scripts/backtest_gap_drift.py)
 **Data:** keyless daily OHLCV from Cboe's CDN (`cdn.cboe.com/.../charts/historical/{sym}.json`),
 split-adjusted, back to 2004 — the same provider `dd_probe.py` uses. Cached under
 `data/backtest/history/` (gitignored).
@@ -15,9 +16,10 @@ Every guardrail protects against blowing up; none creates an edge. Before tuning
 we needed one number: the raw expectancy of the signal itself, net of costs. So we backtested it
 with the LLM removed.
 
-The headline result: **the engine's intraday signal has no edge at the horizon it trades**, but a
-*different* construction — cross-sectional medium-term momentum — does show a statistically
-defensible edge (with a large survivorship caveat). The two scripts test those two claims.
+The headline result: **the engine's intraday signal has no edge at the horizon it trades**, but two
+*different*, multi-day constructions do — cross-sectional medium-term momentum and catalyst
+gap-drift (PEAD) — each statistically defensible, each gated by a survivorship caveat. The three
+scripts test those claims in turn.
 
 ---
 
@@ -122,6 +124,63 @@ broker stops** (gaps become the primary risk once you hold overnight).
 
 ---
 
+## Backtest 3 — catalyst gap-drift / PEAD (`backtest_gap_drift.py`)
+
+The "hotter edge" hypothesis: an agent's real advantage is **breadth + drift**, not speed. A big
+**overnight gap on a volume spike** is a keyless proxy for a genuine catalyst (earnings beat,
+guidance raise, M&A). Post-earnings-announcement drift (PEAD) says under-covered names *under-react*
+and drift over the following days/weeks — a multi-day edge that dodges the 1-day reversal that killed
+the intraday signal. We measure drift from the **gap day's close forward** (textbook PEAD;
+conservative — it doesn't claim the gap-day pop), on two universes: the same 60 large-caps and a
+40-name higher-beta mid-cap basket.
+
+### Data hazard found and fixed
+
+Cboe back-fills tickers with **pre-listing junk** — SPAC shells show ~$0.01 ghost bars years before
+the real IPO (e.g. TWLO at $0.01 in 2016, DKNG at $0.01 in 2014), producing 100,000%+ ghost
+"returns" that detonate the mean. `clean_bars()` strips this: drop sub-$2 bars, then start each
+series *after* the last >80% overnight jump (the boundary between ghost data and real trading). A
+>300% `hold`-day move is dropped as a residual guard. Medians are reported alongside means because
+the (cleaned) small-cap distribution is still heavily right-skewed.
+
+### Results — the edge is real, scales with surprise, and accumulates over weeks
+
+Sweep of forward-return edge (gap days − all days) and t-stat, vol-mult ≥ 2×:
+
+```
+[LARGE]   gap%  hold |   edge      t      n          [MIDCAP]  gap%  hold |   edge      t      n
+             5    10 |  +0.93%   2.18   655                       5    10 |  +0.50%   0.82   848
+             5    20 |  +1.21%   2.38   652                       5    20 |  +1.97%   2.01   842
+             7    20 |  +2.07%   2.64   360                       7    20 |  +2.42%   1.94   595
+            10    10 |  +3.00%   2.24   165                      10    20 |  +3.24%   1.96   388
+            10    20 |  +4.39%   3.10   163                      15    10 |  +2.68%   2.26   192
+            15    20 |  +7.88%   2.25    47                      15    20 |  +4.47%   1.92   191
+```
+
+Two clean PEAD signatures: the edge grows **monotonically with gap size** (bigger surprise → bigger
+drift) and **with horizon** (drift accumulates over 10–20 days, not intraday). This is the first
+signal in the whole study with **consistent t > 2** across multiple parameter cells.
+
+### The surprise: it's CLEANER in large caps, not mid-caps
+
+The naive "less efficient = bigger edge" intuition did **not** replicate. Large-cap gap-drift carries
+the higher t-stats; the mid-cap version is weaker and statistically marginal (mostly t < 2). The
+distribution tells the story — at 5% gap / 10d hold, the **median mid-cap gap trade is −8.3%** (most
+hit the −8% stop; 38% win rate). The positive mid-cap *mean* is a lottery carried by a few huge
+winners — and that right tail is exactly where survivorship + recency bias lives, so it's the least
+trustworthy number here. Likely cause: large-cap gaps are almost always *real* catalysts (clean
+signal); mid-cap gaps mix catalysts with pumps, sympathy moves, and noise (dirty signal).
+
+### Conclusion 3 — and where the agent earns its keep
+
+There is a **real, statistically defensible catalyst-drift edge**, strongest in large caps, that
+behaves like textbook PEAD. Crucially it is a **multi-day-to-weeks** edge — fundamentally
+incompatible with the engine's intraday-flatten design, confirming yet again that the *architecture*,
+not the fills, is the constraint. The dirty mid-cap signal is exactly where an agent's breadth +
+judgment could add value the dumb gap+volume filter can't: read the actual filing across thousands of
+names, **confirm the catalyst is durable and filter the pumps** that wreck the mid-cap median. That
+filtering is load-bearing, not optional — naive mid-cap execution loses.
+
 ## The caveat that gates everything: survivorship bias
 
 Both backtests use a **fixed universe of 60 of today's liquid large-caps**. These are *survivors* —
@@ -154,6 +213,11 @@ python3 scripts/backtest_signal.py --refresh                        # re-pull hi
 python3 scripts/backtest_xsection.py                                # 12-1, top 10, monthly
 python3 scripts/backtest_xsection.py --lookback 126 --topk 5        # best config, full stats
 python3 scripts/backtest_xsection.py --sweep                        # lookback x topk grid
+
+# Catalyst gap-drift (PEAD)
+python3 scripts/backtest_gap_drift.py                               # both universes, 5% gap, 10d
+python3 scripts/backtest_gap_drift.py --gap 10 --hold 20            # bigger surprise, longer drift
+python3 scripts/backtest_gap_drift.py --sweep                       # gap x hold grid, both universes
 ```
 
 Both cache history under `data/backtest/history/` on first run; subsequent runs are instant.
@@ -164,7 +228,14 @@ Both cache history under `data/backtest/history/` on first run; subsequent runs 
    horizon; fills are not the bottleneck.
 2. **The intraday absolute-pop strategy operates in the reversal zone** and caps out before the
    momentum zone. Its premise ("bigger move = buy more") is backwards intraday.
-3. **Cross-sectional medium-term momentum is the only construction here with a real edge** — but the
-   number is survivorship-inflated and unproven out-of-universe.
-4. **Next gate is data, not tuning:** validate on a survivorship-free universe before committing the
-   engine rewrite.
+3. **Two constructions show a real edge**, both multi-day: cross-sectional momentum (t≈3, top-5,
+   3–6mo lookback) and **catalyst gap-drift / PEAD (t up to 3.1, strongest in large caps, scales with
+   gap size and horizon)**. Gap-drift is the most agentic-friendly — it rewards reading catalysts
+   across a wide universe and filtering pumps.
+4. **The engine's architecture is the real blocker.** Every edge found lives at a multi-day-to-weeks
+   horizon; the intraday-flatten / 120-min-max-hold / 5-min-synthetic-stop design is built to avoid
+   exactly the horizon that pays. A profitable engine needs overnight holds and resting broker stops.
+5. **Next gate is data, not tuning:** the momentum and mid-cap gap numbers are survivorship- (and for
+   mid-caps, recency-) inflated. Validate on a survivorship-free / point-in-time universe before
+   committing the rewrite. The agent's catalyst-confirmation filter — the load-bearing piece for the
+   dirty mid-cap signal — can't be backtested here; it's the live thesis to prove.
