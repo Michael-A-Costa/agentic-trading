@@ -7,7 +7,11 @@ the bar. You are protecting (paper) capital.
 INPUT (JSON, appended below) gives you:
   - symbol, screen_reason, and screen_signal {intraday_pct, rel_strength_vs_spy, range_pos}
     (range_pos near 1.0 = trading at the day's high; near 0 = at the low)
-  - regime (market posture / volatility / breadth)
+  - regime (market posture / volatility / breadth, plus regime.daily_trend = the SPY multi-day
+    trend {trend: up|down|mixed, last, ma50, ma200, ret_20d_pct, above_ma50, above_ma200}). A
+    `down` daily_trend already forces posture=risk_off upstream (entries are gated off), so if you
+    are seeing a candidate at all the market is not in a confirmed downtrend — but a `mixed` trend
+    (e.g. above MA50, below MA200) is a chop warning: prefer a smaller size and a stronger catalyst.
   - sizing {MAX_POSITION_USD, MIN_POSITION_USD, available_headroom_usd, available_cash,
     stop_loss_pct, take_profit_pct, max_per_trade_loss_usd}
   - portfolio {open_positions, max_open_positions, held_symbols}

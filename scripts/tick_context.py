@@ -171,6 +171,7 @@ def latest_regime() -> dict:
         "posture": a.get("posture"),
         "volatility_regime": a.get("volatility_regime"),
         "breadth_regime": a.get("breadth_regime"),
+        "daily_trend": a.get("daily_trend") or {"available": False},
         "avg_index_move_pct": a.get("avg_index_move_pct"),
         "vix_proxy_move_pct": a.get("vix_proxy_move_pct"),
         "source": rec.get("source"),
@@ -489,7 +490,7 @@ def main() -> int:
         "allow_entries": allow_entries,   # false => exits/HOLD only; no new positions
         "data_stale": data_stale,
         "regime": {k: regime.get(k) for k in
-                   ("posture", "volatility_regime", "breadth_regime", "session")},
+                   ("posture", "volatility_regime", "breadth_regime", "daily_trend", "session")},
         "portfolio": context["portfolio"],
         "positions": [{k: p[k] for k in ("symbol", "qty", "entry_price", "last", "pnl_pct")}
                       for p in positions],

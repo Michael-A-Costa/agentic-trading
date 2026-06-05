@@ -26,6 +26,7 @@ import argparse
 import csv
 import io
 import json
+import os
 import sys
 import urllib.request
 import urllib.error
@@ -37,6 +38,7 @@ from zoneinfo import ZoneInfo
 ET = ZoneInfo("America/New_York")
 REPO = Path(__file__).resolve().parent.parent
 LOG_PATH = REPO / "data" / "market_conditions.jsonl"
+HISTORY_DIR = REPO / "data" / "history"   # daily-bar cache for the regime trend: regime_{SYM}.json
 
 # Index ETFs that define the broad-market read, plus VIXY as a fear proxy (VIX itself
 # isn't available keyless). VIXY is an ETF — we read its *direction*, not an absolute level.
@@ -47,6 +49,12 @@ ALL_SYMBOLS = INDEXES + [VIX_PROXY]
 STOOQ_URL = "https://stooq.com/q/l/?s={syms}&f=sd2t2ohlcv&h&e=csv"
 CBOE_URL = "https://cdn.cboe.com/api/global/delayed_quotes/quotes/{sym}.json"
 YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=1d&interval=1d"
+# Daily history for the market-regime trend — KEYLESS via the Cboe CDN (deep OHLCV back to IPO),
+# with a 1y Yahoo chart as the usual-429 fallback. Same providers as dd_probe's per-symbol history.
+CBOE_HIST = "https://cdn.cboe.com/api/global/delayed_quotes/charts/historical/{sym}.json"
+YAHOO_HIST = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=1y&interval=1d"
+TREND_LOOKBACK = 220   # keep ~1 trading year so MA200 is computable; MA20/MA50 sit inside it.
+TREND_SYMBOL = "SPY"   # the broad-market proxy whose multi-day trend gates risk posture.
 HTTP_TIMEOUT = 12
 # A browser-ish UA helps the Yahoo fallback (anonymous chart API 429s bare clients).
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -171,6 +179,103 @@ def fetch_quotes(symbols: list[str]) -> tuple[dict[str, dict], str]:
     raise RuntimeError(f"all sources failed (last error: {last_err})")
 
 
+# --------------------------------------------------------------------------- daily trend (multi-day)
+def _fetch_daily_closes(sym: str) -> list[float]:
+    """Last ~1y of daily closes (oldest->newest) for `sym`, keyless. [] on failure.
+
+    Cboe CDN primary (deep history, no key, no throttle), Yahoo 1y chart fallback. We keep only the
+    last TREND_LOOKBACK bars so MA200/MA50/MA20 windows mean what they say.
+    """
+    try:  # Cboe CDN — returns full history oldest->newest under "data".
+        d = json.loads(_http_get(CBOE_HIST.format(sym=urllib.parse.quote(sym.upper()))))
+        closes = [_fnum(b.get("close")) for b in (d.get("data") or [])]
+        closes = [c for c in closes if c is not None][-TREND_LOOKBACK:]
+        if closes:
+            return closes
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError, TypeError):
+        pass
+    try:  # Yahoo fallback (usually 429-throttled, hence second).
+        d = json.loads(_http_get(YAHOO_HIST.format(sym=urllib.parse.quote(sym))))
+        res = (d.get("chart", {}).get("result") or [None])[0]
+        q = (res.get("indicators", {}).get("quote") or [{}])[0] if res else {}
+        closes = [c for c in (q.get("close") or []) if c is not None][-TREND_LOOKBACK:]
+        return closes
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError, TypeError):
+        return []
+
+
+def _daily_closes_cached(sym: str, today: str) -> list[float]:
+    """Daily closes with a once-a-day file cache (regime ticks every ~5 min — don't refetch each time).
+
+    Cache at data/history/regime_{SYM}.json; served as-is when fetched today, else refreshed. On a
+    fetch failure we fall back to a stale cache if one exists, so a brief CDN blip doesn't blind the
+    trend. Returns [] only when there is neither a fresh fetch nor any cached history.
+    """
+    path = HISTORY_DIR / f"regime_{sym.upper()}.json"
+    try:
+        cached = json.loads(path.read_text())
+    except (OSError, ValueError):
+        cached = None
+    if cached and cached.get("fetched_date") == today and cached.get("closes"):
+        return cached["closes"]
+    closes = _fetch_daily_closes(sym)
+    if closes:
+        try:
+            HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps({"symbol": sym.upper(), "fetched_date": today,
+                                       "n_bars": len(closes), "closes": closes}))
+            os.replace(tmp, path)
+        except OSError:
+            pass
+        return closes
+    return (cached or {}).get("closes") or []   # stale fallback, or [] if we never cached
+
+
+def _mean(xs: list[float]) -> float:
+    return sum(xs) / len(xs)
+
+
+def daily_trend(sym: str = TREND_SYMBOL, today: str | None = None) -> dict:
+    """Multi-day market trend from daily closes: last vs MA20/MA50/MA200 + 20d return.
+
+    Classification (the regime gate keys off `trend`):
+      down  = below MA50 AND below MA200 AND 20d return < 0  (clear, confirmed downtrend)
+      up    = above MA50 AND (above MA200 or MA200 unknown)
+      mixed = anything between (e.g. above MA50 but below MA200 — chop / transition)
+    Fail-open: too little history => {"available": False}, and the caller treats that as 'no signal'
+    (never as a downtrend), so a data outage can't wrongly halt entries.
+    """
+    today = today or datetime.now(ET).strftime("%Y-%m-%d")
+    closes = _daily_closes_cached(sym, today)
+    if len(closes) < 50:
+        return {"available": False, "note": f"insufficient daily history ({len(closes)} bars; need >=50)"}
+    last = closes[-1]
+    ma20 = round(_mean(closes[-20:]), 2)
+    ma50 = round(_mean(closes[-50:]), 2)
+    ma200 = round(_mean(closes[-200:]), 2) if len(closes) >= 200 else None
+    ret_20d = round((last / closes[-21] - 1) * 100, 2) if len(closes) >= 21 else None
+    above50 = last > ma50
+    above200 = (last > ma200) if ma200 is not None else None
+    # below200: explicitly below MA200 when known; when MA200 is unknown (<200 bars), fall back to
+    # the MA50 read so a short-history symbol can still register a downtrend.
+    below200 = (above200 is False) if above200 is not None else (not above50)
+    if (not above50) and below200 and (ret_20d or 0) < 0:
+        # confirmed downtrend: below MA50 AND below MA200 AND 20d return negative.
+        trend = "down"
+    elif above50 and (above200 is not False):
+        # above MA50 and not below MA200 (above it, or MA200 unknown).
+        trend = "up"
+    else:
+        trend = "mixed"
+    return {
+        "available": True, "symbol": sym, "last": round(last, 2),
+        "ma20": ma20, "ma50": ma50, "ma200": ma200,
+        "ret_20d_pct": ret_20d, "above_ma50": above50, "above_ma200": above200,
+        "trend": trend, "bars_used": len(closes),
+    }
+
+
 # --------------------------------------------------------------------------- session
 def session_state(now_et: datetime) -> tuple[str, bool]:
     """Crude US-equity session label. Weekday + clock only — does NOT know market holidays."""
@@ -202,7 +307,7 @@ def range_position(q: dict) -> float | None:
     return None
 
 
-def assess(quotes: dict[str, dict]) -> dict:
+def assess(quotes: dict[str, dict], trend: dict | None = None) -> dict:
     moves = {s: intraday_pct(quotes[s]) for s in INDEXES if s in quotes}
     valid = {s: m for s, m in moves.items() if m is not None}
 
@@ -253,6 +358,21 @@ def assess(quotes: dict[str, dict]) -> dict:
     if vol == "elevated":
         reasons.append("elevated volatility — size down / widen stops")
 
+    # Multi-day market trend overlay. Today's intraday breadth says whether the tape is green RIGHT
+    # NOW; the daily trend says where the market has been heading over weeks. A confirmed daily
+    # downtrend overrides an intraday-green read to risk_off, so one green morning inside a falling
+    # market no longer reads as risk_on (momentum longs into a downtrend are the trap this closes).
+    # Fail-open: an unavailable trend (data outage) is never treated as a downtrend.
+    td = trend or {}
+    trend_gate = os.environ.get("REGIME_DAILY_TREND_GATE", "1") == "1"
+    if td.get("available"):
+        ma_bits = f"MA50 {td['ma50']}" + (f"/MA200 {td['ma200']}" if td.get("ma200") else "")
+        reasons.append(f"SPY daily trend {td['trend']} (last {td['last']} vs {ma_bits}, "
+                       f"20d {td.get('ret_20d_pct')}%)")
+        if td["trend"] == "down" and trend_gate and posture != "risk_off":
+            posture = "risk_off"
+            reasons.append("daily downtrend override -> risk_off (entries off)")
+
     return {
         "posture": posture,
         "volatility_regime": vol,
@@ -263,38 +383,8 @@ def assess(quotes: dict[str, dict]) -> dict:
         "avg_abs_move_pct": avg_abs,
         "vix_proxy_move_pct": vix_move,
         "index_moves_pct": valid,
+        "daily_trend": td if td.get("available") else {"available": False},
         "reasons": reasons,
-    }
-
-
-# --------------------------------------------------------------------------- trend (self-accumulated)
-def trailing_trend(today_close: float | None, lookback: int = 20) -> dict:
-    """Use our own JSONL history of SPY closes to compute a simple trend, once enough days exist."""
-    if not LOG_PATH.exists() or today_close is None:
-        return {"available": False, "note": "insufficient history (self-accumulating)"}
-    seen: dict[str, float] = {}
-    try:
-        for line in LOG_PATH.read_text().splitlines():
-            if not line.strip():
-                continue
-            rec = json.loads(line)
-            d = rec.get("quotes", {}).get("SPY", {}).get("date")
-            c = rec.get("quotes", {}).get("SPY", {}).get("last")
-            if d and c:
-                seen[d] = c  # last record per session date wins
-    except (json.JSONDecodeError, OSError):
-        return {"available": False, "note": "history unreadable"}
-    closes = [seen[d] for d in sorted(seen)][-lookback:]
-    if len(closes) < 5:
-        return {"available": False, "note": f"only {len(closes)} session(s) logged; need >=5"}
-    ma = round(sum(closes) / len(closes), 2)
-    return {
-        "available": True,
-        "spy_last": today_close,
-        f"spy_ma{len(closes)}": ma,
-        "above_ma": today_close > ma,
-        "trend": "up" if today_close > ma else "down",
-        "sessions_used": len(closes),
     }
 
 
@@ -325,8 +415,9 @@ def build_record() -> dict:
         record["assessment"] = None
         record["trend"] = {"available": False}
     else:
-        record["assessment"] = assess(quotes)
-        record["trend"] = trailing_trend(quotes.get("SPY", {}).get("last"))
+        trend = daily_trend(TREND_SYMBOL, today=now_et.strftime("%Y-%m-%d"))
+        record["assessment"] = assess(quotes, trend)
+        record["trend"] = trend
     return record
 
 
@@ -344,7 +435,9 @@ def summarize(record: dict) -> str:
     vix = a["vix_proxy_move_pct"]
     vix_s = f"VIXY{'+' if (vix or 0) >= 0 else ''}{vix}%" if vix is not None else "VIXY n/a"
     trend = record["trend"]
-    trend_s = (f"trend {trend['trend']} (SPY {trend['spy_last']} vs MA{trend['sessions_used']})"
+    trend_s = (f"trend {trend['trend']} (SPY {trend['last']} vs MA50 {trend['ma50']}"
+               + (f"/MA200 {trend['ma200']}" if trend.get("ma200") else "")
+               + f", 20d {trend.get('ret_20d_pct')}%)"
                if trend.get("available") else f"trend: {trend.get('note', 'n/a')}")
     return (
         f"[{record['ts_et']}] {record['session'].upper()} src={record.get('source')} | "
