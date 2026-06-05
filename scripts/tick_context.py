@@ -312,9 +312,9 @@ def main() -> int:
     # --- DETERMINISTIC screen (rules, no LLM): exits + entry candidates ---
     # Exits are pure risk rules — never a model decision. Stop/TP first, then time-based exits.
     tp, sl = caps["TAKE_PROFIT_PCT"], caps["STOP_LOSS_PCT"]
-    # CATALYST-DRIFT v1 entry gate: overnight gap on a volume spike (NOT the old intraday pop).
-    gap_threshold = caps["GAP_THRESHOLD_PCT"]          # min overnight gap % vs prior close
-    vol_mult_min = caps["VOL_MULT_MIN"]                # AND today's volume >= this x its 20d average
+    # FREE-REIN trader (owner mandate 2026-06-05): NO mechanical entry signal — the agent picks.
+    # The deterministic layer only gathers the day's tradable movers + enforces the risk seatbelts
+    # (stops, caps, daily breaker); Stage-2 (the agent) decides what's worth a shot and for how long.
     # Screen / risk-mgmt tuning knobs (all .env-overridable; v1 defaults hold MULTI-DAY, no EOD flatten).
     cooldown_min = envf("COOLDOWN_MIN", 1440.0)        # no re-entry within N min of an exit (anti-whipsaw; 1d default)
     flatten_min = envf("FLATTEN_BEFORE_CLOSE_MIN", 0.0)  # 0 = HOLD OVERNIGHT (the drift edge is overnight)
@@ -396,12 +396,14 @@ def main() -> int:
                               "reason": f"scale-out {pct}% at +{pp}% (tier {tier_lbl})",
                               "qty": qty_out, "scale_tiers": gains})
 
-    # Entry candidates (CATALYST-DRIFT v1): names that OVERNIGHT-GAPPED >= GAP_THRESHOLD_PCT vs their
-    # prior close AND traded >= VOL_MULT_MIN x their 20d-average volume (gap+volume = a keyless catalyst
-    # proxy), in a non-hostile regime, not held, not in post-exit cooldown, with a fresh same-day quote.
-    # Ranked by gap size (biggest surprise first). Stage 2 (DD) then CONFIRMS the catalyst is real and
-    # rejects pumps — the load-bearing filter for the small/mid universe.
-    hostile = (regime.get("posture") == "risk_off") or (regime.get("volatility_regime") == "elevated")
+    # Entry candidates (FREE-REIN): the day's tradable movers, handed to the agent with NO mechanical
+    # signal gate — not held, not in post-exit cooldown, with a fresh same-day quote, in a non-hostile
+    # regime. Ranked by intraday move (liveliest first) purely as ordering. Stage 2 (the agent) has
+    # full discretion: it picks what's worth a shot (momentum / breakout / news / its own read) and the
+    # hold horizon (scalp or ride). The agent IS the screen.
+    # FREE-REIN: only a CONFIRMED downtrend (risk_off) blocks entries — the seatbelt against buying into
+    # a falling market. Elevated volatility no longer blocks (more vol = more action); agent sizes down.
+    hostile = (regime.get("posture") == "risk_off")
     held = {p["symbol"] for p in positions}
     # A quote is only a LIVE signal during regular hours AND when it carries today's date.
     spy_date = (quotes.get("SPY") or {}).get("date")
@@ -445,21 +447,12 @@ def main() -> int:
                 continue
             if c.get("date") and c["date"] != today:
                 continue  # this symbol's own quote is stale — fail closed, skip it
-            # Overnight gap + volume spike from the live quote + cached daily bars (keyless).
-            bars = mc.daily_bars_cached(sym, today)
-            csig = mc.catalyst_signal(q, bars, today)
-            gp, vm = csig.get("gap_pct"), csig.get("vol_mult")
-            if gp is None or vm is None:          # need BOTH gap and volume — fail closed on missing history
-                continue
-            if gp < gap_threshold or vm < vol_mult_min:
-                continue
-            movers.append({**c, "gap_pct": gp, "vol_mult": vm, "prev_close": csig.get("prev_close")})
-        movers.sort(key=lambda c: -c["gap_pct"])   # biggest catalyst gap first (largest surprise)
-        entry_candidates = [{"symbol": c["symbol"], "gap_pct": c["gap_pct"], "vol_mult": c["vol_mult"],
-                             "range_pos": c.get("range_pos"), "intraday_pct": c.get("intraday_pct"),
-                             "reason": (f"gap +{c['gap_pct']}% overnight on {c['vol_mult']}x 20d-vol "
-                                        f"(catalyst proxy, >= {gap_threshold}% / {vol_mult_min}x), "
-                                        f"{regime.get('posture')} regime")}
+            movers.append(c)                        # FREE REIN: no signal gate — the agent decides
+        movers.sort(key=lambda c: -(c.get("intraday_pct") or 0))   # liveliest first (ordering only)
+        entry_candidates = [{"symbol": c["symbol"], "intraday_pct": c.get("intraday_pct"),
+                             "range_pos": c.get("range_pos"), "last": c.get("last"),
+                             "reason": (f"{c.get('intraday_pct')}% intraday, {regime.get('posture')} "
+                                        "regime — agent's discretion (free rein)")}
                             for c in movers]
     screen = {"exits": exits, "entry_candidates": entry_candidates,
               "hostile_regime": hostile, "cooling": sorted(cooling)}

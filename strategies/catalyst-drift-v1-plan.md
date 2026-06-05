@@ -1,5 +1,15 @@
 # Catalyst-Drift Engine — v1 Plan (supersedes momentum-v0 for live deployment)
 
+> **⚠️ SUPERSEDED same day (2026-06-05): pivoted to FREE-REIN.** The owner found catalyst gap-drift too
+> passive — "only buy a ticker that gapped >7% overnight" left the book in cash all session. This is a
+> fun, risk-it-for-the-biscuit sleeve, so the mechanical entry gate was removed entirely and the agent
+> given full discretion over WHAT to buy (any liquid mover) and HOW LONG to hold (scalp/swing/runner),
+> with stops + caps + the daily breaker as the only seatbelts. The gap-drift research/backtests below
+> stay valid as ANALYSIS (the only *measurable* edge), but the live engine no longer trades them — the
+> agent's own read is the strategy. The forward ledger (`catalyst_log.py` / `catalyst_filter_report.py`)
+> now measures general agent selection skill: does the agent's commit beat the average candidate it
+> evaluated, forward. No proven edge here — it's discretion + seatbelts, on purpose.
+
 **Owner mandate (2026-06-05):** this is the **risky** sleeve — the owner already holds the safe,
 long-term, large-cap book elsewhere. This account exists to take **high-variance, actively-managed,
 agent-driven** bets. Decisions locked via Q&A:

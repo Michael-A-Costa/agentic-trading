@@ -82,7 +82,7 @@ DD_TOOLS = ["WebSearch", "WebFetch", "mcp__robinhood-trading__get_equity_quotes"
 
 def fmt_candidate(c: dict) -> str:
     """One screened entry candidate -> compact signal string for the log."""
-    return f"{c.get('symbol', '?')}(gap +{c.get('gap_pct')}% {c.get('vol_mult')}x-vol)"
+    return f"{c.get('symbol', '?')}(+{c.get('intraday_pct')}% intraday)"
 
 
 def fmt_dd_line(d: dict) -> str:
@@ -131,10 +131,9 @@ def run_dd(c: dict, regime: dict, caps: dict, portfolio: dict, dd_model: str) ->
     dd_input = json.dumps({
         "symbol": sym,
         "screen_reason": c.get("reason", ""),
-        "screen_signal": {"gap_pct": c.get("gap_pct"),          # overnight gap vs prior close (the catalyst proxy)
-                          "vol_mult": c.get("vol_mult"),        # today's volume vs its 20d average
-                          "intraday_pct": c.get("intraday_pct"),  # move from today's open (context only)
-                          "range_pos": c.get("range_pos")},     # near 1.0 = at the day's high
+        "screen_signal": {"intraday_pct": c.get("intraday_pct"),  # move from today's open
+                          "range_pos": c.get("range_pos"),       # near 1.0 = at the day's high
+                          "last": c.get("last")},                # the screen had no signal gate — you pick
         "regime": regime,
         "sizing": {"MAX_POSITION_USD": caps["MAX_POSITION_USD"],
                    "MIN_POSITION_USD": caps.get("MIN_POSITION_USD", 0.0),
@@ -178,7 +177,8 @@ def run_dd(c: dict, regime: dict, caps: dict, portfolio: dict, dd_model: str) ->
             commit["reason"] = f"commit returned without a valid size; {commit.get('reason', '')}".strip()
     return {"symbol": sym, "decision": decision, "conviction": commit.get("conviction"),
             "dollar_amount": dollar, "reason": commit.get("reason", ""),
-            "catalyst_type": commit.get("catalyst_type"),        # earnings|guidance|...|none (none => pump)
+            "catalyst_type": commit.get("thesis_type") or commit.get("catalyst_type"),  # the agent's thesis tag
+            "hold_intent": commit.get("hold_intent"),            # scalp | swing | runner — agent's horizon call
             "catalysts": commit.get("catalysts", []), "risks": commit.get("risks", []),
             "next_earnings_date": commit.get("next_earnings_date"),
             "never_buy": bool(commit.get("never_buy")),          # structural disqualifier -> exclude
