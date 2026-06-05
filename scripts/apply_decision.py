@@ -255,6 +255,10 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
                           "stop_price": round(new_entry * (1 - sl / 100), 4),
                           "take_profit_price": round(new_entry * (1 + tp / 100), 4),
                           "stop_type": stop_type,
+                          # OG DD persisted for the Tier-1 hold-risk monitor (hold_risk.py); kept on averaging-in.
+                          "conviction": action.get("conviction") or prev.get("conviction"),
+                          "hold_intent": action.get("hold_intent") or prev.get("hold_intent"),
+                          "thesis_type": action.get("thesis_type") or prev.get("thesis_type"),
                           "scaled": prev.get("scaled", [])}  # tiers already taken (preserved when averaging in)
         state["cash"] -= notional
         result.update(status="filled", qty=round(qty, 6), price=round(buy_px, 4),

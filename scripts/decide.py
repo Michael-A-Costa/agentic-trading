@@ -222,6 +222,9 @@ def main() -> int:
     drift_pct = float(os.environ.get("DD_CACHE_DRIFT_PCT", "3.0"))
     now = time.time()
     cache_dirty = False
+    book_full = False
+    headroom = None
+    book_full_note = ""   # set inside the entries block (where portfolio is in scope) if full
     if context.get("allow_entries") and candidates:
         positions_ctx = context.get("positions", [])
         portfolio = {
@@ -230,11 +233,28 @@ def main() -> int:
             "open_positions": context["portfolio"].get("open_positions", len(positions_ctx)),
             "held": [p["symbol"] for p in positions_ctx],
         }
+        # Portfolio-level short-circuit: when the book is full, available headroom (mirrors run_dd's
+        # formula) drops below a usable lot and EVERY entry rejects on that single portfolio-wide
+        # constraint — nothing to do with the name. Skip Stage-2 entirely so we don't burn N ~85s
+        # Sonnet+web DD calls per tick re-rejecting the same top movers; log one "book full" line.
+        # Threshold defaults to MIN_POSITION_USD (or $25 if unset); tune via MIN_ENTRY_HEADROOM_USD.
+        headroom = max(0.0, min(caps["MAX_POSITION_USD"],
+                                caps["MAX_TOTAL_EXPOSURE_USD"] - portfolio["exposure"],
+                                portfolio["cash"]))
+        min_headroom = float(os.environ.get("MIN_ENTRY_HEADROOM_USD",
+                                            caps.get("MIN_POSITION_USD") or 25.0))
+        book_full = headroom < min_headroom
+        if book_full:
+            book_full_note = (f"${headroom:.2f} headroom (exposure {portfolio['exposure']:.0f}"
+                              f"/{caps['MAX_TOTAL_EXPOSURE_USD']:.0f}, "
+                              f"{portfolio['open_positions']} pos) < usable lot")
+
         shortlist = []
-        for c in candidates[:max_dd]:
-            sym = str(c.get("symbol", "")).upper().strip()
-            if sym:
-                shortlist.append((sym, c))
+        if not book_full:
+            for c in candidates[:max_dd]:
+                sym = str(c.get("symbol", "")).upper().strip()
+                if sym:
+                    shortlist.append((sym, c))
 
         # Serve fresh cached verdicts synchronously (commits live longer than rejects; errors are
         # never cached so they retry; reject_ttl=0 disables reject reuse). Cache misses need a fresh
@@ -305,6 +325,9 @@ def main() -> int:
                 tag = f"DD/{res.get('conviction', '?')}" + ("/cached" if res.get("cached") else "")
                 actions.append({"symbol": sym, "side": "buy",
                                 "dollar_amount": res["dollar_amount"],
+                                "conviction": res.get("conviction"),     # OG DD -> persisted on the position
+                                "hold_intent": res.get("hold_intent"),   #   so the Tier-1 risk monitor can reason
+                                "thesis_type": res.get("catalyst_type"),
                                 "reason": f"[{tag}] {res.get('reason', '')}"})
         if cache_dirty:
             save_cache(cache)
@@ -316,6 +339,7 @@ def main() -> int:
 
     rationale = (f"{len(exits)} rule-exit(s), {len(candidates)} screened candidate(s)"
                  + (" [hostile regime: entries off]" if screen.get("hostile_regime") else "")
+                 + (f" [book full: {book_full_note} — entries skipped]" if book_full else "")
                  + (" [entries gated: market closed/stale]" if not context.get("allow_entries") else ""))
     decision_out = {
         "actions": actions,
@@ -336,6 +360,8 @@ def main() -> int:
     if candidates:
         print(f"screen: {len(exits)} exit(s), {len(candidates)} candidate(s): "
               + ", ".join(fmt_candidate(c) for c in candidates))
+        if book_full:
+            print(f"  BOOK FULL: {book_full_note} — Stage-2 entries skipped this tick")
     else:
         # No candidates -> say why (gate / regime / nothing cleared the bar), not just "0".
         if not context.get("allow_entries"):

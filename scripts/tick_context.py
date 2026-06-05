@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import market_conditions as mc  # sibling module; its dir is on sys.path when run as a script
+import hold_risk                # sibling: deterministic Tier-1 risk score for open positions
 
 REPO = Path(__file__).resolve().parent.parent
 DATA = REPO / "data"
@@ -228,6 +229,7 @@ def main() -> int:
         pos_value += val
         pnl = (lp - entry) * qty if lp else 0.0
         pnl_pct = round((lp - entry) / entry * 100, 2) if lp and entry else None
+        q = quotes.get(sym) or {}
         positions.append({
             "symbol": sym, "qty": round(qty, 6), "entry_price": entry,
             "last": lp, "value": round(val, 2), "pnl_usd": round(pnl, 2), "pnl_pct": pnl_pct,
@@ -236,6 +238,10 @@ def main() -> int:
             "init_qty": p.get("init_qty", round(qty, 6)),  # scale-out base (qty at entry); fallback for pre-existing positions
             "scaled": p.get("scaled") or [],               # scale-out tiers already taken (gain%s)
             "stop_type": p.get("stop_type", "synthetic"),  # synthetic = engine-tick only, not a resting broker stop
+            # OG DD + intraday structure for the Tier-1 hold-risk monitor (hold_risk.py):
+            "conviction": p.get("conviction"), "hold_intent": p.get("hold_intent"),
+            "thesis_type": p.get("thesis_type"),
+            "range_pos": mc.range_position(q), "intraday_pct": mc.intraday_pct(q),
         })
 
     equity = round(state["cash"] + pos_value, 2)
@@ -325,6 +331,12 @@ def main() -> int:
     max_hold_days = caps["MAX_HOLD_DAYS"]              # time-exit after N calendar days (~drift window) — the core exit
     stall_band_pct = envf("STALL_BAND_PCT", 2.0)       # max |pnl%| for max-hold-MIN to fire (only if MAX_HOLD_MIN>0)
     tiers = scale_out_tiers()                          # partial profit-take ladder (gain% -> fraction of entry qty); [] = off
+    # Tier-1 hold-risk monitor (hold_risk.py): a cheap per-tick protective SELL of a DETERIORATING
+    # loser — tighter than the hard stop, gated so it doesn't whipsaw a noisy-but-fine position. The
+    # hard STOP_LOSS_PCT stop stays the backstop under it. HOLD_RISK_SELL=0 disables the auto-sell
+    # (positions are still scored, for logging + the Tier-2 manage cadence).
+    hold_risk_sell = env("HOLD_RISK_SELL", "1") == "1"
+    soft_cut = envf("SOFT_CUT_PCT", 4.0)               # protective-sell a falling loser at this %
     # Minutes until the 16:00 ET close (None when not in a regular session).
     close_et = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
     mins_to_close = (close_et - now_et).total_seconds() / 60.0 if is_open else None
@@ -335,6 +347,10 @@ def main() -> int:
         sp, tpp = p.get("stop_price"), p.get("take_profit_price")
         if lp is None:
             continue  # need a fresh quote to (synthetically) sell against
+        # Tier-1 hold-risk score (cheap, deterministic) — surfaced on the position for logging + the
+        # Tier-2 manage cadence, and used below for the protective soft-cut.
+        prisk = hold_risk.score(p, now_utc, soft_cut_pct=soft_cut)
+        p["risk"] = prisk
         reason = None
         # Prefer the explicit per-position stop/TP levels set at buy; fall back to the % rule.
         # "synthetic stop" = enforced here at tick time, NOT a resting broker order (no gap cover).
@@ -346,6 +362,9 @@ def main() -> int:
             reason = f"stop-loss {pp}% <= -{sl}%"
         elif tpp is None and pp is not None and pp >= tp:
             reason = f"take-profit {pp}% >= {tp}%"
+        # Tier-1 SMART soft-cut: bail a deteriorating loser before the hard stop (risk monitor's call).
+        elif hold_risk_sell and prisk.get("protective_sell"):
+            reason = f"risk-exit: {prisk.get('sell_reason')}"
         # Time-based exits (price-independent risk mgmt; bound the synthetic-stop gap window).
         elif is_open and flatten_min > 0 and mins_to_close is not None and mins_to_close <= flatten_min:
             reason = f"EOD flatten ({int(mins_to_close)}m to close)"
