@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 
 import stock_memory as memory                # sibling: long-term per-symbol eval memory + exclusions
+import catalyst_log                          # sibling: forward filter-lift ledger (gap event -> verdict)
 from apply_decision import extract_decision  # sibling: robust JSON extraction
 
 REPO = Path(__file__).resolve().parent.parent
@@ -177,6 +178,7 @@ def run_dd(c: dict, regime: dict, caps: dict, portfolio: dict, dd_model: str) ->
             commit["reason"] = f"commit returned without a valid size; {commit.get('reason', '')}".strip()
     return {"symbol": sym, "decision": decision, "conviction": commit.get("conviction"),
             "dollar_amount": dollar, "reason": commit.get("reason", ""),
+            "catalyst_type": commit.get("catalyst_type"),        # earnings|guidance|...|none (none => pump)
             "catalysts": commit.get("catalysts", []), "risks": commit.get("risks", []),
             "next_earnings_date": commit.get("next_earnings_date"),
             "never_buy": bool(commit.get("never_buy")),          # structural disqualifier -> exclude
@@ -297,6 +299,11 @@ def main() -> int:
                                 "reason": f"[{tag}] {res.get('reason', '')}"})
         if cache_dirty:
             save_cache(cache)
+
+    # Forward filter-lift ledger: record each agent-evaluated gap candidate's verdict (commit/reject)
+    # so catalyst_filter_report.py can later join it to the realized N-day drift. Best-effort.
+    if dd_results:
+        catalyst_log.record_events(context, candidates, dd_results)
 
     rationale = (f"{len(exits)} rule-exit(s), {len(candidates)} screened candidate(s)"
                  + (" [hostile regime: entries off]" if screen.get("hostile_regime") else "")

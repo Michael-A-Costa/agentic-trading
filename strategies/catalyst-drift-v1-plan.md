@@ -96,7 +96,13 @@ hard floor** — never take a position a resting stop can't exit. ATR-scaled siz
 4. ✅ `.env` retune — gap/vol knobs, MULTI-DAY horizon, wider 8% stop, concentration (15%/name, 6 names,
    90% exposure), `MAX_PER_TRADE_LOSS_PCT` 0.01→0.02 (so the per-trade-loss cap doesn't throttle the
    wider stop), scale-out OFF, far 25% TP. Still `TRADING_MODE=paper`, `LIVE_ARMED=0`.
-5. ⏳ NEXT: paper-validate (watch whether the LLM catalyst filter lifts win rate vs ~45% unfiltered).
+5. 🔄 IN PROGRESS: paper-validating (engine live via launchd, 5-min, paper). **Forward filter-lift
+   ledger built** — `catalyst_log.py` logs every agent-evaluated gap event {verdict, gap, vol,
+   ref_price, is_real/is_pump} to `data/catalyst_events.jsonl`; `catalyst_filter_report.py` joins each
+   to its realized N-day forward drift (keyless daily history) and reports REAL vs PUMP vs the gap-alone
+   baseline. Leakage-free (forward, no hindsight) — the historical version is contaminated by the LLM
+   already knowing the outcome. Read the report (`python3 scripts/catalyst_filter_report.py`) as events
+   accumulate; the lift of REAL over gap-alone is the whole thesis.
 6. ⏳ TODO (live-only, before re-arming): in `live_execute.py` make the resting `stop_market` GTC
    mandatory for overnight whole-share lots + verify it persists across an overnight boundary on the
    canary; ATR/vol-scaled sizing under the notional cap; cadence drop (5-min → a few scans/day) in
