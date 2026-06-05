@@ -28,11 +28,18 @@ import argparse
 import os
 import sys
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rh_mcp
 import live_execute as le
+import market_conditions as mc
+
+# US-equity session -> the market_hours the order must carry. Extended sessions (pre-market 04:00-
+# 09:30, after-hours 16:00-20:00 ET) need "extended_hours" or the broker queues/rejects the order;
+# F trades in those sessions, so a far-below limit placed now still rests (and still can't fill).
+EXTENDED_SESSIONS = {"pre_market", "after_hours"}
 
 SAFE_FRAC = 0.30      # default limit = 30% of last trade — far below market
 MAX_FRAC = 0.50       # hard ceiling: refuse to place if limit >= 50% of last (could fill)
@@ -62,17 +69,32 @@ def main() -> int:
     ap.add_argument("--qty", type=int, default=1, help="whole shares (default 1)")
     ap.add_argument("--limit", type=float, default=None,
                     help="limit price; default = 30%% of the live last (auto, far below market)")
-    ap.add_argument("--tif", default="gtc", choices=["gtc", "gfd"],
-                    help="time in force (gtc rests so you can see it; default gtc)")
+    ap.add_argument("--tif", default=None, choices=["gtc", "gfd"],
+                    help="time in force (default: gfd in extended hours, gtc in regular)")
+    ap.add_argument("--market-hours", default="auto",
+                    choices=["auto", "regular_hours", "extended_hours"],
+                    help="session to route to (default auto: picks extended in pre/after-hours)")
     ap.add_argument("--place", action="store_true",
                     help="actually place + cancel (needs TRADING_MODE=live & LIVE_ARMED=1). "
                          "Omit for a safe review-only run.")
     args = ap.parse_args()
     sym = args.symbol.upper().strip()
 
+    now_et = datetime.now(timezone.utc).astimezone(mc.ET)
+    session, _ = mc.session_state(now_et)
+    if args.market_hours != "auto":
+        market_hours = args.market_hours
+    else:
+        market_hours = "extended_hours" if session in EXTENDED_SESSIONS else "regular_hours"
+    tif = args.tif or ("gfd" if market_hours == "extended_hours" else "gtc")
+
     print(f"=== live write-path smoke test — {sym} unfillable limit ===")
     print(f"TRADING_MODE={os.environ.get('TRADING_MODE', 'paper')}  LIVE_ARMED={os.environ.get('LIVE_ARMED', '0')}")
+    print(f"session={session} ({now_et:%H:%M ET})  ->  market_hours={market_hours}  tif={tif}")
     print(f"account={rh_mcp.account()}\n")
+    if session in ("closed", "closed_weekend"):
+        print("note: market fully closed — an order will QUEUE for the next session, not rest now. "
+              "Run during regular or extended hours to test a live resting order.\n")
 
     # 1) READ PATH: pull a live quote (also proves snapshot + account pin work).
     snap = rh_mcp.snapshot([sym])
@@ -96,7 +118,7 @@ def main() -> int:
     print(f"[guard]  limit={limit:.2f}  ({limit / last:.0%} of last) — cannot be marketable\n")
 
     spec = {"symbol": sym, "side": "buy", "type": "limit", "quantity": str(int(args.qty)),
-            "limit_price": f"{limit:.2f}", "time_in_force": args.tif, "market_hours": "regular_hours"}
+            "limit_price": f"{limit:.2f}", "time_in_force": tif, "market_hours": market_hours}
 
     # 3) REVIEW PATH (no execution — the place tool isn't even in the review agent's toolset).
     review = rh_mcp.review(spec)

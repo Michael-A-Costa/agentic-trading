@@ -46,8 +46,11 @@ the order in a `finally` block so it never leaves a resting order behind.
 
 - The **Robinhood MCP is connected** (the relay spawns a headless `claude` that needs MCP auth — run
   `/mcp` to connect first).
-- **Regular market hours** (09:30–16:00 ET). Off-hours, `review` will flag the market as closed and a
-  GTC order won't rest the same way.
+- **Regular OR extended hours.** F trades in the extended sessions (pre-market 04:00–09:30, after-hours
+  16:00–20:00 ET), so you can run this probe *right now* after the close. `live_smoke_test.py`
+  auto-detects the session and routes the order to `extended_hours` (TIF `gfd`) when appropriate — the
+  far-below limit still rests unfilled. Only when the market is **fully closed** (overnight/weekend)
+  does the order merely queue for the next session instead of resting; the script warns you.
 - The agentic account's **investor profile is complete** — otherwise `place` 400s on the second order
   (a known Robinhood quirk; see CLAUDE.md).
 - `.env` has the live knobs: `TRADING_MODE`, `LIVE_ARMED`, `LIVE_CANARY_USD`, `RH_EXEC_MODEL`.
@@ -82,6 +85,11 @@ A clean run ends with `PASS: ... Account left flat.`
 
 > Without `LIVE_ARMED=1`, `--place` stops after review and logs "would place" — the same double-gate
 > the engine itself uses, so you can't place by accident.
+
+> **Placing NOW, after hours:** this is a *manual one-off* — the script talks straight to the relay,
+> so it isn't subject to the engine's market-hours gate. (The automated 5-min planner stays gated off
+> after hours by design; it won't place. Only this probe does.) Override the session with
+> `--market-hours extended_hours` if auto-detect ever disagrees.
 
 ### Manual equivalent (if you'd rather drive the relay directly)
 
