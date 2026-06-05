@@ -291,7 +291,10 @@ def main() -> int:
         "MAX_OPEN_POSITIONS": int(envf("MAX_OPEN_POSITIONS", 10)),
         "STOP_LOSS_PCT": envf("STOP_LOSS_PCT", 4.0),
         "TAKE_PROFIT_PCT": envf("TAKE_PROFIT_PCT", 4.0),
-        "SIGNAL_THRESHOLD_PCT": envf("SIGNAL_THRESHOLD_PCT", 2.0),
+        "SIGNAL_THRESHOLD_PCT": envf("SIGNAL_THRESHOLD_PCT", 2.0),  # DEPRECATED (old intraday-pop trigger)
+        "GAP_THRESHOLD_PCT": envf("GAP_THRESHOLD_PCT", 7.0),        # catalyst entry: min overnight gap %
+        "VOL_MULT_MIN": envf("VOL_MULT_MIN", 2.0),                  # catalyst entry: min volume vs 20d avg
+        "MAX_HOLD_DAYS": envf("MAX_HOLD_DAYS", 0.0),                # multi-day time-exit (drift window)
         "DAILY_MAX_LOSS_PCT": daily_pct,
         "DAILY_MAX_LOSS_CAP_USD": daily_cap,
         "DAILY_MAX_LOSS_USD": daily_max_loss,                      # = min(pct * start-of-day equity, cap)
@@ -309,16 +312,18 @@ def main() -> int:
     # --- DETERMINISTIC screen (rules, no LLM): exits + entry candidates ---
     # Exits are pure risk rules — never a model decision. Stop/TP first, then time-based exits.
     tp, sl = caps["TAKE_PROFIT_PCT"], caps["STOP_LOSS_PCT"]
-    sig = caps["SIGNAL_THRESHOLD_PCT"]
-    # Screen / risk-mgmt tuning knobs (all .env-overridable; defaults are conservative).
-    rel_strength_pct = envf("REL_STRENGTH_PCT", 1.0)   # require this much intraday % ABOVE SPY
-    cooldown_min = envf("COOLDOWN_MIN", 30.0)          # no re-entry within N min of an exit (anti-whipsaw)
-    flatten_min = envf("FLATTEN_BEFORE_CLOSE_MIN", 15.0)  # flatten ALL positions N min before close
+    # CATALYST-DRIFT v1 entry gate: overnight gap on a volume spike (NOT the old intraday pop).
+    gap_threshold = caps["GAP_THRESHOLD_PCT"]          # min overnight gap % vs prior close
+    vol_mult_min = caps["VOL_MULT_MIN"]                # AND today's volume >= this x its 20d average
+    # Screen / risk-mgmt tuning knobs (all .env-overridable; v1 defaults hold MULTI-DAY, no EOD flatten).
+    cooldown_min = envf("COOLDOWN_MIN", 1440.0)        # no re-entry within N min of an exit (anti-whipsaw; 1d default)
+    flatten_min = envf("FLATTEN_BEFORE_CLOSE_MIN", 0.0)  # 0 = HOLD OVERNIGHT (the drift edge is overnight)
     winddown_min = envf("WINDDOWN_BEFORE_CLOSE_MIN", 0.0)  # in the last N min, lock GREEN positions early (0 = off)
     winddown_profit = envf("WINDDOWN_MIN_PROFIT_PCT", 1.0)  # only wind down positions with pnl% >= this (0 = any green)
-    no_entry_last_min = envf("NO_ENTRY_LAST_MIN", 15.0)   # block NEW entries in the last N min
-    max_hold_min = envf("MAX_HOLD_MIN", 0.0)           # force-exit a STALLED position held > N min (0 = off)
-    stall_band_pct = envf("STALL_BAND_PCT", 2.0)       # max |pnl%| for max-hold to fire (<=0 = exit at time regardless)
+    no_entry_last_min = envf("NO_ENTRY_LAST_MIN", 0.0)   # 0 = entering near the close is fine for a multi-day hold
+    max_hold_min = envf("MAX_HOLD_MIN", 0.0)           # 0 = OFF (no intraday recycle; v1 holds the drift out)
+    max_hold_days = caps["MAX_HOLD_DAYS"]              # time-exit after N calendar days (~drift window) — the core exit
+    stall_band_pct = envf("STALL_BAND_PCT", 2.0)       # max |pnl%| for max-hold-MIN to fire (only if MAX_HOLD_MIN>0)
     tiers = scale_out_tiers()                          # partial profit-take ladder (gain% -> fraction of entry qty); [] = off
     # Minutes until the 16:00 ET close (None when not in a regular session).
     close_et = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
@@ -362,6 +367,15 @@ def main() -> int:
                     reason = f"max-hold {int(age_min)}m >= {int(max_hold_min)}m{band}"
             except (ValueError, TypeError):
                 pass
+        elif max_hold_days > 0 and p.get("entry_ts"):
+            # CATALYST-DRIFT v1 core exit: the multi-day drift window elapsed -> time-exit the hold.
+            # Unlike max-hold-MIN this fires regardless of pnl (the drift is realized by N days, win or lose).
+            try:
+                age_days = (now_utc - datetime.fromisoformat(p["entry_ts"])).days
+                if age_days >= max_hold_days:
+                    reason = f"max-hold {age_days}d >= {int(max_hold_days)}d (drift window elapsed)"
+            except (ValueError, TypeError):
+                pass
         if reason:
             exits.append({"symbol": p["symbol"], "reason": reason})
         elif tiers and pp is not None and pp > 0:
@@ -382,10 +396,11 @@ def main() -> int:
                               "reason": f"scale-out {pct}% at +{pp}% (tier {tier_lbl})",
                               "qty": qty_out, "scale_tiers": gains})
 
-    # Entry candidates: movers clearing BOTH an absolute threshold and a relative-strength bar vs
-    # SPY (so we don't just buy market beta on a broad-up tape), in a non-hostile regime, not held,
-    # not in post-exit cooldown, with a fresh same-day quote. Ranked by relative strength, then by
-    # range position (prefer not-already-at-the-high). Stage 2 (DD) makes the real commit call.
+    # Entry candidates (CATALYST-DRIFT v1): names that OVERNIGHT-GAPPED >= GAP_THRESHOLD_PCT vs their
+    # prior close AND traded >= VOL_MULT_MIN x their 20d-average volume (gap+volume = a keyless catalyst
+    # proxy), in a non-hostile regime, not held, not in post-exit cooldown, with a fresh same-day quote.
+    # Ranked by gap size (biggest surprise first). Stage 2 (DD) then CONFIRMS the catalyst is real and
+    # rejects pumps — the load-bearing filter for the small/mid universe.
     hostile = (regime.get("posture") == "risk_off") or (regime.get("volatility_regime") == "elevated")
     held = {p["symbol"] for p in positions}
     # A quote is only a LIVE signal during regular hours AND when it carries today's date.
@@ -420,28 +435,31 @@ def main() -> int:
                     | {s.strip().upper() for s in env("NON_TRADABLE_SYMBOLS", "").split(",") if s.strip()})
     entry_candidates = []
     if allow_entries and not hostile:
-        spy_move = mc.intraday_pct(quotes.get("SPY") or {})  # SPY already fetched — no extra call
         movers = []
         for c in cand:
-            if c["symbol"] in non_tradable:
+            sym = c["symbol"]
+            if sym in non_tradable or sym in held or sym in cooling:
                 continue
-            ip = c.get("intraday_pct")
-            if ip is None or ip < sig:
-                continue
-            if c["symbol"] in held or c["symbol"] in cooling:
+            q = quotes.get(sym) or {}
+            if q.get("last") is None:
                 continue
             if c.get("date") and c["date"] != today:
                 continue  # this symbol's own quote is stale — fail closed, skip it
-            rel = round(ip - spy_move, 3) if spy_move is not None else ip
-            if rel < rel_strength_pct:
+            # Overnight gap + volume spike from the live quote + cached daily bars (keyless).
+            bars = mc.daily_bars_cached(sym, today)
+            csig = mc.catalyst_signal(q, bars, today)
+            gp, vm = csig.get("gap_pct"), csig.get("vol_mult")
+            if gp is None or vm is None:          # need BOTH gap and volume — fail closed on missing history
                 continue
-            movers.append({**c, "rel_strength": rel})
-        movers.sort(key=lambda c: (-c["rel_strength"],
-                                   c["range_pos"] if c.get("range_pos") is not None else 1.0))
-        entry_candidates = [{"symbol": c["symbol"], "intraday_pct": c["intraday_pct"],
-                             "rel_strength": c["rel_strength"], "range_pos": c.get("range_pos"),
-                             "reason": (f"+{c['intraday_pct']}% intraday, rel {c['rel_strength']} vs SPY "
-                                        f">= {rel_strength_pct}, {regime.get('posture')} regime")}
+            if gp < gap_threshold or vm < vol_mult_min:
+                continue
+            movers.append({**c, "gap_pct": gp, "vol_mult": vm, "prev_close": csig.get("prev_close")})
+        movers.sort(key=lambda c: -c["gap_pct"])   # biggest catalyst gap first (largest surprise)
+        entry_candidates = [{"symbol": c["symbol"], "gap_pct": c["gap_pct"], "vol_mult": c["vol_mult"],
+                             "range_pos": c.get("range_pos"), "intraday_pct": c.get("intraday_pct"),
+                             "reason": (f"gap +{c['gap_pct']}% overnight on {c['vol_mult']}x 20d-vol "
+                                        f"(catalyst proxy, >= {gap_threshold}% / {vol_mult_min}x), "
+                                        f"{regime.get('posture')} regime")}
                             for c in movers]
     screen = {"exits": exits, "entry_candidates": entry_candidates,
               "hostile_regime": hostile, "cooling": sorted(cooling)}

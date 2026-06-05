@@ -276,6 +276,76 @@ def daily_trend(sym: str = TREND_SYMBOL, today: str | None = None) -> dict:
     }
 
 
+# --------------------------------------------------------------------------- catalyst gap+volume
+def _fetch_daily_ohlcv(sym: str) -> list[dict]:
+    """Last ~1y of daily bars [{date, close, volume}] (oldest->newest), keyless via the Cboe CDN.
+
+    [] on failure (caller fails closed / falls back to a stale cache). Only Cboe here — it's the
+    reliable keyless OHLCV source; a miss just skips the candidate this tick. See
+    memory/keyless-market-data-sources.md.
+    """
+    try:
+        d = json.loads(_http_get(CBOE_HIST.format(sym=urllib.parse.quote(sym.upper()))))
+        bars = []
+        for b in (d.get("data") or []):
+            c, dt = _fnum(b.get("close")), (b.get("date") or "").strip()
+            if c is not None and dt:
+                bars.append({"date": dt, "close": c, "volume": _fnum(b.get("volume"))})
+        return bars[-TREND_LOOKBACK:]
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError, TypeError):
+        return []
+
+
+def daily_bars_cached(sym: str, today: str) -> list[dict]:
+    """Daily OHLCV bars with a once-a-day file cache (data/history/bars_{SYM}.json), stale fallback.
+
+    The catalyst screen calls this per candidate; a daily cache means one fetch per name per day, the
+    rest of the day's ticks are free. Mirrors _daily_closes_cached but keeps volume too.
+    """
+    path = HISTORY_DIR / f"bars_{sym.upper()}.json"
+    try:
+        cached = json.loads(path.read_text())
+    except (OSError, ValueError):
+        cached = None
+    if cached and cached.get("fetched_date") == today and cached.get("bars"):
+        return cached["bars"]
+    bars = _fetch_daily_ohlcv(sym)
+    if bars:
+        try:
+            HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps({"symbol": sym.upper(), "fetched_date": today,
+                                       "n_bars": len(bars), "bars": bars}))
+            os.replace(tmp, path)
+        except OSError:
+            pass
+        return bars
+    return (cached or {}).get("bars") or []   # stale fallback, or [] if never cached
+
+
+def catalyst_signal(quote: dict, bars: list[dict], today: str, navg: int = 20) -> dict:
+    """Overnight GAP + VOLUME-SPIKE (a keyless catalyst proxy) from a live quote + cached daily bars.
+
+      gap_pct  = (today's open / prior daily close - 1) * 100 — the overnight jump. Uses the quote's
+                 open (the gap is fixed once the session opens); falls back to last if open is missing.
+      vol_mult = today's cumulative volume / trailing navg-day average volume.
+
+    Only COMPLETED daily bars (date < today) define the prior close + average volume, so a partial
+    'today' bar present in the history feed can't contaminate them. Returns Nones when data is
+    insufficient and the caller fails closed (no gap/volume confirmation => no entry).
+    """
+    completed = [b for b in bars if b.get("date") and b["date"] < today]
+    prev_close = completed[-1]["close"] if completed else None
+    vols = [b["volume"] for b in completed[-navg:] if b.get("volume")]
+    avg_vol = (sum(vols) / len(vols)) if vols else None
+    o = quote.get("open") or quote.get("last")
+    gap_pct = round((o / prev_close - 1) * 100, 2) if (o and prev_close) else None
+    tvol = quote.get("volume")
+    vol_mult = round(tvol / avg_vol, 2) if (tvol and avg_vol) else None
+    return {"gap_pct": gap_pct, "vol_mult": vol_mult,
+            "prev_close": prev_close, "avg_vol": round(avg_vol) if avg_vol else None}
+
+
 # --------------------------------------------------------------------------- session
 def session_state(now_et: datetime) -> tuple[str, bool]:
     """Crude US-equity session label. Weekday + clock only — does NOT know market holidays."""

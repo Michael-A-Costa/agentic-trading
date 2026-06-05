@@ -81,7 +81,7 @@ DD_TOOLS = ["WebSearch", "WebFetch", "mcp__robinhood-trading__get_equity_quotes"
 
 def fmt_candidate(c: dict) -> str:
     """One screened entry candidate -> compact signal string for the log."""
-    return f"{c.get('symbol', '?')}(+{c.get('intraday_pct')}% rel {c.get('rel_strength')})"
+    return f"{c.get('symbol', '?')}(gap +{c.get('gap_pct')}% {c.get('vol_mult')}x-vol)"
 
 
 def fmt_dd_line(d: dict) -> str:
@@ -130,9 +130,10 @@ def run_dd(c: dict, regime: dict, caps: dict, portfolio: dict, dd_model: str) ->
     dd_input = json.dumps({
         "symbol": sym,
         "screen_reason": c.get("reason", ""),
-        "screen_signal": {"intraday_pct": c.get("intraday_pct"),
-                          "rel_strength_vs_spy": c.get("rel_strength"),
-                          "range_pos": c.get("range_pos")},  # near 1.0 = at the day's high (extended)
+        "screen_signal": {"gap_pct": c.get("gap_pct"),          # overnight gap vs prior close (the catalyst proxy)
+                          "vol_mult": c.get("vol_mult"),        # today's volume vs its 20d average
+                          "intraday_pct": c.get("intraday_pct"),  # move from today's open (context only)
+                          "range_pos": c.get("range_pos")},     # near 1.0 = at the day's high
         "regime": regime,
         "sizing": {"MAX_POSITION_USD": caps["MAX_POSITION_USD"],
                    "MIN_POSITION_USD": caps.get("MIN_POSITION_USD", 0.0),
