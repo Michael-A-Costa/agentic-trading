@@ -146,5 +146,36 @@ check("sentinel sold the stopped-out position", "AAPL" not in out["positions"])
 check("engine-log got a source='sentinel' fill record",
       any(r.get("source") == "sentinel" and r.get("n_filled", 0) >= 1 for r in logged))
 
+print("\nLIVE PATH (decision file -> apply_decision arms -> sentinel fires on the cross)")
+import sys as _sys
+tmp2 = Path(tempfile.mkdtemp())
+sfile, ctxfile, decfile, elog = (tmp2 / "paper_state.json", tmp2 / "ctx.json",
+                                 tmp2 / "dec.json", tmp2 / "engine.jsonl")
+sfile.write_text(_json.dumps(fresh_state(cash=1000.0)))
+ictx2 = ctx(candidates=[{"symbol": "AAPL", "last": 300.0}])          # below the 315 trigger
+ctxfile.write_text(_json.dumps(ictx2))
+# exactly the action decide.py emits for an armed DD commit:
+decfile.write_text(_json.dumps({"actions": [{"symbol": "AAPL", "side": "buy", "dollar_amount": 100,
+    "arm": True, "entry_trigger": {"price": 315.0, "direction": "above"}, "conviction": "high",
+    "reason": "[DD/high] breakout-armed"}], "rationale": "t"}))
+ad.STATE_PATH, ad.ENGINE_LOG = sfile, elog
+ad.trade_log.record_fills = lambda *a, **k: []
+_argv = _sys.argv
+_sys.argv = ["apply_decision", "--context", str(ctxfile), "--decision", str(decfile)]
+ad.main()
+_sys.argv = _argv
+out2 = _json.loads(sfile.read_text())
+check("apply_decision ARMED the entry (no immediate buy)",
+      "AAPL" in out2.get("armed_entries", {}) and "AAPL" not in out2["positions"])
+# sentinel fires it once price crosses the trigger
+sen.STATE_PATH, sen.ENGINE_LOG = sfile, elog
+fctx = ctx(candidates=[{"symbol": "AAPL", "last": 316.0}])           # now above the trigger
+sen.tc.build_context = lambda now=None: fctx
+rc3 = sen.main()
+out3 = _json.loads(sfile.read_text())
+check("sentinel FIRED the armed entry on the cross",
+      "AAPL" in out3["positions"] and "AAPL" not in out3.get("armed_entries", {}))
+check("sentinel.main returned 0", rc3 == 0)
+
 print(f"\n{'='*48}\n{PASS} passed, {FAIL} failed")
 raise SystemExit(1 if FAIL else 0)

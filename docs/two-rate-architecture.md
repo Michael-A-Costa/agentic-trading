@@ -56,8 +56,10 @@ front* and leaves a deterministic trigger the sentinel can fire — keeping the 
   `allow_entries` is true and it hasn't expired) it fires the buy through `validate_and_fill`
   (full cap gate) and consumes the trigger. Expired triggers are dropped.
 - **Default is unchanged behavior:** a commit with *no* `entry_trigger` fills immediately, exactly
-  as before. Arming is opt-in from the DD output, so the existing entry strategy is untouched until
-  the prompt deliberately uses it.
+  as before. The DD prompt (`dd_prompt.txt`) now offers `entry_trigger` for breakout-confirmation
+  (`above`) and pullback (`below`) entries, with guidance to reserve it for when the level genuinely
+  is the thesis — so arming is live in production but the default stays immediate. `ENTRY_ARMING=0`
+  disables it engine-wide.
 
 Triggers are re-validated/re-armed by the planner each 5-min tick; an armed entry's natural TTL is
 `ENTRY_ARM_TTL_MIN` (default one planner cycle's worth of slack).
@@ -87,5 +89,5 @@ Triggers are re-validated/re-armed by the planner each 5-min tick; an armed entr
 ## Future
 
 - Decouple manage-DD cadence from entry-DD cadence now that exits no longer need the planner.
-- Teach the DD prompt to emit `entry_trigger` so armed (level-triggered) entries actually fire in
-  production — the plumbing + tests exist; the prompt is the only missing piece.
+- Watch armed-entry usage in the logs: if the agent over-arms (triggers expiring unfilled → re-DD
+  churn), tune `ENTRY_ARM_TTL_MIN` up or tighten the prompt guidance.

@@ -62,12 +62,30 @@ Cut one tier in elevated volatility, a `mixed` trend, a wide spread, or a parabo
 If the capped result is < MIN_POSITION_USD, reject (don't commit dust). A commit MUST carry a positive
 dollar_amount.
 
+=== ENTRY TIMING — buy now, or ARM a level (optional) ===
+Default: a commit fills IMMEDIATELY at the current price — right when the name is good to own RIGHT
+NOW. But if your read is conditional on a price LEVEL, set entry_trigger and a fast 1-min sentinel
+will pull the trigger the moment price crosses it — so you don't buy a fakeout or chase an extended
+print:
+  - BREAKOUT confirmation -> direction "above": coiled just under resistance; only want it if it
+    actually breaks. Set price just above the level (the day's high / a base top).
+  - PULLBACK / limit entry -> direction "below": already extended (range_pos ~1.0) but you'd own it
+    cheaper; buy only if it dips to support (VWAP, a rising MA, the prior breakout level).
+An armed trigger is SHORT-LIVED — it expires in minutes and the name is re-evaluated next cycle — so
+arm only NEAR-TERM, imminently-reachable levels; for a far-off "maybe someday" level, just reject for
+now. The sizing is identical either way: entry_trigger changes only WHEN the buy fires, not whether
+or how big. Omit it (or null) to buy immediately. Most shots should still be immediate — reserve
+arming for when the level genuinely IS the thesis.
+
 === OUTPUT — output ONLY one JSON object, no prose, no markdown fences, as your FINAL message ===
 Do not echo the input or your tool transcript. Exactly one object with these fields:
   decision         : "commit" | "reject"
   dollar_amount    : number (required and > 0 for commit; null for reject)
   conviction       : "high" | "medium" | "low" (null for reject)
   hold_intent      : "scalp" | "swing" | "runner" (null for reject) — your intended horizon
+  entry_trigger    : OPTIONAL {"price": number > 0, "direction": "above"|"below"} or null — arm a
+                     level-triggered entry instead of buying now (see ENTRY TIMING). null/omit = buy
+                     immediately at market. Only valid on a commit.
   thesis_type      : "momentum" | "breakout" | "news" | "earnings" | "sector" | "technical" |
                      "reversal" | "other" (null/"none" for reject)
   next_earnings_date : "YYYY-MM-DD" or "unknown" (informational — earnings is a risk, not a blocker)
@@ -76,13 +94,19 @@ Do not echo the input or your tool transcript. Exactly one object with these fie
   never_buy        : boolean — TRUE only for a STRUCTURAL, durable disqualifier (R2). Permanently
                      excludes the name from future ticks — reserve for real red flags; default FALSE.
   never_buy_reason : string or null — required when never_buy is true
-Example commit: {"symbol":"PLTR","decision":"commit","dollar_amount":300,"conviction":"high",
-  "hold_intent":"swing","thesis_type":"breakout","next_earnings_date":"2026-08-04",
+Example commit (immediate): {"symbol":"PLTR","decision":"commit","dollar_amount":300,
+  "conviction":"high","hold_intent":"swing","entry_trigger":null,"thesis_type":"breakout",
+  "next_earnings_date":"2026-08-04",
   "reason":"Breaking out of a 3-week base on 2x volume after an analyst PT hike; room to the prior high,
    not yet extended.","risks":["broad-market reversal risk","high IV"],"never_buy":false,
   "never_buy_reason":null}
+Example commit (armed breakout): {"symbol":"COIN","decision":"commit","dollar_amount":300,
+  "conviction":"high","hold_intent":"swing","entry_trigger":{"price":312.50,"direction":"above"},
+  "thesis_type":"breakout","next_earnings_date":"2026-07-30",
+  "reason":"Coiling just under 312 resistance on rising volume; want the confirmed break, not the
+   fakeout.","risks":["fails the breakout and reverses"],"never_buy":false,"never_buy_reason":null}
 Example reject:  {"symbol":"XYZ","decision":"reject","dollar_amount":null,"conviction":null,
-  "hold_intent":null,"thesis_type":"none","next_earnings_date":"unknown",
+  "hold_intent":null,"entry_trigger":null,"thesis_type":"none","next_earnings_date":"unknown",
   "reason":"Spread too wide to exit cleanly and no read on direction — not worth the slippage.",
   "risks":["illiquid"],"never_buy":false,"never_buy_reason":null}
 
