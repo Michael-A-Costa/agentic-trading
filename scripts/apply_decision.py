@@ -28,6 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import trade_log  # shared trade-history writer (paper + live)
+from state_lock import state_lock  # short critical section around every paper_state read-modify-write
 
 REPO = Path(__file__).resolve().parent.parent
 DATA = REPO / "data"
@@ -396,6 +397,15 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
+    # All paper_state.json read-modify-write runs under .state.lock so the 1-min sentinel and this
+    # 5-min executor never lose each other's updates. apply_decision does NO LLM/network work, so the
+    # lock is held only for this fast compute span (ms) — NOT during the planner's DD (decide.py runs
+    # before this and never touches paper_state), which is why the sentinel is no longer starved.
+    with state_lock():
+        return _run(context, caps, now, args)
+
+
+def _run(context: dict, caps: dict, now: datetime, args) -> int:
     state_path = STATE_PATH
     if state_path.exists():
         try:

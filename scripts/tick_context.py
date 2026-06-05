@@ -83,8 +83,12 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
+    # Atomic (temp + os.replace) so a concurrent reader (e.g. the sentinel) can't see a half-written
+    # file, matching apply_decision.write_json_atomic.
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps(state, indent=2))
+    tmp = STATE_PATH.with_suffix(STATE_PATH.suffix + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    os.replace(tmp, STATE_PATH)
 
 
 def load_live_state() -> dict:
@@ -263,7 +267,16 @@ def build_context(now_utc: datetime | None = None) -> dict:
         state["day"] = today
         state["start_of_day_equity"] = equity
         if not is_live:
-            save_state(state)
+            # Persist ONLY the day + SOD fields, under .state.lock, via a fresh re-read — never the
+            # snapshot loaded before the (slow) quote fetch, which would clobber any exit the sentinel
+            # wrote in between. The rollover fires once a day, so the lock is essentially never contended.
+            from state_lock import state_lock
+            with state_lock():
+                fresh = load_state()
+                if fresh.get("day") != today or fresh.get("start_of_day_equity") is None:
+                    fresh["day"] = today
+                    fresh["start_of_day_equity"] = equity
+                    save_state(fresh)
     day_pnl = round(equity - state["start_of_day_equity"], 2)
 
     # --- candidates with intraday move ---

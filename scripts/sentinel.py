@@ -12,9 +12,9 @@ It is the deterministic, NO-LLM half of the system (see docs/two-rate-architectu
 It shares tick_context.build_context() (identical exit rules + caps as the planner) and
 apply_decision.validate_and_fill() (identical cap gate + paper fill) — so a sentinel action is
 indistinguishable from a planner action except for cadence and the source tag. It NEVER calls the
-model or touches the MCP. Single-flight against the planner via the SAME data/.tick.lock, so the
-two loops never race on paper_state.json: if a planner tick is running, the sentinel skips this
-minute (the planner runs the same exit screen at the end of its own tick).
+model or touches the MCP. Its quote fetch runs lock-free; only the read-modify-write of
+paper_state.json is wrapped in the short-held data/.state.lock (shared with apply_decision), so the
+planner's DD never starves the sentinel and the two loops can't lose each other's writes.
 
 Usage:  sentinel.py            # one fast pass
         sentinel.py --dry-run  # evaluate + print intended actions, mutate/write NOTHING
@@ -23,9 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,37 +31,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tick_context as tc
 import apply_decision as ad
 import trade_log
+from state_lock import state_lock  # short critical section shared with apply_decision
 
 REPO = Path(__file__).resolve().parent.parent
 DATA = REPO / "data"
 STATE_PATH = DATA / "paper_state.json"
 ENGINE_LOG = DATA / "engine-log.jsonl"
-LOCK = DATA / ".tick.lock"          # SAME lock the planner uses -> mutual exclusion
-LOCK_STALE_MIN = 15.0               # matches run_trading_tick.sh's stale-lock reclaim window
-
-
-def acquire_lock() -> bool:
-    """Atomic single-flight via mkdir; reclaim a lock older than LOCK_STALE_MIN (crashed holder)."""
-    LOCK.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.mkdir(LOCK)
-        return True
-    except FileExistsError:
-        try:
-            if (time.time() - LOCK.stat().st_mtime) / 60.0 > LOCK_STALE_MIN:
-                os.rmdir(LOCK)
-                os.mkdir(LOCK)
-                return True
-        except OSError:
-            pass
-        return False
-
-
-def release_lock() -> None:
-    try:
-        os.rmdir(LOCK)
-    except OSError:
-        pass
 
 
 def exit_actions_from_screen(context: dict) -> list[dict]:
@@ -119,46 +92,52 @@ def main() -> int:
                     help="evaluate + print intended actions; mutate/write nothing")
     args = ap.parse_args()
 
-    if not args.dry_run and not acquire_lock():
-        print("[sentinel] planner tick holds the lock — skip")
+    now = datetime.now(timezone.utc)
+    context = tc.build_context(now)     # quote fetch — done OUTSIDE the state lock (slow, read-only)
+
+    # Live exits run through the broker relay + resting stops, not this paper executor.
+    if str(context.get("mode", "paper")).lower() == "live":
         return 0
-    try:
-        now = datetime.now(timezone.utc)
-        context = tc.build_context(now)
+    # Exits and entries both need a fresh, regular-hours quote to act on. Off-hours / stale ->
+    # nothing to do (the planner's gate logs the skip; the sentinel stays silent to avoid noise).
+    if not context.get("market_open") or context.get("data_stale"):
+        return 0
 
-        # Live exits run through the broker relay + resting stops, not this paper executor.
-        if str(context.get("mode", "paper")).lower() == "live":
-            return 0
-        # Exits and entries both need a fresh, regular-hours quote to act on. Off-hours / stale ->
-        # nothing to do (the planner's gate logs the skip; the sentinel stays silent to avoid noise).
-        if not context.get("market_open") or context.get("data_stale"):
-            return 0
+    caps = context["caps"]
+    # Circuit breaker: like the planner, a tripped breaker still runs exits (never strand a position
+    # without protection) but fires NO new entries.
+    breaker = (context.get("gate_reason") or "").startswith("circuit_breaker")
 
-        caps = context["caps"]
+    if args.dry_run:
         state = json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else None
         if state is None:
             print("[sentinel] no paper_state.json yet — nothing to manage")
             return 0
-
-        # Circuit breaker: like the planner, a tripped breaker still runs exits (never strand a
-        # position without protection) but fires NO new entries.
-        breaker = (context.get("gate_reason") or "").startswith("circuit_breaker")
         actions = exit_actions_from_screen(context)
         fire, drop = armed_entry_actions(state, context, now)
-        if not breaker:
-            actions += fire
-        else:
-            drop = []  # leave armed entries in place; the breaker just suppresses firing this pass
+        actions += [] if breaker else fire
+        print(f"[sentinel DRY-RUN] {context.get('ts_et')} breaker={breaker} "
+              f"exits={len(exit_actions_from_screen(context))} arm_fire={0 if breaker else len(fire)} "
+              f"arm_drop={0 if breaker else len(drop)}")
+        for a in actions:
+            print(f"  {a['side'].upper()} {a['symbol']} "
+                  f"{a.get('qty') or a.get('dollar_amount') or 'ALL'} — {a.get('reason')}")
+        return 0
 
-        if args.dry_run:
-            print(f"[sentinel DRY-RUN] {context.get('ts_et')} breaker={breaker} "
-                  f"exits={len(exit_actions_from_screen(context))} arm_fire={0 if breaker else len(fire)} "
-                  f"arm_drop={len(drop)}")
-            for a in actions:
-                print(f"  {a['side'].upper()} {a['symbol']} "
-                      f"{a.get('qty') or a.get('dollar_amount') or 'ALL'} — {a.get('reason')}")
+    # The read -> mutate -> write below is the critical section, held for milliseconds under
+    # .state.lock (shared with apply_decision). build_context's quote fetch already happened ABOVE,
+    # outside this lock, so a slow fetch never blocks the planner and vice-versa.
+    with state_lock():
+        state = json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else None
+        if state is None:
+            print("[sentinel] no paper_state.json yet — nothing to manage")
             return 0
-
+        actions = exit_actions_from_screen(context)
+        fire, drop = armed_entry_actions(state, context, now)
+        if breaker:
+            drop = []  # leave armed entries in place; the breaker just suppresses firing this pass
+        else:
+            actions += fire
         if not actions and not drop:
             return 0  # quiet minute: nothing crossed, nothing to expire
 
@@ -173,7 +152,6 @@ def main() -> int:
 
         equity, day_pnl = ad.recompute_portfolio(state, context)
         ad.write_json_atomic(STATE_PATH, state)
-
         filled = [r for r in results if r.get("status") == "filled"]
         record = {
             "ts_utc": now.isoformat(timespec="seconds"),
@@ -191,21 +169,19 @@ def main() -> int:
                                 "open_positions": len(state["positions"]),
                                 "realized_total": round(state.get("realized_total", 0.0), 2)},
         }
-        ENGINE_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with ENGINE_LOG.open("a") as f:
-            f.write(json.dumps(record) + "\n")
-        trade_log.record_fills(results, ts_utc=record["ts_utc"], ts_et=record["ts_et"],
-                               mode=record["mode"])
 
-        if filled:
-            parts = [f"{r['side'].upper()} {r.get('qty', '?')} {r['symbol']} @ {r.get('price', '?')}"
-                     for r in filled]
-            print(f"[{record['ts_et']}] equity={equity} SENTINEL {len(filled)} filled | "
-                  f"day_pnl={day_pnl} | " + " ; ".join(parts))
-        return 0
-    finally:
-        if not args.dry_run:
-            release_lock()
+    # Append-only logging + print happen OUTSIDE the lock (no state mutation).
+    ENGINE_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with ENGINE_LOG.open("a") as f:
+        f.write(json.dumps(record) + "\n")
+    trade_log.record_fills(results, ts_utc=record["ts_utc"], ts_et=record["ts_et"],
+                           mode=record["mode"])
+    if filled:
+        parts = [f"{r['side'].upper()} {r.get('qty', '?')} {r['symbol']} @ {r.get('price', '?')}"
+                 for r in filled]
+        print(f"[{record['ts_et']}] equity={equity} SENTINEL {len(filled)} filled | "
+              f"day_pnl={day_pnl} | " + " ; ".join(parts))
+    return 0
 
 
 if __name__ == "__main__":

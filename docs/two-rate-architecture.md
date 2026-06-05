@@ -26,10 +26,11 @@ enforces it at high frequency with no LLM in the hot path.
 | Responsibility | find names, DD them, commit/arm entries, set stops/TPs | fire all protective exits + crossed armed entries |
 | Cost | tokens | quotes + arithmetic (~free) |
 
-Both acquire the **same** `data/.tick.lock`, so they are mutually exclusive — no `paper_state.json`
-races. If a planner tick is mid-DD, the sentinel skips that minute (the planner runs the same exit
-screen at the end of its own tick, so nothing is unprotected; once the cache is warm, planner ticks
-finish in ~1s and the sentinel is essentially never starved).
+The two loops do **not** block each other. Instead of a coarse shared lock, every `paper_state.json`
+read-modify-write runs under a short-held `data/.state.lock` (held for milliseconds, never during
+the planner's DD or the sentinel's quote fetch). So the sentinel fires exits every minute even while
+a planner tick is mid-DD — the slow loop never starves the fast one. The planner's own
+`data/.tick.lock` remains, but only as planner single-flight (two planner ticks can't overlap).
 
 ## Shared context
 
@@ -63,9 +64,16 @@ Triggers are re-validated/re-armed by the planner each 5-min tick; an armed entr
 
 ## Locking & ownership
 
-- `paper_state.json` writers — `apply_decision` (planner fills + arming), `sentinel` (fast fills),
-  `tick_context` (start-of-day equity rollover) — all run under `.tick.lock`, so writes are
-  serialized.
+- Every `paper_state.json` writer — `apply_decision` (planner fills + arming), `sentinel` (fast
+  fills), `tick_context` (start-of-day equity rollover) — wraps its read-modify-write in
+  `state_lock.state_lock()` (`data/.state.lock`), an atomic mkdir lock held only for the mutation.
+  `apply_decision` does no LLM/network work, so its critical section is milliseconds; the sentinel
+  does its quote fetch *before* taking the lock. Writers re-read state fresh under the lock
+  (optimistic concurrency), so a stale planner decision can never clobber a sentinel exit — at worst
+  an action no-ops ("no position to sell"). The lock reclaims a holder older than 15s and fails open
+  after 20s (better a rare interleaved write than a missed stop).
+- `data/.tick.lock` stays, but now only as planner single-flight (run_trading_tick.sh) — the
+  sentinel no longer touches it.
 - The planner path is the only one that calls the LLM; the sentinel has no MCP/model access.
 
 ## Files
@@ -78,7 +86,6 @@ Triggers are re-validated/re-armed by the planner each 5-min tick; an armed entr
 
 ## Future
 
-- Replace `.tick.lock` mutual exclusion with a short-held `.state.lock` around just the
-  read-modify-write, so the sentinel is never starved during a long DD tick (removes the only
-  remaining exit-latency gap).
 - Decouple manage-DD cadence from entry-DD cadence now that exits no longer need the planner.
+- Teach the DD prompt to emit `entry_trigger` so armed (level-triggered) entries actually fire in
+  production — the plumbing + tests exist; the prompt is the only missing piece.
