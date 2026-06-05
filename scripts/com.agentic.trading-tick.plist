@@ -1,15 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  launchd agent: run one PAPER trading tick every 5 minutes (StartInterval 300), around the clock.
+  launchd agent: run one PAPER trading tick every 1 minute (StartInterval 60), around the clock.
+  (Fast cadence for ACTIVE MONITORING of the catalyst-drift paper validation; revert to 300 = 5 min
+  for steady-state. The single-flight lock in run_trading_tick.sh prevents pileup — a slow DD tick
+  just makes the next minute's tick skip — and the DD cache (20-30 min TTLs) keeps cost bounded.)
 
   Off-hours ticks are NOT failures. market_conditions.py + tick_context.py compute the session in
   America/New_York and print GATE=SKIP outside weekday 09:30-15:55 ET; run_trading_tick.sh then logs
   a deterministic skip and exits 0 with NO LLM call. So the market-hours filtering lives in the
-  script (the correct backstop), and launchd just needs a plain 5-min cadence — no need to enumerate
+  script (the correct backstop), and launchd just needs a plain 1-min cadence — no need to enumerate
   hundreds of StartCalendarInterval slots (it has no cron-style step syntax anyway).
 
-  Cost of a clean cadence: a cheap SKIP log line every 5 min outside market hours. Trivial.
+  Cost of a clean cadence: a cheap SKIP log line every 1 min outside market hours. Trivial.
 
   Install:  cp scripts/com.agentic.trading-tick.plist ~/Library/LaunchAgents/
             launchctl unload -w ~/Library/LaunchAgents/com.agentic.trading-tick.plist 2>/dev/null
@@ -33,7 +36,7 @@
     <string>/Users/mcosta/agentic-trading</string>
 
     <key>StartInterval</key>
-    <integer>300</integer>
+    <integer>60</integer>
 
     <key>RunAtLoad</key>
     <false/>
