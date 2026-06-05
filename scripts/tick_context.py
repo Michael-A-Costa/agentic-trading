@@ -337,6 +337,10 @@ def main() -> int:
     # (positions are still scored, for logging + the Tier-2 manage cadence).
     hold_risk_sell = env("HOLD_RISK_SELL", "1") == "1"
     soft_cut = envf("SOFT_CUT_PCT", 4.0)               # protective-sell a falling loser at this %
+    # Risk-adaptive re-DD cadence (minutes) by band -> drives the Tier-2 manage-DD timing (decide.py):
+    # riskier holdings get re-checked sooner; a calm winner coasts.
+    redd_ttl = {"low": envf("HOLD_REDD_TTL_LOW_MIN", 60.0), "medium": envf("HOLD_REDD_TTL_MED_MIN", 20.0),
+                "high": envf("HOLD_REDD_TTL_HIGH_MIN", 5.0), "critical": envf("HOLD_REDD_TTL_CRIT_MIN", 0.0)}
     # Minutes until the 16:00 ET close (None when not in a regular session).
     close_et = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
     mins_to_close = (close_et - now_et).total_seconds() / 60.0 if is_open else None
@@ -349,7 +353,7 @@ def main() -> int:
             continue  # need a fresh quote to (synthetically) sell against
         # Tier-1 hold-risk score (cheap, deterministic) — surfaced on the position for logging + the
         # Tier-2 manage cadence, and used below for the protective soft-cut.
-        prisk = hold_risk.score(p, now_utc, soft_cut_pct=soft_cut)
+        prisk = hold_risk.score(p, now_utc, soft_cut_pct=soft_cut, redd_ttl=redd_ttl)
         p["risk"] = prisk
         reason = None
         # Prefer the explicit per-position stop/TP levels set at buy; fall back to the % rule.

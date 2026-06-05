@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import stock_memory as memory                # sibling: long-term per-symbol eval memory + exclusions
@@ -32,6 +33,7 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / "scripts"
 TICK = REPO / "data" / "tick"
 DD_CACHE = REPO / "data" / "dd_cache.json"
+MANAGE_CACHE = REPO / "data" / "manage_cache.json"   # Tier-2: last-managed ts + verdict per holding
 PYEXE = sys.executable or "python3"
 
 
@@ -45,6 +47,18 @@ def load_cache() -> dict:
 def save_cache(cache: dict) -> None:
     DD_CACHE.parent.mkdir(parents=True, exist_ok=True)
     DD_CACHE.write_text(json.dumps(cache, indent=2))
+
+
+def load_manage_cache() -> dict:
+    try:
+        return json.loads(MANAGE_CACHE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_manage_cache(cache: dict) -> None:
+    MANAGE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    MANAGE_CACHE.write_text(json.dumps(cache, indent=2))
 
 
 def claude_bin() -> str:
@@ -183,6 +197,71 @@ def run_dd(c: dict, regime: dict, caps: dict, portfolio: dict, dd_model: str) ->
             "next_earnings_date": commit.get("next_earnings_date"),
             "never_buy": bool(commit.get("never_buy")),          # structural disqualifier -> exclude
             "never_buy_reason": commit.get("never_buy_reason")}
+
+
+MANAGE_TOOLS = ["WebSearch", "WebFetch", "mcp__robinhood-trading__get_equity_quotes"]
+
+
+def run_manage_dd(p: dict, regime: dict, caps: dict, portfolio: dict, dd_model: str) -> dict:
+    """Tier-2: re-assess ONE held position on FRESH data + news. Returns
+    {action: keep|trim|exit|add, trim_fraction, add_dollars, conviction, hold_intent, reason}.
+    Defaults to KEEP on any failure — the hard stop + Tier-1 monitor still protect the downside."""
+    sym = str(p.get("symbol", "")).upper().strip()
+    try:
+        subprocess.run([PYEXE, str(SCRIPTS / "dd_probe.py"), sym],
+                       capture_output=True, text=True, timeout=60)
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError) as e:
+        sys.stderr.write(f"[manage] dd_probe {sym} failed ({e})\n")
+    dd_file = TICK / f"dd_{sym}.json"
+    try:
+        dd = json.loads(dd_file.read_text()) if dd_file.exists() else {"symbol": sym, "error": "no_dd"}
+    except (OSError, ValueError):
+        dd = {"symbol": sym, "error": "dd_unreadable"}
+
+    cur_val = float(p.get("value") or 0.0)
+    headroom = max(0.0, min(caps["MAX_POSITION_USD"] - cur_val,
+                            caps["MAX_TOTAL_EXPOSURE_USD"] - portfolio.get("exposure", 0.0),
+                            portfolio.get("cash", 0.0)))
+    age_h = None
+    if p.get("entry_ts"):
+        try:
+            age_h = round((datetime.now(timezone.utc)
+                           - datetime.fromisoformat(p["entry_ts"])).total_seconds() / 3600.0, 1)
+        except (ValueError, TypeError):
+            age_h = None
+    risk = p.get("risk") or {}
+    manage_input = json.dumps({
+        "symbol": sym,
+        "position": {"entry_price": p.get("entry_price"), "qty": p.get("qty"),
+                     "current_value_usd": round(cur_val, 2), "last": p.get("last"),
+                     "pnl_pct": p.get("pnl_pct"), "age_hours": age_h,
+                     "og_conviction": p.get("conviction"), "og_hold_intent": p.get("hold_intent"),
+                     "og_thesis": p.get("thesis_type")},
+        "risk": {"score": risk.get("risk"), "band": risk.get("band"), "reasons": risk.get("reasons")},
+        "sizing": {"MAX_POSITION_USD": caps["MAX_POSITION_USD"],
+                   "available_headroom_usd": round(headroom, 2),
+                   "available_cash": round(portfolio.get("cash", 0.0), 2)},
+        "regime": regime,
+        "prior_evaluation": memory.get_note(sym),
+        "dd": dd,
+    })
+    dd_timeout = int(os.environ.get("DD_CLAUDE_TIMEOUT_S", "240"))
+    out = run_claude((SCRIPTS / "dd_manage_prompt.txt").read_text() + manage_input,
+                     dd_model, tools=MANAGE_TOOLS, mcp=True, timeout=dd_timeout)
+    if out is None:
+        return {"symbol": sym, "action": "keep", "error": "manage_model_failed",
+                "reason": "manage model failed -> keep (stop + Tier-1 still protect)"}
+    v = extract_decision(out)
+    if v.get("_parse_error"):
+        return {"symbol": sym, "action": "keep", "error": "manage_parse_error",
+                "reason": "unparseable manage output -> keep"}
+    action = (v.get("action") or "keep").lower()
+    if action not in ("keep", "trim", "exit", "add"):
+        action = "keep"
+    return {"symbol": sym, "action": action, "trim_fraction": v.get("trim_fraction"),
+            "add_dollars": v.get("add_dollars"), "conviction": v.get("conviction"),
+            "hold_intent": v.get("hold_intent"), "reason": v.get("reason", ""),
+            "risks": v.get("risks", [])}
 
 
 def main() -> int:
@@ -332,6 +411,85 @@ def main() -> int:
         if cache_dirty:
             save_cache(cache)
 
+    # --- Tier-2: risk-adaptive manage-DD on HELD positions that are DUE (riskiest first, capped) ---
+    # Each holding carries a risk-adaptive re-DD TTL (hold_risk.py: critical->now, high->5m, med->20m,
+    # low->60m). A holding is DUE when that TTL has elapsed since its last manage-DD (or it's critical,
+    # or never managed). We re-check only the due ones, on FRESH news, and keep/trim/exit/add. The hard
+    # stop + the Tier-1 monitor cover the gaps between reviews. Best-effort: never sink the tick.
+    manage_results = []
+    try:
+        positions_ctx = context.get("positions", [])
+        if context.get("market_open") and not context.get("data_stale") and positions_ctx:
+            mcache = load_manage_cache()
+            exiting = {a.get("symbol") for a in actions if a.get("side") == "sell"}  # already exiting this tick
+            due = []
+            for p in positions_ctx:
+                sym = p.get("symbol")
+                if not sym or sym in exiting:
+                    continue
+                prisk = p.get("risk") or {}
+                ttl_min = float(prisk.get("redd_ttl_min", 20.0))
+                ent = mcache.get(sym)
+                is_due = (ent is None or prisk.get("band") == "critical"
+                          or (now - float(ent.get("ts", 0))) >= ttl_min * 60)
+                if is_due:
+                    due.append((float(prisk.get("risk", 0) or 0), p))
+            due.sort(key=lambda x: -x[0])                       # riskiest holdings first
+            max_manage = int(os.environ.get("HOLD_REVIEW_MAX_PER_TICK", "4"))
+            due_ps = [p for _, p in due[:max_manage]]
+            if due_ps:
+                pm = {"cash": context["portfolio"]["cash"],
+                      "exposure": context["portfolio"].get("positions_value", 0.0)}
+                mfresh = {}
+                workers = min(len(due_ps), int(os.environ.get("DD_MAX_PARALLEL", "4")))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                    futs = {ex.submit(run_manage_dd, p, regime, caps, pm, dd_model): p["symbol"]
+                            for p in due_ps}
+                    for fut in concurrent.futures.as_completed(futs):
+                        s = futs[fut]
+                        try:
+                            mfresh[s] = fut.result()
+                        except Exception as e:               # one manage-DD blowing up isn't fatal
+                            mfresh[s] = {"symbol": s, "action": "keep",
+                                         "error": f"manage_exception: {e}", "reason": ""}
+                for p in due_ps:
+                    sym = p["symbol"]
+                    res = mfresh.get(sym)
+                    if not res:
+                        continue
+                    prisk = p.get("risk") or {}
+                    mcache[sym] = {"ts": now, "band": prisk.get("band"),
+                                   "ttl_min": prisk.get("redd_ttl_min"), "result": res}
+                    manage_results.append(res)
+                    act = res.get("action")
+                    if act == "exit":
+                        actions.append({"symbol": sym, "side": "sell",
+                                        "reason": f"[manage/exit] {res.get('reason', '')}"})
+                    elif act == "trim" and res.get("trim_fraction"):
+                        try:
+                            frac = max(0.0, min(1.0, float(res["trim_fraction"])))
+                        except (TypeError, ValueError):
+                            frac = 0.0
+                        qty = round(frac * float(p.get("qty") or 0.0), 6)
+                        if qty > 0:
+                            actions.append({"symbol": sym, "side": "sell", "qty": qty,
+                                            "reason": f"[manage/trim {int(frac * 100)}%] {res.get('reason', '')}"})
+                    elif act == "add" and res.get("add_dollars"):
+                        try:
+                            addd = float(res["add_dollars"])
+                        except (TypeError, ValueError):
+                            addd = 0.0
+                        if addd > 0:
+                            actions.append({"symbol": sym, "side": "buy", "dollar_amount": addd,
+                                            "conviction": res.get("conviction"),
+                                            "hold_intent": res.get("hold_intent"),
+                                            "thesis_type": p.get("thesis_type"),
+                                            "reason": f"[manage/add] {res.get('reason', '')}"})
+                    # "keep" -> no action (the cache ts is still bumped so it coasts for its TTL)
+                save_manage_cache(mcache)
+    except Exception as e:  # a manage-pass failure must not sink the tick's entries/exits
+        sys.stderr.write(f"[decide] manage pass failed (ignored): {e}\n")
+
     # Forward filter-lift ledger: record each agent-evaluated gap candidate's verdict (commit/reject)
     # so catalyst_filter_report.py can later join it to the realized N-day drift. Best-effort.
     if dd_results:
@@ -346,6 +504,7 @@ def main() -> int:
         "rationale": rationale,
         "screen": screen,
         "dd": dd_results,
+        "manage": manage_results,        # Tier-2 hold re-assessments (keep/trim/exit/add)
     }
     TICK.mkdir(parents=True, exist_ok=True)
     (TICK / "decision_latest.json").write_text(json.dumps(decision_out, indent=2))
@@ -377,6 +536,12 @@ def main() -> int:
     if context.get("allow_entries") and not_dd > 0:
         print(f"  (+{not_dd} more candidate(s) not DD'd this tick — MAX_DD_CANDIDATES={max_dd})")
     print(f"DD: {n_commit} commit / {n_reject} reject / {n_error} error -> {len(actions)} action(s)")
+    for m in manage_results:
+        print(f"  MANAGE {m.get('symbol')}: {(m.get('action') or '?').upper()} — "
+              f"{(m.get('reason') or m.get('error') or '')[:90]}")
+    if manage_results:
+        n_act = sum(1 for m in manage_results if m.get('action') in ('trim', 'exit', 'add'))
+        print(f"MANAGE: {len(manage_results)} holding(s) re-checked, {n_act} acted")
     return 0
 
 
