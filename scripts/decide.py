@@ -427,9 +427,12 @@ def main() -> int:
                               f"/{caps['MAX_TOTAL_EXPOSURE_USD']:.0f}, "
                               f"{portfolio['open_positions']} pos) < usable lot")
 
+        # Consider EVERY candidate — serving a same-day cached verdict is free (no LLM call), so the
+        # per-tick fresh-DD budget (max_dd) must NOT hide a candidate that already has a commit/reject
+        # in today's cache. max_dd is applied below, to cache MISSES only.
         shortlist = []
         if not book_full:
-            for c in candidates[:max_dd]:
+            for c in candidates:
                 sym = str(c.get("symbol", "")).upper().strip()
                 if sym:
                     shortlist.append((sym, c))
@@ -468,7 +471,11 @@ def main() -> int:
                 cache_hits[sym] = res
             else:
                 fresh_jobs.append((sym, c))
-        entry_did_fresh = bool(fresh_jobs)   # entries did real DD work this tick -> defer manage to a quieter tick
+        # max_dd caps only the EXPENSIVE fresh DDs (each ~85s Sonnet+web call); every cache hit above is
+        # already served. Only cache MISSES compete for the per-tick budget — the rest defer to a later
+        # tick (or get served instantly once today's verdict lands in the cache).
+        fresh_jobs = fresh_jobs[:max_dd] if max_dd >= 0 else fresh_jobs
+        entry_did_fresh = bool(fresh_jobs)   # ran real FRESH DD work this tick -> defer the manage wave
 
         # Run the cache-miss DDs CONCURRENTLY. Each run_dd is subprocess-bound (dd_probe + a headless
         # `claude` web-research call), so it releases the GIL and threads give true parallelism.
@@ -662,9 +669,12 @@ def main() -> int:
         print(f"screen: {len(exits)} exit(s), 0 candidate(s){note}")
     for d in dd_results:
         print(fmt_dd_line(d))
+    # Cache hits are all in dd_results, so this only counts cache-MISS candidates deferred by the
+    # fresh-DD budget (book-full has its own line above and is excluded here).
     not_dd = len(candidates) - len(dd_results)
-    if context.get("allow_entries") and not_dd > 0:
-        print(f"  (+{not_dd} more candidate(s) not DD'd this tick — MAX_DD_CANDIDATES={max_dd})")
+    if context.get("allow_entries") and not book_full and not_dd > 0:
+        print(f"  (+{not_dd} candidate(s) deferred — MAX_DD_CANDIDATES={max_dd} caps FRESH DDs/tick; "
+              f"cached verdicts always served)")
     print(f"DD: {n_commit} commit / {n_reject} reject / {n_error} error -> {len(actions)} action(s)")
     for m in manage_results:
         print(f"  MANAGE {m.get('symbol')}: {(m.get('action') or '?').upper()} — "
