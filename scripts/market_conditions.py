@@ -153,6 +153,15 @@ def fetch_cboe(symbols: list[str]) -> dict[str, dict]:
                 "volume": _fnum(data.get("volume")),
                 "date": date,
                 "time": tm,
+                # Extra raw-Cboe fields so a downstream consumer (dd_probe) can price + gate liquidity
+                # off THIS fetch instead of re-hitting Cboe per symbol (N parallel DD processes doing
+                # that is what trips the 429). Keys mirror the raw quote dd_probe.probe() reads.
+                "current_price": _fnum(data.get("current_price")),
+                "bid": _fnum(data.get("bid")),
+                "ask": _fnum(data.get("ask")),
+                "prev_day_close": _fnum(data.get("prev_day_close")),
+                "iv30": _fnum(data.get("iv30")),
+                "price_change_percent": _fnum(data.get("price_change_percent")),
             }
         except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError) as e:
             last_err = e

@@ -240,6 +240,19 @@ def build_context(now_utc: datetime | None = None, scope: str = "full") -> dict:
     except (OSError, RuntimeError) as e:
         fetch_error = str(e)
 
+    # Persist the quotes this tick already fetched so the parallel DD probes can reuse them instead of
+    # each re-hitting Cboe (N cold processes bursting it is what trips the 429 -> no_live_quote). Only
+    # the FULL-scope planner tick writes it (the monitor sentinel's partial set must not clobber the
+    # candidate quotes a DD will look up); dd_probe falls back to a live fetch if it's stale/missing.
+    if not monitor and quotes:
+        try:
+            TICK.mkdir(parents=True, exist_ok=True)
+            tmp = (TICK / "quotes_latest.json").with_suffix(".json.tmp")
+            tmp.write_text(json.dumps({"ts": now_utc.timestamp(), "source": source, "quotes": quotes}))
+            os.replace(tmp, TICK / "quotes_latest.json")
+        except OSError:
+            pass  # quote cache is a best-effort optimization; dd_probe fetches live if it's absent
+
     def last(sym):
         return (quotes.get(sym) or {}).get("last")
 
@@ -335,6 +348,7 @@ def build_context(now_utc: datetime | None = None, scope: str = "full") -> dict:
         # high-water mark, ratchet-only, beginning once a lot is up TRAIL_ACTIVATE_PCT. See live_execute.
         "TRAIL_STOP_PCT": envf("TRAIL_STOP_PCT", 0.0),
         "TRAIL_ACTIVATE_PCT": envf("TRAIL_ACTIVATE_PCT", 0.0),
+        "TRAIL_BREAKEVEN_AT_PCT": envf("TRAIL_BREAKEVEN_AT_PCT", 0.0),  # lift stop to entry once up this %
         "TRAIL_MIN_STEP_PCT": envf("TRAIL_MIN_STEP_PCT", 0.5),
         "SIGNAL_THRESHOLD_PCT": envf("SIGNAL_THRESHOLD_PCT", 2.0),  # DEPRECATED (old intraday-pop trigger)
         "GAP_THRESHOLD_PCT": envf("GAP_THRESHOLD_PCT", 7.0),        # catalyst entry: min overnight gap %

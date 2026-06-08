@@ -31,6 +31,7 @@ import json
 import os
 import statistics
 import sys
+import time
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
@@ -40,6 +41,10 @@ import market_conditions as mc  # sibling: _http_get, _fnum, CBOE_URL, ET, sessi
 REPO = Path(__file__).resolve().parent.parent
 DATA = REPO / "data"
 TICK = DATA / "tick"
+# The tick writes the quotes it already fetched here; we reuse them so N parallel DD probes don't each
+# re-hit Cboe and trip its rate limit. Stale/missing -> live fetch (e.g. standalone `dd_probe.py SYM`).
+QUOTES_FILE = TICK / "quotes_latest.json"
+QUOTE_FILE_MAX_AGE_S = int(os.environ.get("DD_QUOTE_FILE_MAX_AGE_S", "180"))
 HISTORY_DIR = DATA / "history"   # per-symbol daily-bar cache: data/history/{SYM}.json
 # Daily history is KEYLESS again via Cboe's CDN (same provider as the live quote): deep OHLCV,
 # no key, no throttling. Yahoo stays only as a last-resort fallback (it's usually 429-throttled).
@@ -153,7 +158,26 @@ def load_history(sym: str) -> tuple[dict, str | None]:
     return {}, None
 
 
+def _quote_from_tick_cache(sym: str) -> dict | None:
+    """The quote the tick already fetched this cycle, if fresh and present. Reused so parallel DD
+    processes don't each re-hit Cboe (that concurrent burst is what 429s -> no_live_quote). The cached
+    quote carries the same raw-Cboe keys probe() reads (current_price/bid/ask/iv30/...); see
+    market_conditions.fetch_cboe."""
+    try:
+        blob = json.loads(QUOTES_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+    if time.time() - (blob.get("ts") or 0) >= QUOTE_FILE_MAX_AGE_S:
+        return None  # stale (e.g. a standalone run hours later) -> fetch live instead
+    q = (blob.get("quotes") or {}).get(sym.upper())
+    # require a real price; a non-Cboe source (stooq/yahoo) lacks current_price -> fetch live
+    return q if (q and q.get("current_price") is not None) else None
+
+
 def cboe_quote(sym: str) -> dict:
+    cached = _quote_from_tick_cache(sym)
+    if cached is not None:
+        return cached
     try:
         d = json.loads(mc._http_get(mc.CBOE_URL.format(sym=urllib.parse.quote(sym.upper()))))
         return d.get("data") or {}
