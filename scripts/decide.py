@@ -38,6 +38,7 @@ SCRIPTS = REPO / "scripts"
 TICK = REPO / "data" / "tick"
 DD_CACHE = REPO / "data" / "dd_cache.json"
 MANAGE_CACHE = REPO / "data" / "manage_cache.json"   # Tier-2: last-managed ts + verdict per holding
+DD_JOBS = REPO / "data" / "dd_jobs"                  # async (DD_ASYNC) mode: one <SYM>.json job/result file
 PYEXE = sys.executable or "python3"
 
 
@@ -63,6 +64,101 @@ def load_manage_cache() -> dict:
 def save_manage_cache(cache: dict) -> None:
     MANAGE_CACHE.parent.mkdir(parents=True, exist_ok=True)
     MANAGE_CACHE.write_text(json.dumps(cache, indent=2))
+
+
+# --------------------------------------------------------------------------- async DD (DD_ASYNC)
+# In async mode the entry DDs don't BLOCK the tick: cache misses are dispatched to detached
+# dd_worker.py processes that write data/dd_jobs/<SYM>.json, and a LATER tick ingests the finished
+# verdicts into the cache and acts on them. decide.py stays the SOLE dd_cache writer (workers only
+# touch their own job file), so no cross-process cache lock is needed. Knobs:
+#   DD_ASYNC=1                  turn it on (default 0 = the original synchronous, blocking path)
+#   DD_ASYNC_MAX_INFLIGHT=6     ceiling on concurrent background workers (bounds CPU/RAM + spend)
+#   DD_ASYNC_RUNNING_TIMEOUT_S  a 'running' marker older than this => worker died, reap + re-dispatch
+def _async_on() -> bool:
+    return os.environ.get("DD_ASYNC", "0").strip().lower() in ("1", "true", "yes")
+
+
+def _running_timeout() -> int:
+    return int(os.environ.get("DD_ASYNC_RUNNING_TIMEOUT_S", "600"))
+
+
+def job_in_flight(sym: str, now: float) -> bool:
+    """True if a background DD for sym is dispatched and not yet finished (fresh 'running' marker)."""
+    try:
+        job = json.loads((DD_JOBS / f"{sym.upper()}.json").read_text())
+    except (OSError, ValueError):
+        return False
+    return job.get("status") == "running" and (now - job.get("ts", 0)) <= _running_timeout()
+
+
+def count_in_flight(now: float) -> int:
+    if not DD_JOBS.exists():
+        return 0
+    n = 0
+    for f in DD_JOBS.glob("*.json"):
+        try:
+            job = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if job.get("status") == "running" and (now - job.get("ts", 0)) <= _running_timeout():
+            n += 1
+    return n
+
+
+def ingest_dd_jobs(cache: dict, today_et: str, now: float) -> int:
+    """Fold FINISHED background verdicts into the cache (commit/reject only — an error worker is
+    dropped so it retries) and reap dead 'running' markers. Returns how many verdicts were ingested."""
+    if not DD_JOBS.exists():
+        return 0
+    n = 0
+    for f in DD_JOBS.glob("*.json"):
+        try:
+            job = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        sym = (job.get("symbol") or f.stem).upper()
+        status = job.get("status")
+        if status == "done":
+            res = job.get("result") or {}
+            if res.get("decision") in ("commit", "reject"):
+                cache[sym] = {"ts": now, "day": today_et,
+                              "ref_price": job.get("ref_price"), "ref_range_pos": job.get("ref_range_pos"),
+                              "result": {k: v for k, v in res.items() if k != "dd_elapsed_s"}}
+                memory.record(sym, decision=res["decision"], conviction=res.get("conviction"),
+                              reason=res.get("reason", ""), catalysts=res.get("catalysts"),
+                              risks=res.get("risks"), next_earnings_date=res.get("next_earnings_date"),
+                              never_buy=bool(res.get("never_buy")), never_buy_reason=res.get("never_buy_reason"))
+                n += 1
+            try:
+                f.unlink()  # consumed (or a dropped error) — clear it either way
+            except OSError:
+                pass
+        elif status == "running" and (now - job.get("ts", 0)) > _running_timeout():
+            try:
+                f.unlink()  # worker died -> reap so the symbol can be re-dispatched
+            except OSError:
+                pass
+    return n
+
+
+def dispatch_dd(sym: str, c: dict, now: float) -> bool:
+    """Fire-and-forget a detached dd_worker for one symbol, writing the 'running' marker first so a
+    later tick won't double-dispatch. Returns True if spawned."""
+    sym = sym.upper()
+    try:
+        DD_JOBS.mkdir(parents=True, exist_ok=True)
+        tmp = (DD_JOBS / f"{sym}.json").with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"symbol": sym, "status": "running", "ts": now}))
+        os.replace(tmp, DD_JOBS / f"{sym}.json")
+        args = [PYEXE, str(SCRIPTS / "dd_worker.py"), sym, "--reason", str(c.get("reason", "async DD"))]
+        for flag, key in (("--last", "last"), ("--range-pos", "range_pos"), ("--intraday", "intraday_pct")):
+            if c.get(key) is not None:
+                args += [flag, str(c[key])]
+        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)  # detach so it outlives this tick
+        return True
+    except OSError:
+        return False
 
 
 def claude_bin() -> str:
@@ -399,6 +495,12 @@ def main() -> int:
     for k in stale_keys:
         cache.pop(k, None)
     cache_dirty = bool(stale_keys)
+    # Async mode: fold any FINISHED background DD verdicts into the cache BEFORE serving cache hits,
+    # so a name dispatched a prior tick is acted on the moment its worker lands (decide is the sole
+    # cache writer; workers only touch their own job file).
+    async_on = _async_on()
+    if async_on and ingest_dd_jobs(cache, today_et, now):
+        cache_dirty = True
     book_full = False
     entry_did_fresh = False   # did the entry pass run any FRESH (uncached) DDs this tick? (gates the manage wave)
     headroom = None
@@ -475,32 +577,51 @@ def main() -> int:
         # already served. Only cache MISSES compete for the per-tick budget — the rest defer to a later
         # tick (or get served instantly once today's verdict lands in the cache).
         fresh_jobs = fresh_jobs[:max_dd] if max_dd >= 0 else fresh_jobs
-        entry_did_fresh = bool(fresh_jobs)   # ran real FRESH DD work this tick -> defer the manage wave
-
-        # Run the cache-miss DDs CONCURRENTLY. Each run_dd is subprocess-bound (dd_probe + a headless
-        # `claude` web-research call), so it releases the GIL and threads give true parallelism.
-        # Serial DD was the cause of ticks overrunning the 5-min launchd cadence — 2-3 fresh DDs cost
-        # the SUM of their web-research calls; in parallel the tick's wall-clock is the SLOWEST single
-        # DD instead. Cache + long-term-memory writes stay on the main thread (after the pool drains)
-        # to avoid races.
+        # ASYNC (DD_ASYNC): do NOT block the tick on entry DDs. Dispatch each cache-miss to a detached
+        # worker (skipping any already in flight) up to the global ceiling; its verdict lands in a
+        # LATER tick via ingest_dd_jobs above. SYNC (default): run them now in a thread pool and act
+        # this tick. fresh_results = what got computed SYNCHRONOUSLY (empty in async mode).
         fresh_results = {}
-        if fresh_jobs:
-            def timed_dd(cand):
-                t0 = time.time()
-                r = run_dd(cand, regime, caps, portfolio, dd_model)
-                return {**r, "dd_elapsed_s": round(time.time() - t0, 1)}
-            workers = min(len(fresh_jobs), int(os.environ.get("DD_MAX_PARALLEL", "4")))
-            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = {ex.submit(timed_dd, c): sym for sym, c in fresh_jobs}
-                for fut in concurrent.futures.as_completed(futs):
-                    sym = futs[fut]
-                    try:
-                        fresh_results[sym] = fut.result()
-                    except Exception as e:  # one DD blowing up must not sink the whole tick
-                        fresh_results[sym] = {"symbol": sym, "decision": "error",
-                                              "error": f"dd_exception: {e}", "conviction": None,
-                                              "dollar_amount": None, "reason": "", "catalysts": [],
-                                              "risks": []}
+        if async_on:
+            max_inflight = int(os.environ.get("DD_ASYNC_MAX_INFLIGHT", "6"))
+            dispatched, in_flight = [], []
+            for sym, c in fresh_jobs:
+                if job_in_flight(sym, now):
+                    in_flight.append(sym)
+                    continue
+                if count_in_flight(now) >= max_inflight:
+                    break  # global cap on concurrent background workers (bounds CPU/RAM + spend)
+                if dispatch_dd(sym, c, now):
+                    dispatched.append(sym)
+            entry_did_fresh = bool(dispatched)   # dispatching IS initiating fresh work -> defer manage
+            if dispatched or in_flight:
+                print(f"  async DD: +{len(dispatched)} dispatched ({', '.join(dispatched) or '-'}), "
+                      f"{len(in_flight)} already in flight, {count_in_flight(now)} running total "
+                      f"(verdicts act a later tick)")
+        else:
+            entry_did_fresh = bool(fresh_jobs)   # ran real FRESH DD work this tick -> defer the manage wave
+            # Run the cache-miss DDs CONCURRENTLY. Each run_dd is subprocess-bound (dd_probe + a headless
+            # `claude` web-research call), so it releases the GIL and threads give true parallelism.
+            # Serial DD overran the cadence — 2-3 fresh DDs cost the SUM of their web calls; in parallel
+            # the tick's wall-clock is the SLOWEST single DD. Cache + memory writes stay on the main
+            # thread (after the pool drains) to avoid races.
+            if fresh_jobs:
+                def timed_dd(cand):
+                    t0 = time.time()
+                    r = run_dd(cand, regime, caps, portfolio, dd_model)
+                    return {**r, "dd_elapsed_s": round(time.time() - t0, 1)}
+                workers = min(len(fresh_jobs), int(os.environ.get("DD_MAX_PARALLEL", "4")))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                    futs = {ex.submit(timed_dd, c): sym for sym, c in fresh_jobs}
+                    for fut in concurrent.futures.as_completed(futs):
+                        sym = futs[fut]
+                        try:
+                            fresh_results[sym] = fut.result()
+                        except Exception as e:  # one DD blowing up must not sink the whole tick
+                            fresh_results[sym] = {"symbol": sym, "decision": "error",
+                                                  "error": f"dd_exception: {e}", "conviction": None,
+                                                  "dollar_amount": None, "reason": "", "catalysts": [],
+                                                  "risks": []}
 
         # Reassemble in screen order: cache + persist fresh commits/rejects, then build buy actions.
         for sym, c in shortlist:
