@@ -154,19 +154,26 @@ def parse_snapshot(snap: dict) -> dict:
     return {"buying_power": buying_power, "positions": positions, "quotes": quotes, "orders": orders}
 
 
-def open_stop_for(orders: list, sym: str) -> dict | None:
-    """Find an OPEN resting protective stop (sell) for a symbol. A Robinhood stop comes back with a
+def open_stops_for(orders: list, sym: str) -> list:
+    """All OPEN resting protective stops (sell) for a symbol. A Robinhood stop comes back with a
     non-null stop_price (type may read 'market'/'limit' with trigger='stop'), so we key on stop_price
-    + side, NOT type=='stop_market'."""
+    + side, NOT type=='stop_market'. Plural form is used to sweep duplicates after a trail re-arm."""
     OPEN = {"new", "queued", "confirmed", "unconfirmed", "partially_filled"}
+    out = []
     for o in orders:
         osym = (_first(o, "symbol", "ticker") or "").upper().strip()
         oside = (_first(o, "side") or "").lower()
         ostate = (_first(o, "state", "status") or "").lower()
         has_stop = _first(o, "stop_price") is not None or "stop" in (_first(o, "type", "trigger", "order_type") or "").lower()
         if osym == sym and oside == "sell" and has_stop and ostate in OPEN:
-            return o
-    return None
+            out.append(o)
+    return out
+
+
+def open_stop_for(orders: list, sym: str) -> dict | None:
+    """The first OPEN resting protective stop (sell) for a symbol, or None (see open_stops_for)."""
+    stops = open_stops_for(orders, sym)
+    return stops[0] if stops else None
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +250,44 @@ def stop_spec(sym: str, qty: float, stop_price: float) -> dict:
             "stop_price": f"{stop_price:.2f}", "time_in_force": "gtc"}
 
 
+def trail_stop_price(lot: dict, caps: dict, last: float | None) -> tuple[float | None, float | None]:
+    """Trailing-stop ratchet (PURE; no I/O, no MCP). Updates the high-water mark from `last` and
+    returns (new_stop, high_water):
+
+      - high_water = max(prior high-water, entry, last) — the peak the trail anchors to (caller persists).
+      - new_stop   = a RATCHET-ONLY raise of lot['stop_price'], or None when no change is warranted.
+
+    Trailing is OFF when caps['TRAIL_STOP_PCT'] <= 0 (returns (None, high_water) — the fixed
+    entry-based stop is left untouched, preserving today's behaviour). When on, the trail only engages
+    once the peak is up at least TRAIL_ACTIVATE_PCT from entry (so the initial STOP_LOSS_PCT stop owns
+    the per-trade risk budget until the trade is in profit). A raise smaller than TRAIL_MIN_STEP_PCT of
+    the current stop is suppressed (churn guard — each whole-share re-arm costs a cancel+place + a brief
+    naked window). The stop is floored at the entry-based level and never lowered.
+    """
+    entry = _f(lot.get("entry_price"))
+    if entry is None or entry <= 0:
+        return None, lot.get("high_water")
+    hw = _f(lot.get("high_water")) or entry
+    if last is not None and last > hw:
+        hw = last
+    trail = caps.get("TRAIL_STOP_PCT", 0.0) or 0.0
+    if trail <= 0:
+        return None, hw  # trailing disabled — leave the fixed stop as-is
+    activate = caps.get("TRAIL_ACTIVATE_PCT", 0.0) or 0.0
+    if hw < entry * (1 + activate / 100.0):
+        return None, hw  # not yet up enough — the fixed STOP_LOSS_PCT stop still stands
+    floor = round(entry * (1 - caps.get("STOP_LOSS_PCT", 8.0) / 100.0), 2)
+    desired = max(round(hw * (1 - trail / 100.0), 2), floor)
+    cur = _f(lot.get("stop_price"))
+    if cur is not None:
+        if desired <= cur + 1e-9:
+            return None, hw  # ratchet-only: never lower
+        min_step = caps.get("TRAIL_MIN_STEP_PCT", 0.5) or 0.0
+        if min_step > 0 and desired < cur * (1 + min_step / 100.0):
+            return None, hw  # raise too small — skip the churn
+    return desired, hw
+
+
 def sell_spec(sym: str, qty: float, *, whole: bool, quote: dict, caps: dict) -> dict:
     """Discretionary/exit sell: marketable limit for a whole-share lot, market for a fractional one."""
     if whole and float(qty) == math.floor(float(qty)):
@@ -311,6 +356,47 @@ def load_state() -> dict:
 # ---------------------------------------------------------------------------
 # orchestration
 # ---------------------------------------------------------------------------
+def _retrail_resting(sym: str, qty: int, new_stop: float, lot: dict, orders: list, log: list) -> None:
+    """Move a whole-share lot's resting stop UP (ratchet): cancel the current stop, place a higher one.
+    The MCP exposes no modify, so cancel+place is the only path. Failure handling keeps the lot from
+    ever being left unprotected:
+      - cancel fails  -> the old stop is still resting (safe); don't place a duplicate, retry next tick.
+      - place  fails  -> lot is momentarily bare; degrade to a synthetic stop at new_stop (engine-tick
+                          cover) and clear the dead id so the next reconcile re-arms a real resting stop.
+    After a successful re-arm, sweep any OTHER open sell-stop for the symbol (a prior silently-failed
+    cancel would otherwise leave two stops that double-fire on trigger)."""
+    import rh_mcp
+    old_id = lot.get("resting_stop_order_id")
+    old_stop = lot.get("stop_price")
+    if old_id:
+        c = rh_mcp.cancel(old_id)
+        if isinstance(c, dict) and c.get("errors"):
+            log.append({"event": "trail_cancel_failed", "symbol": sym, "order_id": old_id,
+                        "result": c, "kept_stop": old_stop})
+            return  # old stop still live -> protected; don't stack a second stop
+    ref_id = str(uuid.uuid4())
+    res = rh_mcp.place(stop_spec(sym, qty, new_stop), ref_id=ref_id)
+    o = order_obj(res)
+    new_id = _first(o, "id", "order_id") if isinstance(o, dict) else None
+    if not new_id or (isinstance(res, dict) and res.get("errors")):
+        lot["resting_stop_order_id"] = None
+        lot["stop_type"] = "synthetic"
+        lot["stop_price"] = new_stop
+        log.append({"event": "trail_rearm_failed", "symbol": sym, "from": old_stop, "to": new_stop,
+                    "ref_id": ref_id, "result": res, "fallback": "synthetic"})
+        return
+    lot["resting_stop_order_id"] = new_id
+    lot["stop_type"] = "resting"
+    lot["stop_price"] = new_stop
+    log.append({"event": "trail_rearm", "symbol": sym, "from": old_stop, "to": new_stop,
+                "order_id": new_id, "ref_id": ref_id})
+    for extra in open_stops_for(orders, sym):  # duplicate sweep (orders = pre-place snapshot)
+        eid = _first(extra, "id", "order_id")
+        if eid and eid not in (new_id, old_id):
+            rh_mcp.cancel(eid)
+            log.append({"event": "trail_dup_cancel", "symbol": sym, "order_id": eid})
+
+
 def reconcile(state: dict, broker: dict, log: list) -> None:
     """Make local metadata agree with broker truth: confirm fills, arm missing stops, book closures."""
     import rh_mcp  # local import so the pure builders stay importable without the MCP runner
@@ -331,7 +417,11 @@ def reconcile(state: dict, broker: dict, log: list) -> None:
         sl = state.get("_caps", {}).get("STOP_LOSS_PCT", 4.0)
         tp = state.get("_caps", {}).get("TAKE_PROFIT_PCT", 12.0)
         if lot.get("entry_price"):
-            lot["stop_price"] = round(lot["entry_price"] * (1 - sl / 100.0), 4)
+            base_stop = round(lot["entry_price"] * (1 - sl / 100.0), 4)
+            # ratchet-safe: a trailing stop may have raised stop_price above the initial level on a
+            # prior tick — never reset it back down to the entry-based floor here.
+            prev = _f(lot.get("stop_price"))
+            lot["stop_price"] = max(base_stop, prev) if prev is not None else base_stop
             lot["take_profit_price"] = round(lot["entry_price"] * (1 + tp / 100.0), 4)
         # map an existing broker resting stop to the lot
         existing = open_stop_for(orders, sym)
@@ -354,6 +444,27 @@ def reconcile(state: dict, broker: dict, log: list) -> None:
             else:
                 lot["stop_type"] = "synthetic"  # dry-run: rely on the engine-tick synthetic stop
                 log.append({"event": "arm_stop_dryrun", "symbol": sym, "stop_price": lot.get("stop_price")})
+
+        # --- trailing stop: ratchet the protective stop UP toward the high-water mark, never down.
+        # OFF unless TRAIL_STOP_PCT>0. Whole-share lots move the resting broker stop (cancel+replace);
+        # fractional/synthetic lots ratchet stop_price in place (engine-tick cover, no broker order).
+        q = broker["quotes"].get(sym) or {}
+        new_stop, hw = trail_stop_price(lot, state.get("_caps", {}), _f(_first(q, "last", "bid")))
+        if hw is not None:
+            lot["high_water"] = hw
+        if new_stop is not None and new_stop > (_f(lot.get("stop_price")) or 0.0):
+            old_stop = lot.get("stop_price")
+            if whole and lot.get("resting_stop_order_id") and lot.get("stop_type") == "resting":
+                if do_arm:
+                    _retrail_resting(sym, math.floor(bp["qty"]), new_stop, lot, orders, log)
+                else:
+                    lot["stop_price"] = new_stop  # dry-run: reflect intended level (stop is synthetic)
+                    log.append({"event": "trail_rearm_dryrun", "symbol": sym,
+                                "from": old_stop, "to": new_stop, "high_water": hw})
+            else:
+                lot["stop_price"] = new_stop  # synthetic / fractional: pure-data ratchet, no MCP
+                log.append({"event": "trail_synthetic", "symbol": sym,
+                            "from": old_stop, "to": new_stop, "high_water": hw})
 
     # 2) lots we track but the broker no longer holds. Two cases:
     #    a) a PENDING entry from a prior tick that never showed as a position -> it didn't fill

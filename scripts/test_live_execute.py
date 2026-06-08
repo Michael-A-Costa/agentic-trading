@@ -182,12 +182,127 @@ def test_reconcile_pending_not_booked_closed():
     check("no cooldown for unfilled entry", "PEND" not in (state.get("last_exit") or {}))
 
 
+def test_trail_off_by_default():
+    caps = {"STOP_LOSS_PCT": 8.0}  # TRAIL_STOP_PCT absent -> off
+    lot = {"entry_price": 100.0, "stop_price": 92.0, "high_water": 100.0}
+    ns, hw = le.trail_stop_price(lot, caps, 200.0)
+    check("trail off -> no stop change", ns is None, (ns, hw))
+    check("trail off still tracks high-water", hw == 200.0, hw)
+
+
+def test_trail_ratchets_up_and_never_down():
+    caps = {"STOP_LOSS_PCT": 8.0, "TRAIL_STOP_PCT": 5.0, "TRAIL_ACTIVATE_PCT": 4.0, "TRAIL_MIN_STEP_PCT": 0.5}
+    lot = {"entry_price": 100.0, "stop_price": 92.0, "high_water": 100.0}
+    # +3% (last 103) < 4% activate -> fixed stop stands
+    ns, hw = le.trail_stop_price(lot, caps, 103.0)
+    check("trail not yet activated", ns is None and hw == 103.0, (ns, hw))
+    # +10% (last 110) -> activate; stop -> 110*0.95 = 104.5
+    lot["high_water"] = hw
+    ns, hw = le.trail_stop_price(lot, caps, 110.0)
+    check("trail activates and raises stop", ns == 104.5 and hw == 110.0, (ns, hw))
+    # pullback to 106 -> high-water holds at 110, no lowering
+    lot["stop_price"], lot["high_water"] = ns, hw
+    ns, hw = le.trail_stop_price(lot, caps, 106.0)
+    check("trail never lowers on pullback", ns is None and hw == 110.0, (ns, hw))
+
+
+def test_trail_min_step_guard():
+    caps = {"STOP_LOSS_PCT": 8.0, "TRAIL_STOP_PCT": 5.0, "TRAIL_ACTIVATE_PCT": 0.0, "TRAIL_MIN_STEP_PCT": 1.0}
+    lot = {"entry_price": 100.0, "stop_price": 104.5, "high_water": 110.0}
+    # 110.2 -> desired 104.69, only +0.18% over 104.5 (< 1% step) -> suppressed
+    ns, _ = le.trail_stop_price(lot, caps, 110.2)
+    check("min-step suppresses tiny ratchet", ns is None, ns)
+    # 115 -> desired 109.25, well over the step -> allowed
+    ns, _ = le.trail_stop_price(lot, caps, 115.0)
+    check("min-step allows a real ratchet", ns == 109.25, ns)
+
+
+def test_trail_floored_at_initial_stop():
+    # an aggressive trail (15%) on a barely-activated lot must never set the stop BELOW the entry floor
+    caps = {"STOP_LOSS_PCT": 8.0, "TRAIL_STOP_PCT": 15.0, "TRAIL_ACTIVATE_PCT": 0.0, "TRAIL_MIN_STEP_PCT": 0.0}
+    lot = {"entry_price": 100.0, "stop_price": 92.0, "high_water": 100.0}
+    ns, _ = le.trail_stop_price(lot, caps, 100.0)  # 100*0.85=85 < floor 92 -> stays 92 -> no raise
+    check("trail floored at initial stop", ns is None, ns)
+
+
+def test_reconcile_trails_resting_stop():
+    import types
+    calls = {"cancel": [], "place": []}
+    fake = types.ModuleType("rh_mcp")
+    fake.cancel = lambda oid: (calls["cancel"].append(oid), {"cancel": "ok", "errors": {}})[1]
+    fake.place = lambda spec, ref_id: (calls["place"].append(spec),
+                                       {"order": {"data": {"id": "s2"}}, "errors": {}})[1]
+    saved = sys.modules.get("rh_mcp")
+    sys.modules["rh_mcp"] = fake
+    os.environ["LIVE_ARMED"] = "1"
+    try:
+        state = {"lots": {"ABC": {"qty": 5, "entry_price": 100.0, "stop_price": 92.0,
+                                  "high_water": 100.0, "resting_stop_order_id": "s1",
+                                  "stop_type": "resting", "adopted": False}},
+                 "_caps": {"STOP_LOSS_PCT": 8.0, "TAKE_PROFIT_PCT": 25.0, "TRAIL_STOP_PCT": 5.0,
+                           "TRAIL_ACTIVATE_PCT": 4.0, "TRAIL_MIN_STEP_PCT": 0.5},
+                 "live_round_trip_done": True}
+        broker = {"positions": {"ABC": {"qty": 5.0, "avg_cost": 100.0}},
+                  "orders": [{"id": "s1", "symbol": "ABC", "side": "sell",
+                              "stop_price": "92.00", "state": "confirmed"}],
+                  "quotes": {"ABC": {"last": 110.0, "bid": 109.9, "ask": 110.1}}}
+        le.reconcile(state, broker, log := [])
+        lot = state["lots"]["ABC"]
+        check("trail cancelled the old stop", "s1" in calls["cancel"], calls)
+        check("trail placed a new stop @104.50", len(calls["place"]) == 1
+              and calls["place"][0]["stop_price"] == "104.50", calls)
+        check("trail stored new resting id", lot["resting_stop_order_id"] == "s2", lot)
+        check("trail raised stop_price", lot["stop_price"] == 104.5, lot)
+        check("trail tracked high-water", lot["high_water"] == 110.0, lot)
+        check("trail logged a rearm", any(e["event"] == "trail_rearm" for e in log), log)
+    finally:
+        os.environ.pop("LIVE_ARMED", None)
+        if saved is not None:
+            sys.modules["rh_mcp"] = saved
+        else:
+            sys.modules.pop("rh_mcp", None)
+
+
+def test_reconcile_trail_dryrun_places_nothing():
+    import types
+    calls = {"cancel": [], "place": []}
+    fake = types.ModuleType("rh_mcp")
+    fake.cancel = lambda oid: (calls["cancel"].append(oid), {"errors": {}})[1]
+    fake.place = lambda spec, ref_id: (calls["place"].append(spec), {"order": None, "errors": {}})[1]
+    saved = sys.modules.get("rh_mcp")
+    sys.modules["rh_mcp"] = fake
+    os.environ.pop("LIVE_ARMED", None)  # dry-run
+    try:
+        state = {"lots": {"ABC": {"qty": 5, "entry_price": 100.0, "stop_price": 92.0,
+                                  "high_water": 100.0, "resting_stop_order_id": "s1",
+                                  "stop_type": "resting", "adopted": False}},
+                 "_caps": {"STOP_LOSS_PCT": 8.0, "TAKE_PROFIT_PCT": 25.0, "TRAIL_STOP_PCT": 5.0,
+                           "TRAIL_ACTIVATE_PCT": 4.0, "TRAIL_MIN_STEP_PCT": 0.5},
+                 "live_round_trip_done": True}
+        broker = {"positions": {"ABC": {"qty": 5.0, "avg_cost": 100.0}},
+                  "orders": [{"id": "s1", "symbol": "ABC", "side": "sell",
+                              "stop_price": "92.00", "state": "confirmed"}],
+                  "quotes": {"ABC": {"last": 110.0}}}
+        le.reconcile(state, broker, log := [])
+        check("dry-run places nothing", calls["place"] == [] and calls["cancel"] == [], calls)
+        check("dry-run reflects intended stop", state["lots"]["ABC"]["stop_price"] == 104.5, state["lots"]["ABC"])
+        check("dry-run logged rearm_dryrun", any(e["event"] == "trail_rearm_dryrun" for e in log), log)
+    finally:
+        if saved is not None:
+            sys.modules["rh_mcp"] = saved
+        else:
+            sys.modules.pop("rh_mcp", None)
+
+
 if __name__ == "__main__":
     tests = [test_whole_share_entry, test_fractional_entry, test_canary_caps_notional,
              test_cap_rejects, test_sell_specs, test_review_gating, test_snapshot_parse_real_shapes,
              test_buying_power_fallback_to_cash, test_order_obj_and_place_failure,
              test_reconcile_round_trip_on_close, test_reconcile_adopted_close_no_round_trip,
-             test_reconcile_pending_not_booked_closed]
+             test_reconcile_pending_not_booked_closed,
+             test_trail_off_by_default, test_trail_ratchets_up_and_never_down,
+             test_trail_min_step_guard, test_trail_floored_at_initial_stop,
+             test_reconcile_trails_resting_stop, test_reconcile_trail_dryrun_places_nothing]
     for fn in tests:
         fn()
     print(f"OK — {_passed} assertions passed across {len(tests)} tests")
