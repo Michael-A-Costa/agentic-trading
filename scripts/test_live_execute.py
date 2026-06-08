@@ -250,6 +250,36 @@ def test_breakeven_and_trail_compose():
     check("compose trail overtakes breakeven above activation", ns == 105.6, ns)
 
 
+def test_next_settle_date_skips_weekends():
+    os.environ["CASH_SETTLEMENT_GUARD"] = "1"
+    check("Mon -> Tue (T+1)", le.next_settle_date("2026-06-08") == "2026-06-09", le.next_settle_date("2026-06-08"))
+    check("Fri -> Mon (skip weekend)", le.next_settle_date("2026-06-05") == "2026-06-08", le.next_settle_date("2026-06-05"))
+
+
+def test_settled_buying_power_excludes_unsettled_and_pending():
+    os.environ["CASH_SETTLEMENT_GUARD"] = "1"
+    broker = {"buying_power": 2064.0, "pending_deposits": 1000.0}
+    # an unsettled $300 sale that settles tomorrow + the $1000 pending deposit are both excluded
+    state = {"unsettled": [{"settle_date": "2026-06-09", "amount": 300.0, "symbol": "ABC"}]}
+    sbp, uns = le.settled_buying_power(state, broker, "2026-06-08")
+    check("settled = bp - unsettled - pending", sbp == 2064.0 - 300.0 - 1000.0, sbp)
+    check("unsettled total reported", uns == 300.0, uns)
+    # a matured sale (settle_date <= today) is pruned and counts as settled again
+    state2 = {"unsettled": [{"settle_date": "2026-06-08", "amount": 300.0, "symbol": "ABC"}]}
+    sbp2, uns2 = le.settled_buying_power(state2, broker, "2026-06-08")
+    check("matured sale pruned", uns2 == 0.0 and not state2["unsettled"], (uns2, state2["unsettled"]))
+    check("settled excludes only pending after prune", sbp2 == 2064.0 - 1000.0, sbp2)
+
+
+def test_settled_guard_off_returns_raw_bp():
+    os.environ["CASH_SETTLEMENT_GUARD"] = "0"
+    broker = {"buying_power": 2064.0, "pending_deposits": 1000.0}
+    state = {"unsettled": [{"settle_date": "2099-01-01", "amount": 500.0}]}
+    sbp, uns = le.settled_buying_power(state, broker, "2026-06-08")
+    check("guard off -> raw bp, nothing excluded", sbp == 2064.0 and uns == 0.0, (sbp, uns))
+    os.environ["CASH_SETTLEMENT_GUARD"] = "1"
+
+
 def test_reconcile_trails_resting_stop():
     import types
     calls = {"cancel": [], "place": []}
@@ -328,6 +358,8 @@ if __name__ == "__main__":
              test_trail_off_by_default, test_trail_ratchets_up_and_never_down,
              test_trail_min_step_guard, test_trail_floored_at_initial_stop,
              test_breakeven_rung_lifts_to_entry, test_breakeven_and_trail_compose,
+             test_next_settle_date_skips_weekends, test_settled_buying_power_excludes_unsettled_and_pending,
+             test_settled_guard_off_returns_raw_bp,
              test_reconcile_trails_resting_stop, test_reconcile_trail_dryrun_places_nothing]
     for fn in tests:
         fn()

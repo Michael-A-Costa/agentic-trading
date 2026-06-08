@@ -34,7 +34,7 @@ import math
 import os
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -73,6 +73,43 @@ def _f(x, default=None):
 
 def armed() -> bool:
     return str(os.environ.get("LIVE_ARMED", "0")).strip().lower() in ("1", "true", "yes", "on")
+
+
+def gfv_guard_on() -> bool:
+    """Cash-account settlement guard (default ON). Disable only for a margin account."""
+    return str(os.environ.get("CASH_SETTLEMENT_GUARD", "1")).strip().lower() in ("1", "true", "yes", "on")
+
+
+def next_settle_date(et_today: str) -> str:
+    """T+1 BUSINESS day from an ET date 'YYYY-MM-DD' (US equities settle T+1 since 2024-05-28).
+    Skips weekends; does NOT account for market holidays (a holiday makes the guard slightly less
+    conservative — acceptable, and rare). Returns 'YYYY-MM-DD'."""
+    try:
+        d = datetime.strptime(et_today[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return et_today[:10]
+    d += timedelta(days=1)
+    while d.weekday() >= 5:  # 5=Sat, 6=Sun
+        d += timedelta(days=1)
+    return d.isoformat()
+
+
+def settled_buying_power(state: dict, broker: dict, et_today: str) -> tuple[float, float]:
+    """Deployable (settled) cash = broker buying_power - unsettled SALE proceeds - pending deposits.
+
+    GFV (Good-Faith Violation) on a CASH account happens when you BUY with unsettled funds and then
+    sell before they settle. Sizing every entry against settled-only cash makes that impossible —
+    necessary and sufficient. state['unsettled'] is our ledger of recent sale proceeds, each with a
+    T+1 settle_date; prune the matured ones (in place) and subtract the rest. Returns (settled_bp,
+    unsettled_total)."""
+    bp = broker.get("buying_power") or 0.0
+    if not gfv_guard_on():
+        return bp, 0.0
+    led = state.get("unsettled") or []
+    state["unsettled"] = [u for u in led if str(u.get("settle_date", "")) > et_today]  # keep un-matured
+    unsettled = sum(_f(u.get("amount"), 0.0) or 0.0 for u in state["unsettled"])
+    pending = broker.get("pending_deposits", 0.0) or 0.0
+    return max(0.0, bp - unsettled - pending), round(unsettled, 2)
 
 
 def _first(d: dict, *keys, default=None):
@@ -118,6 +155,10 @@ def parse_snapshot(snap: dict) -> dict:
         buying_power = _f(bp, None)
     if buying_power is None:
         buying_power = _f(_first(pf, "cash", "buying_power_usd", "cash_available_for_trading"), 0.0)
+    # Cash account: the broker exposes NO settled/unsettled split (confirmed 2026-06-08) — only cash,
+    # buying_power, and pending_deposits. We exclude pending (un-cleared ACH) from deployable funds and
+    # self-track unsettled SALE proceeds (see settled_buying_power) to avoid Good-Faith Violations.
+    pending_deposits = _f(_first(pf, "pending_deposits"), 0.0) or 0.0
 
     raw_pos = _unwrap(snap.get("positions") or {})
     if isinstance(raw_pos, dict):
@@ -151,7 +192,8 @@ def parse_snapshot(snap: dict) -> dict:
     if isinstance(raw_o, dict):
         raw_o = raw_o.get("orders") or raw_o.get("results") or []
     orders = [o for o in (raw_o or []) if isinstance(o, dict)]
-    return {"buying_power": buying_power, "positions": positions, "quotes": quotes, "orders": orders}
+    return {"buying_power": buying_power, "positions": positions, "quotes": quotes, "orders": orders,
+            "pending_deposits": pending_deposits}
 
 
 def open_stops_for(orders: list, sym: str) -> list:
@@ -660,19 +702,36 @@ def main() -> int:
     is_dryrun = not armed()
     mode_tag = "live-dryrun" if is_dryrun else "live"
 
+    # Cash-account settlement guard: deployable cash = broker buying_power - unsettled sale proceeds -
+    # pending deposits. Computed BEFORE this tick's sells append to the ledger (this tick's proceeds
+    # are unsettled until T+1, so not deployable now). Also prunes matured entries from the ledger.
+    settled_bp, unsettled_total = settled_buying_power(state, broker, today)
+
     if not args.skip and args.decision:
         decision = load_json(Path(args.decision))
         actions = decision.get("actions", [])
         # sells first (free up shares / honour exits), then buys
         for a in [x for x in actions if str(x.get("side")).lower() == "sell"]:
-            results.append(execute_sell(str(a.get("symbol", "")).upper(), a, state, broker, caps, log))
+            r = execute_sell(str(a.get("symbol", "")).upper(), a, state, broker, caps, log)
+            results.append(r)
+            # Record sale proceeds as UNSETTLED (T+1) so a later tick can't redeploy them into a buy
+            # and trip a Good-Faith Violation. Proceeds estimated at the sell-reference price.
+            if r.get("status") == "placed" and gfv_guard_on():
+                qd = broker["quotes"].get(r["symbol"], {})
+                px = qd.get("bid") or qd.get("last") or qd.get("ask") or 0.0
+                proceeds = round((_f(r.get("qty"), 0.0) or 0.0) * px, 2)
+                if proceeds > 0:
+                    state.setdefault("unsettled", []).append(
+                        {"settle_date": next_settle_date(today), "amount": proceeds,
+                         "symbol": r["symbol"], "sold_ts": now.isoformat(timespec="seconds")})
         # re-check the breaker once before any entry (deterministic, on broker numbers)
         breaker = day_pnl <= -caps.get("DAILY_MAX_LOSS_USD", 150.0)
         # Running tallies so multiple buys in ONE tick respect the caps CUMULATIVELY: a placed buy
         # consumes buying power, adds exposure, and may open a new position slot. Without this each
         # buy checks against the pre-tick snapshot and N buys could collectively breach the caps.
-        # Mirrors paper's per-fill recompute (apply_decision.validate_and_fill).
-        run_exposure, run_bp, run_npos = exposure, broker["buying_power"], len(broker["positions"])
+        # Mirrors paper's per-fill recompute (apply_decision.validate_and_fill). Entries draw on
+        # SETTLED cash (the GFV guard), not raw broker buying_power.
+        run_exposure, run_bp, run_npos = exposure, settled_bp, len(broker["positions"])
         for a in [x for x in actions if str(x.get("side")).lower() == "buy"]:
             sym = str(a.get("symbol", "")).upper()
             if breaker:
@@ -702,7 +761,9 @@ def main() -> int:
         "ts_utc": now.isoformat(timespec="seconds"), "ts_et": context.get("ts_et"), "mode": mode_tag,
         "session": context.get("session"), "regime": context.get("regime", {}).get("posture"),
         "armed": armed(), "action": "skip" if (args.skip or not args.decision) else "decide",
-        "buying_power": broker["buying_power"], "exposure": round(exposure, 2),
+        "buying_power": broker["buying_power"], "settled_buying_power": round(settled_bp, 2),
+        "unsettled": round(unsettled_total, 2), "pending_deposits": broker.get("pending_deposits", 0.0),
+        "exposure": round(exposure, 2),
         "equity": equity, "day_pnl": day_pnl, "results": results, "reconcile": log,
         "n_placed": sum(1 for r in results if r.get("status") == "placed"),
         "n_skipped": sum(1 for r in results if r.get("status") in ("skipped", "dryrun")),
@@ -725,8 +786,9 @@ def main() -> int:
 
     placed = record["n_placed"]
     note = "DRY-RUN" if is_dryrun else "ARMED"
+    gfv = f" settled_bp={round(settled_bp, 2)}" + (f" (unsettled={unsettled_total})" if unsettled_total else "")
     print(f"[{record['ts_et']}] {mode_tag.upper()} {note} — {placed} placed, {record['n_skipped']} "
-          f"skipped | equity={equity} day_pnl={day_pnl} bp={broker['buying_power']}")
+          f"skipped | equity={equity} day_pnl={day_pnl} bp={broker['buying_power']}{gfv}")
     return 0
 
 
