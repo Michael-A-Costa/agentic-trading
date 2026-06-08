@@ -257,12 +257,15 @@ def trail_stop_price(lot: dict, caps: dict, last: float | None) -> tuple[float |
       - high_water = max(prior high-water, entry, last) — the peak the trail anchors to (caller persists).
       - new_stop   = a RATCHET-ONLY raise of lot['stop_price'], or None when no change is warranted.
 
-    Trailing is OFF when caps['TRAIL_STOP_PCT'] <= 0 (returns (None, high_water) — the fixed
-    entry-based stop is left untouched, preserving today's behaviour). When on, the trail only engages
-    once the peak is up at least TRAIL_ACTIVATE_PCT from entry (so the initial STOP_LOSS_PCT stop owns
-    the per-trade risk budget until the trade is in profit). A raise smaller than TRAIL_MIN_STEP_PCT of
-    the current stop is suppressed (churn guard — each whole-share re-arm costs a cancel+place + a brief
-    naked window). The stop is floored at the entry-based level and never lowered.
+    The stop SCHEDULE has two independent ratchet rungs (highest engaged rung wins, never below the
+    entry-based STOP_LOSS_PCT floor, never lowered):
+      - TRAIL_BREAKEVEN_AT_PCT: once the peak is up this %, lift the stop to entry ("no give-back to a
+        loss"). One-time; can't whipsaw on the upside.
+      - TRAIL_STOP_PCT (+ TRAIL_ACTIVATE_PCT): once up the activate %, ride TRAIL_STOP_PCT below the
+        high-water mark, scaling up with every new high.
+    Both rungs OFF (<=0) -> returns (None, high_water), the fixed entry-based stop untouched (today's
+    behaviour). A raise smaller than TRAIL_MIN_STEP_PCT of the current stop is suppressed (churn guard —
+    each whole-share re-arm costs a cancel+place + a brief naked window).
     """
     entry = _f(lot.get("entry_price"))
     if entry is None or entry <= 0:
@@ -270,14 +273,27 @@ def trail_stop_price(lot: dict, caps: dict, last: float | None) -> tuple[float |
     hw = _f(lot.get("high_water")) or entry
     if last is not None and last > hw:
         hw = last
+    gain_pct = (hw / entry - 1.0) * 100.0
     trail = caps.get("TRAIL_STOP_PCT", 0.0) or 0.0
-    if trail <= 0:
-        return None, hw  # trailing disabled — leave the fixed stop as-is
-    activate = caps.get("TRAIL_ACTIVATE_PCT", 0.0) or 0.0
-    if hw < entry * (1 + activate / 100.0):
-        return None, hw  # not yet up enough — the fixed STOP_LOSS_PCT stop still stands
+    be_at = caps.get("TRAIL_BREAKEVEN_AT_PCT", 0.0) or 0.0
+    if trail <= 0 and be_at <= 0:
+        return None, hw  # both rungs off — leave the fixed STOP_LOSS_PCT stop as-is
+
+    # A stop SCHEDULE (ratchet-only), composed of independent rungs; take the highest that's engaged:
+    candidates = []
+    #  rung 1 — breakeven: once up TRAIL_BREAKEVEN_AT_PCT, lift the stop to entry ("no give-back to a
+    #  loss"). One-time; cannot whipsaw on the upside (it sits far below price).
+    if be_at > 0 and gain_pct >= be_at:
+        candidates.append(entry)
+    #  rung 2 — continuous trail: once up TRAIL_ACTIVATE_PCT, ride TRAIL_STOP_PCT below the high-water
+    #  mark, scaling UP with every new high.
+    if trail > 0 and gain_pct >= (caps.get("TRAIL_ACTIVATE_PCT", 0.0) or 0.0):
+        candidates.append(hw * (1 - trail / 100.0))
+    if not candidates:
+        return None, hw  # neither rung engaged yet
+
     floor = round(entry * (1 - caps.get("STOP_LOSS_PCT", 8.0) / 100.0), 2)
-    desired = max(round(hw * (1 - trail / 100.0), 2), floor)
+    desired = max(round(max(candidates), 2), floor)  # never below the catastrophe stop
     cur = _f(lot.get("stop_price"))
     if cur is not None:
         if desired <= cur + 1e-9:

@@ -225,6 +225,31 @@ def test_trail_floored_at_initial_stop():
     check("trail floored at initial stop", ns is None, ns)
 
 
+def test_breakeven_rung_lifts_to_entry():
+    # breakeven rung alone (trail off): once up TRAIL_BREAKEVEN_AT_PCT, stop -> entry, then holds.
+    caps = {"STOP_LOSS_PCT": 8.0, "TRAIL_BREAKEVEN_AT_PCT": 10.0, "TRAIL_MIN_STEP_PCT": 0.0}
+    lot = {"entry_price": 100.0, "stop_price": 92.0, "high_water": 100.0}
+    ns, _ = le.trail_stop_price(lot, caps, 108.0)            # +8% < 10% -> not yet
+    check("breakeven not engaged below trigger", ns is None, ns)
+    ns, hw = le.trail_stop_price(lot, caps, 111.0)           # +11% -> lift to entry 100
+    check("breakeven lifts stop to entry", ns == 100.0 and hw == 111.0, (ns, hw))
+    lot["stop_price"], lot["high_water"] = ns, hw
+    ns, _ = le.trail_stop_price(lot, caps, 105.0)            # pullback: holds at breakeven
+    check("breakeven holds on pullback", ns is None, ns)
+
+
+def test_breakeven_and_trail_compose():
+    # both rungs on: breakeven floors at entry up to the trail's activation, then the trail takes over.
+    caps = {"STOP_LOSS_PCT": 8.0, "TRAIL_BREAKEVEN_AT_PCT": 10.0,
+            "TRAIL_STOP_PCT": 12.0, "TRAIL_ACTIVATE_PCT": 15.0, "TRAIL_MIN_STEP_PCT": 0.0}
+    lot = {"entry_price": 100.0, "stop_price": 92.0, "high_water": 100.0}
+    ns, _ = le.trail_stop_price(lot, caps, 112.0)            # +12%: breakeven yes, trail not active (<15)
+    check("compose uses breakeven below trail activation", ns == 100.0, ns)
+    lot["stop_price"] = ns
+    ns, _ = le.trail_stop_price(lot, caps, 120.0)            # +20%: trail 120*0.88=105.6 > entry
+    check("compose trail overtakes breakeven above activation", ns == 105.6, ns)
+
+
 def test_reconcile_trails_resting_stop():
     import types
     calls = {"cancel": [], "place": []}
@@ -302,6 +327,7 @@ if __name__ == "__main__":
              test_reconcile_pending_not_booked_closed,
              test_trail_off_by_default, test_trail_ratchets_up_and_never_down,
              test_trail_min_step_guard, test_trail_floored_at_initial_stop,
+             test_breakeven_rung_lifts_to_entry, test_breakeven_and_trail_compose,
              test_reconcile_trails_resting_stop, test_reconcile_trail_dryrun_places_nothing]
     for fn in tests:
         fn()
