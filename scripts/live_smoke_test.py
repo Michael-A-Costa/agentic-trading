@@ -46,16 +46,21 @@ MAX_FRAC = 0.50       # hard ceiling: refuse to place if limit >= 50% of last (c
 
 
 def _order_id(placed: dict | None) -> str | None:
-    """Dig the broker order id out of the relay's {"order": <raw>} payload, defensively."""
-    if not isinstance(placed, dict):
-        return None
-    o = placed.get("order", placed)
-    if isinstance(o, dict):
-        o = o.get("data", o)
-    if isinstance(o, dict):
-        for k in ("id", "order_id", "ref_id"):
+    """Dig the broker order id out of the relay payload, which nests as
+    {"order": {"data": {"order": {"id": ...}}}}. Descend through any "order"/"data" wrappers until an
+    explicit id surfaces (NOT instrument_id — we check exact keys). Defensive against shape drift."""
+    o = placed
+    for _ in range(8):
+        if not isinstance(o, dict):
+            break
+        for k in ("id", "order_id"):
             if o.get(k):
                 return str(o[k])
+        nxt = o.get("order") if isinstance(o.get("order"), dict) else (
+            o.get("data") if isinstance(o.get("data"), dict) else None)
+        if nxt is None:
+            break
+        o = nxt
     return None
 
 
@@ -143,17 +148,28 @@ def main() -> int:
         placed = rh_mcp.place(spec, ref_id=ref_id)
         order_id = _order_id(placed)
         print(f"[place]  ref_id={ref_id}  order_id={order_id}\n         raw={placed}")
-        if not order_id:
-            print("FAIL: place returned no order id (place path).")
-            return 1
 
-        # Read it back from the broker — it should be OPEN and UNFILLED.
+        # Read it back from the broker — it should be OPEN and UNFILLED. This list is ALSO our safety
+        # net: if id-parsing failed, recover the id by matching our open buy on this symbol+price, so
+        # a place can never orphan an uncancelled order.
         snap2 = rh_mcp.snapshot([sym])
         orders = le.parse_snapshot(snap2)["orders"] if snap2 else []
         mine = next((o for o in orders if str(o.get("id") or o.get("order_id")) == order_id), None)
+        if mine is None:
+            mine = next((o for o in orders
+                         if str(o.get("symbol", "")).upper() == sym
+                         and str(o.get("side", "")).lower() == "buy"
+                         and str(o.get("state", "")).lower() in ("unconfirmed", "confirmed", "queued", "new")
+                         and abs(float(o.get("price") or 0) - limit) < 0.01), None)
+            if mine and not order_id:
+                order_id = str(mine.get("id") or mine.get("order_id"))
+                print(f"[recover] id-parse missed it; recovered open order {order_id} by symbol+price")
         state = (mine or {}).get("state") or (mine or {}).get("status") or "unknown"
         print(f"[verify] resting order found={mine is not None}  state={state}  "
               f"(expected open/unfilled — limit is far below market)")
+        if not order_id:
+            print("FAIL: order placed but no id to cancel — CHECK THE ROBINHOOD APP and cancel manually.")
+            return 1
     finally:
         if order_id:
             cancelled = rh_mcp.cancel(order_id)
