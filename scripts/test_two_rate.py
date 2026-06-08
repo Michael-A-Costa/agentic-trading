@@ -134,7 +134,7 @@ state_file.write_text(_json.dumps(istate))
 ictx = ctx(positions=[{"symbol": "AAPL", "last": 95.0}])
 ictx["market_open"], ictx["data_stale"] = True, False
 ictx["screen"]["exits"] = [{"symbol": "AAPL", "reason": "synthetic stop hit: 95 <= stop 96 (-5%)"}]
-sen.tc.build_context = lambda now=None: ictx          # inject the synthetic view
+sen.tc.build_context = lambda now=None, scope="full": ictx   # inject the synthetic view
 sen.STATE_PATH = state_file
 sen.ENGINE_LOG = log_file
 sen.trade_log.record_fills = lambda *a, **k: []        # don't touch the real blotter
@@ -170,7 +170,7 @@ check("apply_decision ARMED the entry (no immediate buy)",
 # sentinel fires it once price crosses the trigger
 sen.STATE_PATH, sen.ENGINE_LOG = sfile, elog
 fctx = ctx(candidates=[{"symbol": "AAPL", "last": 316.0}])           # now above the trigger
-sen.tc.build_context = lambda now=None: fctx
+sen.tc.build_context = lambda now=None, scope="full": fctx
 rc3 = sen.main()
 out3 = _json.loads(sfile.read_text())
 check("sentinel FIRED the armed entry on the cross",

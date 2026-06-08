@@ -93,7 +93,10 @@ def main() -> int:
     args = ap.parse_args()
 
     now = datetime.now(timezone.utc)
-    context = tc.build_context(now)     # quote fetch — done OUTSIDE the state lock (slow, read-only)
+    # monitor scope: fetch ONLY held + armed + indexes (no discovery/pins). The sentinel runs exits +
+    # armed-trigger checks, never screens new names, so a lean ~12-symbol fetch keeps us under Cboe's
+    # per-IP rate limit every minute instead of bursting the full 30-40 universe.
+    context = tc.build_context(now, scope="monitor")  # quote fetch — OUTSIDE the state lock (slow, read-only)
 
     # Live exits run through the broker relay + resting stops, not this paper executor.
     if str(context.get("mode", "paper")).lower() == "live":

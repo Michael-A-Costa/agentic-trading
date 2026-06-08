@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import http.cookiejar
 import io
 import json
 import os
@@ -32,6 +33,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 from datetime import datetime, time, timezone
+from time import sleep
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -58,12 +60,36 @@ TREND_SYMBOL = "SPY"   # the broad-market proxy whose multi-day trend gates risk
 HTTP_TIMEOUT = 12
 # A browser-ish UA helps the Yahoo fallback (anonymous chart API 429s bare clients).
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+# Cboe sits behind Cloudflare bot-management. A fresh, cookieless request *per symbol* reads as N new
+# bots and trips Cloudflare's burst rate-limit (429) — which is exactly what blinds the engine, since
+# Cboe is the only live keyless source (Stooq 404s, Yahoo 429s). Two defences, set per call site below:
+#   1. _OPENER shares ONE cookie jar across the process, so Cloudflare's __cf_bm cookie set by the first
+#      request rides along on the rest — we read as one trusted session, not a swarm.
+#   2. CBOE_THROTTLE_S spaces the per-symbol loop so we never present a burst in the first place.
+# _http_get adds a 429 backoff-retry as the recovery net when both still collide (e.g. the 1-min
+# sentinel and 5-min tick fetching at the same instant from the same IP).
+CBOE_THROTTLE_S = float(os.environ.get("CBOE_THROTTLE_S", "0.35"))
+_COOKIE_JAR = http.cookiejar.CookieJar()
+_OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_COOKIE_JAR))
 
 
-def _http_get(url: str) -> str:
+def _http_get(url: str, retries: int = 2, backoff: float = 1.0) -> str:
+    """GET through the shared cookie-jar opener, retrying on HTTP 429 with exponential backoff.
+
+    Cookie reuse + caller-side throttling keep us under Cloudflare's limit; this retry is the net for
+    the occasional collision. Non-429 errors (404, timeouts) propagate immediately — no point retrying
+    a dead endpoint."""
     req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+    for attempt in range(retries + 1):
+        try:
+            with _OPENER.open(req, timeout=HTTP_TIMEOUT) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < retries:
+                sleep(backoff * (2 ** attempt))
+                continue
+            raise
+    raise RuntimeError(f"exhausted {retries} retries (429) for {url}")  # unreachable; satisfies the type checker
 
 
 def _fnum(v) -> float | None:
@@ -97,11 +123,23 @@ def fetch_stooq(symbols: list[str]) -> dict[str, dict]:
 
 # --------------------------------------------------------------------------- fetch: fallback 1 (Cboe)
 def fetch_cboe(symbols: list[str]) -> dict[str, dict]:
-    """Same shape, from Cboe's keyless delayed-quotes JSON (one request per symbol)."""
+    """Same shape, from Cboe's keyless delayed-quotes JSON (one request per symbol).
+
+    Throttled (CBOE_THROTTLE_S between symbols) and cookie-shared (via _OPENER) so the per-symbol
+    loop doesn't read as a bot swarm and trip Cloudflare's 429. If EVERY symbol failed, re-raise the
+    last error so the orchestrator reports the real cause (e.g. the 429) instead of a stale Stooq 404.
+    """
     out: dict[str, dict] = {}
-    for s in symbols:
+    last_err: Exception | None = None
+    for i, s in enumerate(symbols):
+        if i:
+            sleep(CBOE_THROTTLE_S)   # space the burst — the burst is what gets us rate-limited
         try:
-            d = json.loads(_http_get(CBOE_URL.format(sym=urllib.parse.quote(s.upper()))))
+            # The FIRST request seats Cloudflare's __cf_bm cookie that the rest ride on, so give it
+            # extra backoff patience: a cold start (or a brief prior block) otherwise drops the first
+            # several symbols before the session warms up. Once warm, the loop flows at the throttle.
+            d = json.loads(_http_get(CBOE_URL.format(sym=urllib.parse.quote(s.upper())),
+                                     retries=(4 if i == 0 else 2)))
             data = d.get("data") or {}
             if not data:
                 continue
@@ -116,8 +154,11 @@ def fetch_cboe(symbols: list[str]) -> dict[str, dict]:
                 "date": date,
                 "time": tm,
             }
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError):
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError) as e:
+            last_err = e
             continue
+    if not out and last_err is not None:
+        raise last_err   # nothing came back at all — let the caller see why (the orchestrator logs it)
     return out
 
 
@@ -162,7 +203,7 @@ def fetch_quotes(symbols: list[str]) -> tuple[dict[str, dict], str]:
     Chain: Stooq (primary, batch + 1 retry) -> Cboe (fallback 1) -> Yahoo (fallback 2). All three are
     independent keyless providers, so a single provider's outage or throttle doesn't blind the engine.
     """
-    last_err: Exception | None = None
+    notes: list[str] = []
     attempts = [
         ("stooq", fetch_stooq),
         ("stooq(retry)", fetch_stooq),
@@ -174,9 +215,10 @@ def fetch_quotes(symbols: list[str]) -> tuple[dict[str, dict], str]:
             q = fn(symbols)
             if _has_indexes(q):
                 return q, label
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            last_err = e
-    raise RuntimeError(f"all sources failed (last error: {last_err})")
+            notes.append(f"{label}: no index data")
+        except Exception as e:   # any source failure just falls through to the next; we raise only if all do
+            notes.append(f"{label}: {type(e).__name__}: {e}")
+    raise RuntimeError("all sources failed (" + "; ".join(notes) + ")")
 
 
 # --------------------------------------------------------------------------- daily trend (multi-day)

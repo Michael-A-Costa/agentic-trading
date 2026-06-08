@@ -146,6 +146,7 @@ def load_live_state() -> dict:
             "entry_ts": lot.get("entry_ts"),
             "stop_price": lot.get("stop_price"),
             "take_profit_price": lot.get("take_profit_price"),
+            "high_water": lot.get("high_water"),  # trailing-stop peak (live_execute owns the writes)
             "init_qty": lot.get("init_qty", qty),
             "scaled": lot.get("scaled") or [],
             "stop_type": lot.get("stop_type", "synthetic"),
@@ -184,12 +185,19 @@ def latest_regime() -> dict:
     }
 
 
-def build_context(now_utc: datetime | None = None) -> dict:
+def build_context(now_utc: datetime | None = None, scope: str = "full") -> dict:
     """Gather one tick's full deterministic view — fresh quotes, equity-resolved caps, per-position
     P&L, the rule-based exit screen, and the GATE — and return it as the context dict. SHARED by the
     5-min planner (tick_context.main below) and the 1-min sentinel (sentinel.py), so both evaluate
     the identical exit rules and caps. The only side effect is the once-a-day start-of-day-equity
-    rollover write to paper_state.json (paper mode); callers serialize that via data/.tick.lock."""
+    rollover write to paper_state.json (paper mode); callers serialize that via data/.tick.lock.
+
+    scope="full" (planner) fetches the whole universe — discovery movers + pins + held + armed — to
+    screen for new entries. scope="monitor" (the 1-min sentinel) fetches ONLY held + armed + indexes:
+    the sentinel just runs exits and armed-trigger checks, never screens new names, so quoting the
+    discovery universe every minute is wasted load that pins us against Cboe's per-IP rate limit and
+    starves the quotes that matter. Smaller, faster fetch => the gate stays fed every minute."""
+    monitor = scope == "monitor"
     now_utc = now_utc or datetime.now(timezone.utc)
     now_et = now_utc.astimezone(mc.ET)
     today = now_et.strftime("%Y-%m-%d")
@@ -202,10 +210,11 @@ def build_context(now_utc: datetime | None = None) -> dict:
     # Discovery replaces a static stock allowlist: a momentum engine has to see what's actually
     # moving market-wide, not a fixed watchlist. The pins (CANDIDATES) stay screened every tick and
     # are the fallback if discovery is disabled/down. See scripts/discover.py for the eligibility filter.
-    pinned = [s.strip().upper() for s in env(
+    # monitor scope skips BOTH the pins and discovery — the sentinel needs neither (no new-entry screen).
+    pinned = [] if monitor else [s.strip().upper() for s in env(
         "CANDIDATES", "AAPL,NVDA,TSLA,AMD,MSFT,AMZN,META,GOOGL,F,PLTR").split(",") if s.strip()]
     discovered = []
-    if env("DISCOVERY_ENABLED", "1") == "1":
+    if not monitor and env("DISCOVERY_ENABLED", "1") == "1":
         try:
             import discover  # sibling; keyless Nasdaq screener + eligibility filter, cached per tick
             discovered = discover.discover()
@@ -218,7 +227,11 @@ def build_context(now_utc: datetime | None = None) -> dict:
     held = list(state["positions"].keys())
     # Index ETFs are ALWAYS fetched: SPY is the rel-strength benchmark and the market-data gate
     # needs index data — but they are excluded from entry candidates below (never momentum-buy beta).
-    symbols = sorted(set(candidates) | set(held) | set(mc.INDEXES))
+    # Order MATTERS: the keyless quote source (Cboe) rate-limits a long per-symbol burst, dropping the
+    # tail. So fetch the must-haves FIRST — indexes (data gate), then held + armed (exits + trigger
+    # checks) — and only then discovery/pins. A clipped tail then loses a low-value mover, never an
+    # index or an open position. (ordered de-dupe keeps first occurrence = highest priority.)
+    symbols = list(dict.fromkeys(list(mc.INDEXES) + held + armed_syms + candidates))
 
     quotes, source = {}, None
     fetch_error = None
@@ -318,6 +331,11 @@ def build_context(now_utc: datetime | None = None) -> dict:
         "MAX_OPEN_POSITIONS": int(envf("MAX_OPEN_POSITIONS", 10)),
         "STOP_LOSS_PCT": envf("STOP_LOSS_PCT", 4.0),
         "TAKE_PROFIT_PCT": envf("TAKE_PROFIT_PCT", 4.0),
+        # Trailing stop (live path): 0 = OFF (static entry-based stop). >0 trails this % below the
+        # high-water mark, ratchet-only, beginning once a lot is up TRAIL_ACTIVATE_PCT. See live_execute.
+        "TRAIL_STOP_PCT": envf("TRAIL_STOP_PCT", 0.0),
+        "TRAIL_ACTIVATE_PCT": envf("TRAIL_ACTIVATE_PCT", 0.0),
+        "TRAIL_MIN_STEP_PCT": envf("TRAIL_MIN_STEP_PCT", 0.5),
         "SIGNAL_THRESHOLD_PCT": envf("SIGNAL_THRESHOLD_PCT", 2.0),  # DEPRECATED (old intraday-pop trigger)
         "GAP_THRESHOLD_PCT": envf("GAP_THRESHOLD_PCT", 7.0),        # catalyst entry: min overnight gap %
         "VOL_MULT_MIN": envf("VOL_MULT_MIN", 2.0),                  # catalyst entry: min volume vs 20d avg
