@@ -42,14 +42,21 @@ def score(pos: dict, now_utc: datetime, soft_cut_pct: float = 4.0,
     reasons: list[str] = []
     risk = 0.0
 
-    # 1) proximity to the hard stop — the dominant term. fraction of the way from entry to stop:
-    #    1.0 = at entry, 0.0 = at the stop, < 0 = already below it. Closer to the stop = hotter.
+    # 1) proximity to the hard stop — the dominant term. fraction of the way down to the stop:
+    #    1.0 = at/above the reference high, 0.0 = at the stop. Closer to the stop = hotter.
+    #    Only meaningful while the stop sits BELOW entry (a position at risk of a losing stop-out).
+    #    Once a TRAILING stop has ratcheted to/above entry the trade is in profit and the resting/
+    #    trailing stop owns the downside — this term would otherwise divide by a negative (entry-stop)
+    #    and spuriously flag a green winner CRITICAL, so we skip it there. ref_high=max(entry,last)
+    #    also avoids penalising an in-profit position against its own high. (Losers: ref_high==entry,
+    #    so the score is identical to the original (last-stop)/(entry-stop).)
     prox = None
-    if entry is not None and stop is not None and last is not None and entry != stop:
-        prox = (last - stop) / (entry - stop)
-        risk += max(0.0, 1 - prox) * 40.0
+    if entry is not None and stop is not None and last is not None and entry > stop:
+        ref_high = max(entry, last)
+        prox = max(0.0, min(1.0, (last - stop) / (ref_high - stop)))
+        risk += (1 - prox) * 40.0
         if prox < 0.5:
-            reasons.append(f"{int(max(0.0, 1 - prox) * 100)}% of the way to stop")
+            reasons.append(f"{int((1 - prox) * 100)}% of the way to stop")
 
     # 2) unrealized loss (each 1% down adds 2, capped at 20)
     if pnl is not None and pnl < 0:
