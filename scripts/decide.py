@@ -120,6 +120,15 @@ def ingest_dd_jobs(cache: dict, today_et: str, now: float) -> int:
         status = job.get("status")
         if status == "done":
             res = job.get("result") or {}
+            # Fold the detached worker's token spend into THIS tick's ledger so the end-of-tick TOKENS
+            # line accounts for async DD cost. Attribute to the ingest tick (the dispatching tick paid
+            # nothing — it only spawned). Relabel "async:" so the per-call breakdown stays traceable.
+            # Done for every finished job (commit/reject/error) so the cost picture is complete.
+            for _call in ((job.get("usage") or {}).get("calls") or []):
+                _rec = dict(_call)
+                _rec["label"] = f"async:{_rec.get('label') or ('dd:' + sym)}"
+                with _USAGE_LOCK:
+                    _USAGE_LEDGER.append(_rec)
             if res.get("decision") in ("commit", "reject"):
                 cache[sym] = {"ts": now, "day": today_et,
                               "ref_price": job.get("ref_price"), "ref_range_pos": job.get("ref_range_pos"),
@@ -306,6 +315,13 @@ def run_dd(c: dict, regime: dict, caps: dict, portfolio: dict, dd_model: str) ->
     except (OSError, ValueError):
         dd = {"symbol": sym, "error": "dd_unreadable"}
 
+    # Python pre-filter: if the probe already triggers a hard R1 disqualifier (can't price /
+    # can't exit), auto-reject here and skip the ~85s Sonnet call — the model would reject anyway.
+    pre = _r1_reject(sym, dd)
+    if pre is not None:
+        sys.stderr.write(f"[decide] {sym}: R1 pre-filter → reject ({pre['reason']})\n")
+        return pre
+
     # Headroom = how much we could ACTUALLY add now (cap, remaining exposure, and cash), so the
     # model sizes within what the deterministic gate will accept instead of proposing a number
     # that silently rejects.
@@ -370,7 +386,170 @@ def run_dd(c: dict, regime: dict, caps: dict, portfolio: dict, dd_model: str) ->
             "never_buy_reason": commit.get("never_buy_reason")}
 
 
+def run_dd_batch(fresh_jobs: list[tuple[str, dict]], regime: dict, caps: dict,
+                 portfolio: dict, dd_model: str) -> dict[str, dict]:
+    """Evaluate all cache-miss candidates in ONE claude subprocess, amortising the startup cost
+    (system prompt + tool schemas) once instead of N times.
+
+    Tradeoff vs the parallel approach: Claude processes symbols sequentially inside one conversation,
+    so wall-clock is ~sum(per-symbol) rather than max(per-symbol). Worth it when N is small (2-3)
+    and token waste dominates over latency.
+
+    Returns {sym: verdict_dict} with the same shape as run_dd().
+    """
+    if not fresh_jobs:
+        return {}
+
+    # Run all dd_probe scripts in parallel first (same as the single-symbol path).
+    def probe_one(sym_c: tuple[str, dict]) -> tuple[str, dict]:
+        sym, _ = sym_c
+        try:
+            subprocess.run([PYEXE, str(SCRIPTS / "dd_probe.py"), sym],
+                           capture_output=True, text=True, timeout=60)
+        except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError) as e:
+            sys.stderr.write(f"[decide] dd_probe {sym} failed ({e}); using any existing probe file\n")
+        dd_file = TICK / f"dd_{sym}.json"
+        try:
+            dd = json.loads(dd_file.read_text()) if dd_file.exists() else {"symbol": sym, "error": "no_dd"}
+        except (OSError, ValueError):
+            dd = {"symbol": sym, "error": "dd_unreadable"}
+        return sym, dd
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(fresh_jobs), 6)) as ex:
+        probed: dict[str, dict] = dict(ex.map(probe_one, fresh_jobs))
+
+    # Python pre-filter: auto-reject any symbol the probe already hard-disqualifies (R1).
+    # Splits fresh_jobs into auto_rejected (no model call) and model_jobs (need the batch call).
+    auto_rejected: dict[str, dict] = {}
+    model_jobs: list[tuple[str, dict]] = []
+    for sym, c in fresh_jobs:
+        pre = _r1_reject(sym, probed.get(sym, {"symbol": sym, "error": "no_dd"}))
+        if pre is not None:
+            sys.stderr.write(f"[decide] {sym}: R1 pre-filter → reject ({pre['reason']})\n")
+            auto_rejected[sym] = pre
+        else:
+            model_jobs.append((sym, c))
+
+    if not model_jobs:
+        return auto_rejected
+
+    # Build batch input array (only symbols that passed the pre-filter).
+    batch_items = []
+    for sym, c in model_jobs:
+        headroom = max(0.0, min(caps["MAX_POSITION_USD"],
+                                caps["MAX_TOTAL_EXPOSURE_USD"] - portfolio.get("exposure", 0.0),
+                                portfolio.get("cash", 0.0)))
+        batch_items.append({
+            "symbol": sym,
+            "screen_reason": c.get("reason", ""),
+            "screen_signal": {"intraday_pct": c.get("intraday_pct"),
+                              "range_pos": c.get("range_pos"),
+                              "last": c.get("last")},
+            "regime": regime,
+            "sizing": {"MAX_POSITION_USD": caps["MAX_POSITION_USD"],
+                       "MIN_POSITION_USD": caps.get("MIN_POSITION_USD", 0.0),
+                       "available_headroom_usd": round(headroom, 2),
+                       "available_cash": round(portfolio.get("cash", 0.0), 2),
+                       "stop_loss_pct": caps["STOP_LOSS_PCT"],
+                       "take_profit_pct": caps["TAKE_PROFIT_PCT"],
+                       "max_per_trade_loss_usd": caps.get("MAX_PER_TRADE_LOSS_USD")},
+            "portfolio": {"open_positions": portfolio.get("open_positions", 0),
+                          "max_open_positions": caps["MAX_OPEN_POSITIONS"],
+                          "held_symbols": portfolio.get("held", [])},
+            "prior_evaluation": memory.get_note(sym),
+            "dd": probed.get(sym, {"symbol": sym, "error": "no_dd"}),
+        })
+
+    dd_timeout = int(os.environ.get("DD_CLAUDE_TIMEOUT_S", "240")) * len(model_jobs)
+    out = run_claude((SCRIPTS / "dd_batch_prompt.txt").read_text() + json.dumps(batch_items),
+                     dd_model, tools=DD_TOOLS, mcp=True, timeout=dd_timeout, label="dd:batch")
+
+    # Error path: model failed — return error verdict for every model-evaluated symbol.
+    if out is None:
+        return {**auto_rejected, **{sym: {"symbol": sym, "decision": "error", "error": "dd_model_failed",
+                                          "conviction": None, "dollar_amount": None, "reason": "",
+                                          "catalysts": [], "risks": []}
+                                    for sym, _ in model_jobs}}
+
+    # Parse the JSON array response. Try to recover a partial array if the model wrapped it.
+    verdicts: list[dict] = []
+    try:
+        parsed = json.loads(out)
+        verdicts = parsed if isinstance(parsed, list) else [parsed]
+    except (ValueError, TypeError):
+        import re as _re
+        m = _re.search(r'\[.*\]', out, _re.DOTALL)
+        if m:
+            try:
+                verdicts = json.loads(m.group())
+            except (ValueError, TypeError):
+                verdicts = []
+
+    verdict_map: dict[str, dict] = {}
+    for v in verdicts:
+        if isinstance(v, dict):
+            s = (v.get("symbol") or "").upper()
+            if s:
+                verdict_map[s] = v
+
+    results: dict[str, dict] = {}
+    for sym, _ in model_jobs:
+        commit = verdict_map.get(sym)
+        if commit is None:
+            results[sym] = {"symbol": sym, "decision": "error", "error": "missing_from_batch",
+                            "conviction": None, "dollar_amount": None, "reason": "", "catalysts": [],
+                            "risks": []}
+            continue
+        if commit.get("_parse_error"):
+            results[sym] = {"symbol": sym, "decision": "error", "error": "dd_parse_error",
+                            "conviction": None, "dollar_amount": None,
+                            "reason": "model output unparseable", "catalysts": [], "risks": []}
+            continue
+        decision = (commit.get("decision") or "reject").lower()
+        dollar = commit.get("dollar_amount")
+        if decision == "commit":
+            try:
+                d = float(dollar)
+                if not math.isfinite(d) or d <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                decision, dollar = "reject", None
+                commit["reason"] = f"commit returned without a valid size; {commit.get('reason', '')}".strip()
+        results[sym] = {
+            "symbol": sym, "decision": decision, "conviction": commit.get("conviction"),
+            "dollar_amount": dollar, "reason": commit.get("reason", ""),
+            "catalyst_type": commit.get("thesis_type") or commit.get("catalyst_type"),
+            "hold_intent": commit.get("hold_intent"),
+            "entry_trigger": commit.get("entry_trigger"),
+            "catalysts": commit.get("catalysts", []), "risks": commit.get("risks", []),
+            "next_earnings_date": commit.get("next_earnings_date"),
+            "never_buy": bool(commit.get("never_buy")),
+            "never_buy_reason": commit.get("never_buy_reason"),
+        }
+    return {**auto_rejected, **results}
+
+
 MANAGE_TOOLS = ["WebSearch", "WebFetch", "mcp__robinhood-trading__get_equity_quotes"]
+
+
+def _r1_reject(sym: str, dd: dict) -> dict | None:
+    """Return a reject verdict if the quant probe already triggers a hard R1 disqualifier
+    (can't price / can't exit).  Only fires on explicit False flags — None means data gap,
+    not a disqualifier — so we don't silently block a tradeable name on missing history."""
+    flags = dd.get("flags") or {}
+    if dd.get("error"):
+        reason = f"dd_probe error: {dd['error']}"
+    elif flags.get("spread_ok") is False:
+        reason = "spread too wide to exit cleanly (flags.spread_ok=false)"
+    elif flags.get("liquid") is False:
+        reason = "insufficient dollar volume (flags.liquid=false)"
+    else:
+        return None
+    return {"symbol": sym, "decision": "reject", "conviction": None, "dollar_amount": None,
+            "hold_intent": None, "thesis_type": "none", "next_earnings_date": "unknown",
+            "reason": f"R1 auto-reject: {reason}",
+            "risks": ["illiquid or wide spread"], "never_buy": False, "never_buy_reason": None,
+            "catalysts": []}
 
 
 def run_manage_dd(p: dict, regime: dict, caps: dict, portfolio: dict, dd_model: str) -> dict:
@@ -441,6 +620,9 @@ def main() -> int:
     caps = context["caps"]
     regime = context.get("regime", {})
     dd_model = os.environ.get("DD_MODEL", "claude-sonnet-4-6")
+    # Manage DDs (keep/trim/exit on held positions) use a lighter model by default — the prompt
+    # is shorter and the decision is simpler than a fresh entry DD.
+    manage_model = os.environ.get("DD_MODEL_MANAGE", "claude-haiku-4-5-20251001")
     max_dd = int(os.environ.get("MAX_DD_CANDIDATES", "2"))
 
     # --- Stage 1 is now DETERMINISTIC (computed in tick_context.py) — just read it ---
@@ -600,28 +782,24 @@ def main() -> int:
                       f"(verdicts act a later tick)")
         else:
             entry_did_fresh = bool(fresh_jobs)   # ran real FRESH DD work this tick -> defer the manage wave
-            # Run the cache-miss DDs CONCURRENTLY. Each run_dd is subprocess-bound (dd_probe + a headless
-            # `claude` web-research call), so it releases the GIL and threads give true parallelism.
-            # Serial DD overran the cadence — 2-3 fresh DDs cost the SUM of their web calls; in parallel
-            # the tick's wall-clock is the SLOWEST single DD. Cache + memory writes stay on the main
-            # thread (after the pool drains) to avoid races.
+            # Batch all cache-miss DDs into ONE claude subprocess so system-prompt + tool-schema
+            # startup cost is paid once, not N times. Wall-clock is ~sum(per-symbol) rather than
+            # max(per-symbol), but that's the correct tradeoff when N is small and token waste dominates.
             if fresh_jobs:
-                def timed_dd(cand):
-                    t0 = time.time()
-                    r = run_dd(cand, regime, caps, portfolio, dd_model)
-                    return {**r, "dd_elapsed_s": round(time.time() - t0, 1)}
-                workers = min(len(fresh_jobs), int(os.environ.get("DD_MAX_PARALLEL", "4")))
-                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-                    futs = {ex.submit(timed_dd, c): sym for sym, c in fresh_jobs}
-                    for fut in concurrent.futures.as_completed(futs):
-                        sym = futs[fut]
-                        try:
-                            fresh_results[sym] = fut.result()
-                        except Exception as e:  # one DD blowing up must not sink the whole tick
-                            fresh_results[sym] = {"symbol": sym, "decision": "error",
-                                                  "error": f"dd_exception: {e}", "conviction": None,
-                                                  "dollar_amount": None, "reason": "", "catalysts": [],
-                                                  "risks": []}
+                t0_batch = time.time()
+                try:
+                    batch_out = run_dd_batch(fresh_jobs, regime, caps, portfolio, dd_model)
+                except Exception as e:
+                    batch_out = {sym: {"symbol": sym, "decision": "error",
+                                       "error": f"dd_batch_exception: {e}", "conviction": None,
+                                       "dollar_amount": None, "reason": "", "catalysts": [], "risks": []}
+                                 for sym, _ in fresh_jobs}
+                elapsed = round(time.time() - t0_batch, 1)
+                for sym, _ in fresh_jobs:
+                    r = batch_out.get(sym, {"symbol": sym, "decision": "error",
+                                            "error": "missing_from_batch", "conviction": None,
+                                            "dollar_amount": None, "reason": "", "catalysts": [], "risks": []})
+                    fresh_results[sym] = {**r, "dd_elapsed_s": elapsed}
 
         # Reassemble in screen order: cache + persist fresh commits/rejects, then build buy actions.
         for sym, c in shortlist:
@@ -700,7 +878,7 @@ def main() -> int:
                 mfresh = {}
                 workers = min(len(due_ps), int(os.environ.get("DD_MAX_PARALLEL", "4")))
                 with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-                    futs = {ex.submit(run_manage_dd, p, regime, caps, pm, dd_model): p["symbol"]
+                    futs = {ex.submit(run_manage_dd, p, regime, caps, pm, manage_model): p["symbol"]
                             for p in due_ps}
                     for fut in concurrent.futures.as_completed(futs):
                         s = futs[fut]
