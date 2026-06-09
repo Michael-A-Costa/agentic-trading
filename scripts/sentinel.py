@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +38,10 @@ REPO = Path(__file__).resolve().parent.parent
 DATA = REPO / "data"
 STATE_PATH = DATA / "paper_state.json"
 ENGINE_LOG = DATA / "engine-log.jsonl"
+
+# Fire a full planner tick at these minutes past midnight ET on open day, regardless of the
+# 10-min scheduler phase — so we never miss more than 1 minute of the open window.
+FORCE_TICK_MINUTES_ET = {(9, 32), (9, 35), (9, 39)}
 
 
 def exit_actions_from_screen(context: dict) -> list[dict]:
@@ -93,6 +98,14 @@ def main() -> int:
     args = ap.parse_args()
 
     now = datetime.now(timezone.utc)
+    now_et = now.astimezone(tc.mc.ET)
+    if (now_et.hour, now_et.minute) in FORCE_TICK_MINUTES_ET:
+        tick = REPO / "scripts" / "run_paper_tick.sh"
+        subprocess.Popen(["/bin/bash", str(tick)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        print(f"[sentinel] force-tick fired at {now_et.strftime('%H:%M')} ET")
+
     # monitor scope: fetch ONLY held + armed + indexes (no discovery/pins). The sentinel runs exits +
     # armed-trigger checks, never screens new names, so a lean ~12-symbol fetch keeps us under Cboe's
     # per-IP rate limit every minute instead of bursting the full 30-40 universe.

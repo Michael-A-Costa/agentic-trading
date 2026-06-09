@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 import uuid
@@ -42,6 +43,8 @@ STATE = REPO / "data" / "live_state.json"
 LOCK = REPO / "data" / ".tick.lock"
 ENGINE_LOG = REPO / "data" / "engine-log.jsonl"
 ET = ZoneInfo("America/New_York")
+
+FORCE_TICK_MINUTES_ET = {(9, 32), (9, 35), (9, 39)}
 
 # don't re-fire a lot whose sell was already dispatched within this window (lets the planner reconcile
 # book the fill before we'd try again); after it, a still-held + still-breached lot may re-fire.
@@ -62,9 +65,10 @@ def _log(rec: dict) -> None:
 
 
 def _needs_watch(lot: dict) -> bool:
-    """A lot the sentinel must cover: NO live resting broker stop (fractional, or a whole-share lot
-    whose resting stop failed to arm and degraded to synthetic)."""
-    return not lot.get("resting_stop_order_id") and lot.get("stop_type") != "resting"
+    """A lot the sentinel must cover: no ACTUAL resting broker stop order id.
+    stop_type='resting' reflects intent (set at buy time) but the real stop isn't armed until
+    reconcile() confirms the fill next tick — so check the id, not the type."""
+    return not lot.get("resting_stop_order_id")
 
 
 def _breach(sym: str, lot: dict, now_s: float) -> tuple[str, float] | None:
@@ -96,7 +100,14 @@ def main() -> int:
 
     if os.environ.get("TRADING_MODE", "paper") != "live" or not STATE.exists():
         return 0
-    _, is_open = market_conditions.session_state(datetime.now(ET))
+    now_et = datetime.now(ET)
+    _, is_open = market_conditions.session_state(now_et)
+    if (now_et.hour, now_et.minute) in FORCE_TICK_MINUTES_ET and is_open:
+        tick = REPO / "scripts" / "run_live_tick.sh"
+        subprocess.Popen(["/bin/bash", str(tick)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        print(f"[sentinel] force-tick fired at {now_et.strftime('%H:%M')} ET")
     if not is_open:
         return 0  # only act on a fresh regular-hours quote
 
@@ -106,6 +117,13 @@ def main() -> int:
     except (OSError, ValueError):
         return 0
     now_s = time.time()
+    # Heartbeat: write last-run timestamp to a separate file so the user can verify the sentinel
+    # is alive without a breach event — avoids racing with the planner's live_state.json writes.
+    try:
+        hb = REPO / "data" / "sentinel_heartbeat.txt"
+        hb.write_text(datetime.now(timezone.utc).isoformat(timespec="seconds") + "\n")
+    except OSError:
+        pass
     breaches = []  # (sym, reason, last, qty)
     for sym, lot in (state.get("lots") or {}).items():
         if not _needs_watch(lot):
