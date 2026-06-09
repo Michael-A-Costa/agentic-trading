@@ -204,7 +204,7 @@ covers the gap); fractional → **`market`** entry + synthetic engine-tick stop.
 TRADING_MODE=live LIVE_ARMED=0 scripts/run_trading_tick.sh
 tail -n 3 data/engine-log.jsonl     # look for "buy_dryrun" / "DRY-RUN would place"
 
-# 2) ARMED: real orders; first one capped to LIVE_CANARY_USD until a round-trip completes
+# 2) ARMED: real orders, each sized to MAX_POSITION_USD within the exposure/settled-cash caps
 TRADING_MODE=live LIVE_ARMED=1 scripts/run_trading_tick.sh
 ```
 **Gate (no human per-trade approval):** account hard-pinned to `AGENTIC_ACCOUNT` · `review` before

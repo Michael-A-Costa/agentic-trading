@@ -129,8 +129,9 @@ broker; `data/live_state.json` holds only our stop/TP metadata. Whole-share lots
 `limit` entry + resting `stop_market` GTC; fractional → `market` + synthetic stop.
 
 **Live is double-gated:** running `run_live_tick.sh` with `LIVE_ARMED!=1` is a **dry-run**
-(real `review`, logs intended orders, places nothing); `LIVE_ARMED=1` actually places (first
-order capped to `LIVE_CANARY_USD`). **Kill switches** (in order of preference):
+(real `review`, logs intended orders, places nothing); `LIVE_ARMED=1` actually places (every
+entry sized to `MAX_POSITION_USD` within the exposure/settled-cash caps). **Kill switches** (in
+order of preference):
 1. `launchctl unload com.agentic.trading-live.plist` — stops the live scheduler
 2. `LIVE_ARMED=0` in `.env` — arms nothing new (dry-run mode)
 3. Disconnect the Robinhood MCP — blocks all relay calls

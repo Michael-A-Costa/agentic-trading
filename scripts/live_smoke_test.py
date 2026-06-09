@@ -8,7 +8,7 @@ read-back -> cancel plumbing works against the real broker without ever acquirin
 cancels the resting order, leaving the account exactly as it started.
 
 This is the last rung of the safety ladder (see docs/testing-live.md):
-  paper  ->  live dry-run (review only)  ->  THIS unfillable-limit probe  ->  armed canary.
+  paper  ->  live dry-run (review only)  ->  THIS unfillable-limit probe  ->  armed live.
 
 Safety invariants enforced here:
   - the limit is HARD-capped well below the live quote (default 30%); the script REFUSES to place if
