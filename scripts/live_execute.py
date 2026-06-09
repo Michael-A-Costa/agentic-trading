@@ -19,7 +19,6 @@ Safety gate (no human per-trade approval — this IS the seatbelt):
   - account hard-pinned to AGENTIC_ACCOUNT
   - every BUY: review_equity_order -> Python inspects alerts -> place only if clear
   - LIVE_ARMED!=1 => DRY-RUN: review + log "would place", never place
-  - canary: first armed order capped to LIVE_CANARY_USD until one live round-trip completes
   - caps re-checked against fresh broker buying power; daily breaker on broker start-of-day equity
   - ref_id idempotency per logical order
 
@@ -132,10 +131,17 @@ def _unwrap(x):
 
 def order_obj(placed: dict | None) -> dict | None:
     """Extract the order object from a rh_mcp.place result ({"order": <verbatim>, "errors": ...}),
-    peeling the {"data": {...}} envelope. Returns None if the relay errored or shape is unusable."""
+    peeling the {"data": {...}} envelope. Returns None if the relay errored or shape is unusable.
+
+    The relay is non-deterministic about nesting: it sometimes returns the raw tool response
+    ({"order": {"data": {"order": {id, ...}}}}) and sometimes the extracted object ({"order": {id, ...}}).
+    Handle both by peeling up to two layers."""
     if not isinstance(placed, dict):
         return None
     o = _unwrap(placed.get("order", placed))
+    # relay may echo {"order": {...}} with one additional nesting level (raw MCP tool response)
+    if isinstance(o, dict) and "id" not in o and "order_id" not in o and isinstance(o.get("order"), dict):
+        o = o["order"]
     return o if isinstance(o, dict) else None
 
 
@@ -226,31 +232,45 @@ def open_stop_for(orders: list, sym: str) -> dict | None:
     return stops[0] if stops else None
 
 
+def open_nonstop_sells_for(orders: list, sym: str) -> list:
+    """OPEN sell orders for a symbol that are NOT protective stops — i.e. a discretionary/exit limit
+    that hasn't filled. A stranded one holds the shares (blocking a stop re-arm) AND leaves the lot
+    naked to downside while it rests above the market; reconcile() sweeps these before re-arming."""
+    OPEN = {"new", "queued", "confirmed", "unconfirmed", "partially_filled"}
+    out = []
+    for o in orders:
+        osym = (_first(o, "symbol", "ticker") or "").upper().strip()
+        oside = (_first(o, "side") or "").lower()
+        ostate = (_first(o, "state", "status") or "").lower()
+        has_stop = _first(o, "stop_price") is not None or "stop" in (_first(o, "type", "trigger", "order_type") or "").lower()
+        if osym == sym and oside == "sell" and not has_stop and ostate in OPEN:
+            out.append(o)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # PURE order-spec builders + cap checks  (unit-tested; no MCP, no I/O)
 # ---------------------------------------------------------------------------
-def size_entry(dollar_amount: float, quote: dict, caps: dict, *, canary_usd: float | None) -> dict:
+def size_entry(dollar_amount: float, quote: dict, caps: dict) -> dict:
     """Size a BUY as whole shares only (-> marketable limit + real resting broker stop).
 
     Floor to whole shares when the budget covers >=1. If the budget covers < 1 share, round UP
     to exactly 1 share when 1 share fits within the position cap — this overspends the DD's
     conviction sizing by at most 1 share but gets a real resting stop instead of a synthetic one.
     If even 1 share exceeds the cap, return ok=False: the entry is skipped, not degraded to
-    fractional. Honours the canary notional cap when set.
+    fractional.
     """
     ref = quote.get("ask") or quote.get("last") or quote.get("bid")
     if not ref or ref <= 0:
         return {"ok": False, "reject_reason": "no usable quote (ask/last) for sizing"}
     notional = float(dollar_amount)
-    if canary_usd is not None and notional > canary_usd:
-        notional = canary_usd  # first live order is a tiny canary until a round-trip completes
     limit_pct = caps.get("MARKETABLE_LIMIT_PCT", 0.5)
     raw_qty = notional / ref
     if math.floor(raw_qty) >= 1:
         qty = float(math.floor(raw_qty))
     else:
         # Budget is short of 1 share — round up to exactly 1 if it fits within the cap.
-        ceiling = canary_usd if canary_usd is not None else float(caps.get("MAX_POSITION_USD", 0) or 0)
+        ceiling = float(caps.get("MAX_POSITION_USD", 0) or 0)
         if ceiling > 0 and ref <= ceiling:
             qty = 1.0
         else:
@@ -260,8 +280,7 @@ def size_entry(dollar_amount: float, quote: dict, caps: dict, *, canary_usd: flo
     limit_price = round(ref * (1 + limit_pct / 100.0), 2)
     notional = qty * limit_price
     return {"ok": True, "kind": "limit", "qty": qty, "whole": True, "stop_type": "resting",
-            "limit_price": limit_price, "notional": round(notional, 2),
-            "canary_capped": canary_usd is not None and float(dollar_amount) > canary_usd}
+            "limit_price": limit_price, "notional": round(notional, 2)}
 
 
 def check_entry_caps(plan: dict, *, existing_val: float, exposure: float,
@@ -360,16 +379,25 @@ def trail_stop_price(lot: dict, caps: dict, last: float | None) -> tuple[float |
     return desired, hw
 
 
-def sell_spec(sym: str, qty: float, *, whole: bool, quote: dict, caps: dict) -> dict:
-    """Discretionary/exit sell: marketable limit for a whole-share lot, market for a fractional one."""
-    if whole and float(qty) == math.floor(float(qty)):
+def sell_spec(sym: str, qty: float, *, whole: bool, quote: dict, caps: dict, urgent: bool = False) -> dict:
+    """Exit/discretionary sell.
+
+    urgent=True — a protective full-close that REPLACES the resting stop_market (risk-exit, synthetic-
+    stop/TP hit, EOD flatten, max-hold, manage 'exit'). Use a plain MARKET sell: same execution
+    semantics as the stop it stands in for, and — unlike a limit — it CANNOT land non-marketable and
+    rest above a fast-dropping market while the lot sits naked (the bug that stranded a risk-exit limit
+    on ALOY after its protective stop had already been cancelled).
+
+    urgent=False — a partial scale-out / trim. The remaining lot keeps its protection, so favour price:
+    marketable limit for a whole-share slice, market for a fractional one."""
+    if not urgent and whole and float(qty) == math.floor(float(qty)):
         ref = quote.get("bid") or quote.get("last") or quote.get("ask")
         limit_pct = caps.get("MARKETABLE_LIMIT_PCT", 0.5)
         if ref and ref > 0:
             lp = round(ref * (1 - limit_pct / 100.0), 2)
             return {"symbol": sym, "side": "sell", "type": "limit", "quantity": str(int(qty)),
                     "limit_price": f"{lp:.2f}", "time_in_force": "gfd", "market_hours": "regular_hours"}
-    # fractional, or no quote to anchor a limit -> market sell (fractional is market-only anyway)
+    # urgent exit, fractional, or no quote to anchor a limit -> market sell (fractional is market-only anyway)
     q = str(int(qty)) if float(qty) == math.floor(float(qty)) else f"{float(qty):.6f}"
     return {"symbol": sym, "side": "sell", "type": "market", "quantity": q, "market_hours": "regular_hours"}
 
@@ -422,7 +450,7 @@ def load_state() -> dict:
                 pass
             print(f"[live_execute] FATAL: live_state.json unreadable; backed up to {bak.name}", file=sys.stderr)
             raise
-    return {"lots": {}, "day": None, "start_of_day_equity": None, "live_round_trip_done": False}
+    return {"lots": {}, "day": None, "start_of_day_equity": None}
 
 
 # ---------------------------------------------------------------------------
@@ -504,6 +532,16 @@ def reconcile(state: dict, broker: dict, log: list) -> None:
         # arm a resting stop on a whole-share lot that has a confirmed entry but no live stop yet
         if whole and not lot.get("resting_stop_order_id") and lot.get("entry_price"):
             if do_arm:
+                # First clear any stranded prior-tick exit limit: it holds the shares (so the stop-arm
+                # below would reject) AND leaves the lot naked while it rests above the market. Safe to
+                # cancel here — reconcile runs before this tick's sells, so an open non-stop sell can
+                # only be a leftover. If the engine still wants out, this tick re-decides and fires a
+                # fill-certain market exit. (Auto-recovery for the strand that left ALOY unprotected.)
+                for so in open_nonstop_sells_for(orders, sym):
+                    sid = _first(so, "id", "order_id")
+                    if sid:
+                        rh_mcp.cancel(sid)
+                        log.append({"event": "stranded_sell_cancelled", "symbol": sym, "order_id": sid})
                 res = rh_mcp.place(stop_spec(sym, math.floor(bp["qty"]), lot["stop_price"]),
                                    ref_id=str(uuid.uuid4()))
                 o = order_obj(res)
@@ -544,8 +582,7 @@ def reconcile(state: dict, broker: dict, log: list) -> None:
     #       the lot — do NOT book it as a closed position (it was never opened), and do NOT count it
     #       as a round-trip.
     #    b) a position we actually held that's now gone -> a real closure (stop fired / sold while
-    #       asleep). Record the exit; if it was a lot we entered ourselves (not adopted), one full
-    #       live round-trip is now complete, so the canary notional cap can lift.
+    #       asleep). Record the exit.
     for sym in list(lots.keys()):
         if sym not in bpos:
             stale = lots.pop(sym)
@@ -562,8 +599,6 @@ def reconcile(state: dict, broker: dict, log: list) -> None:
             log.append({"event": "closed_external", "symbol": sym,
                         "note": "position gone from broker — resting stop fired or sold while engine asleep",
                         "had_stop": stale.get("resting_stop_order_id")})
-            if not stale.get("adopted"):
-                state["live_round_trip_done"] = True
 
 
 def execute_sell(sym: str, action: dict, state: dict, broker: dict, caps: dict, log: list) -> dict:
@@ -582,19 +617,25 @@ def execute_sell(sym: str, action: dict, state: dict, broker: dict, caps: dict, 
         res["reject_reason"] = "non-positive sell qty"
         return res
     whole = float(qty) == math.floor(float(qty)) and qty >= 1
-    spec = sell_spec(sym, qty, whole=whole, quote=broker["quotes"].get(sym, {}), caps=caps)
-    res.update(order_spec=spec, qty=qty)
+    # A FULL close (no explicit qty) is a protective/decisive exit that gives up the resting stop ->
+    # fill-certain MARKET sell so it can't strand as a resting limit while the lot sits naked. A partial
+    # (scale-out / trim, qty set) leaves the lot protected, so it keeps the price-protected limit.
+    urgent = action.get("qty") is None
+    spec = sell_spec(sym, qty, whole=whole, quote=broker["quotes"].get(sym, {}), caps=caps, urgent=urgent)
+    res.update(order_spec=spec, qty=qty, urgent=urgent)
 
     if not armed():
         res["status"] = "dryrun"
-        log.append({"event": "sell_dryrun", "symbol": sym, "spec": spec,
+        log.append({"event": "sell_dryrun", "symbol": sym, "spec": spec, "urgent": urgent,
                     "cancel_stop": lot.get("resting_stop_order_id")})
         return res
-    # cancel resting stop first so the shares are free to sell
-    if lot.get("resting_stop_order_id"):
-        c = rh_mcp.cancel(lot["resting_stop_order_id"])
-        log.append({"event": "cancel_stop", "symbol": sym, "order_id": lot["resting_stop_order_id"],
-                    "result": c})
+    # cancel resting stop first so the shares are free to sell. Remember it: if the sell place FAILS we
+    # must RE-ARM, never leave a whole-share lot naked because we dropped the stop for a sell that died.
+    had_stop_id = lot.get("resting_stop_order_id")
+    had_stop_price = _f(lot.get("stop_price"))
+    if had_stop_id:
+        c = rh_mcp.cancel(had_stop_id)
+        log.append({"event": "cancel_stop", "symbol": sym, "order_id": had_stop_id, "result": c})
         lot["resting_stop_order_id"] = None
     ref_id = str(uuid.uuid4())
     placed = rh_mcp.place(spec, ref_id=ref_id)
@@ -603,6 +644,19 @@ def execute_sell(sym: str, action: dict, state: dict, broker: dict, caps: dict, 
     if not order_id or (isinstance(placed, dict) and placed.get("errors")):
         res.update(status="failed", ref_id=ref_id, reject_reason=f"sell rejected/failed: {placed}", order=placed)
         log.append({"event": "sell_failed", "symbol": sym, "spec": spec, "ref_id": ref_id, "result": placed})
+        # the sell didn't take -> re-arm the protective stop we just cancelled (whole-share lots only;
+        # fractional lots never had a resting stop). Leaves the lot protected for the next tick.
+        if had_stop_id and whole and had_stop_price:
+            rid = str(uuid.uuid4())
+            rearm = rh_mcp.place(stop_spec(sym, math.floor(qty), had_stop_price), ref_id=rid)
+            ro = order_obj(rearm)
+            roid = _first(ro, "id", "order_id") if isinstance(ro, dict) else None
+            lot["resting_stop_order_id"] = roid
+            lot["stop_type"] = "resting" if roid else "synthetic"
+            res["stop_rearmed"] = bool(roid)
+            log.append({"event": "stop_rearmed_after_failed_sell" if roid else "stop_rearm_failed",
+                        "symbol": sym, "stop_price": had_stop_price, "ref_id": rid,
+                        "order_id": roid, "result": None if roid else rearm})
         return res
     res.update(status="placed", ref_id=ref_id, order_id=order_id, order=placed)
     log.append({"event": "sell_placed", "symbol": sym, "spec": spec, "ref_id": ref_id,
@@ -645,10 +699,7 @@ def execute_buy(sym: str, action: dict, state: dict, broker: dict, caps: dict,
     if dollar is None:
         res["reject_reason"] = "buy action without dollar_amount"
         return res
-    canary = None
-    if armed() and not state.get("live_round_trip_done"):
-        canary = float(os.environ.get("LIVE_CANARY_USD", "20"))
-    plan = size_entry(float(dollar), quote, caps, canary_usd=canary)
+    plan = size_entry(float(dollar), quote, caps)
     if not plan.get("ok"):
         res["reject_reason"] = plan.get("reject_reason")
         return res
@@ -710,6 +761,53 @@ def execute_buy(sym: str, action: dict, state: dict, broker: dict, caps: dict,
     log.append({"event": "buy_placed", "symbol": sym, "spec": spec, "ref_id": ref_id,
                 "order_id": order_id, "plan": plan, "order": placed})
     return res
+
+
+def _parallel_orders_on() -> bool:
+    """Whether to run this tick's order relays (sells AND entries) concurrently. Defaults ON.
+    LIVE_PARALLEL_ORDERS is the master knob; falls back to the older LIVE_PARALLEL_ENTRIES so an
+    existing opt-out still serializes everything."""
+    v = os.environ.get("LIVE_PARALLEL_ORDERS", os.environ.get("LIVE_PARALLEL_ENTRIES", "1"))
+    return str(v).strip().lower() not in ("0", "false", "no", "")
+
+
+def _order_workers() -> int:
+    """Max concurrent order-relay subprocesses. LIVE_ORDER_WORKERS, falling back to LIVE_ENTRY_WORKERS."""
+    v = os.environ.get("LIVE_ORDER_WORKERS", os.environ.get("LIVE_ENTRY_WORKERS", "5"))
+    try:
+        return max(1, int(v))
+    except (TypeError, ValueError):
+        return 5
+
+
+def _run_relays_parallel(jobs: list, side: str) -> list:
+    """Run independent order-relay thunks concurrently and collect their result dicts.
+
+    Each `claude` relay is a ~30-50s I/O-bound subprocess; serializing N of them adds their runtimes
+    (a 5-order phase = minutes of dead wall-clock). A thread pool overlaps the waits — total time
+    ~= the slowest single relay. Tokens are UNAFFECTED: each relay is its own subprocess with its own
+    prompt, so N calls cost the same whether serial or parallel (parallel may even cache marginally
+    better). `jobs` is [(symbol, thunk)]; a thunk that raises becomes a 'failed' result rather than
+    sinking the batch. Falls back to serial for <2 jobs or when parallelism is switched off."""
+    results: list = []
+    workers = min(len(jobs), _order_workers()) if _parallel_orders_on() else 1
+    if workers > 1 and len(jobs) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(thunk): sym for sym, thunk in jobs}
+            for fut in concurrent.futures.as_completed(futs):
+                try:
+                    results.append(fut.result())
+                except Exception as e:  # noqa: BLE001 — one bad relay must not sink the rest
+                    results.append({"symbol": futs[fut], "side": side, "status": "failed",
+                                    "reject_reason": f"{side}_exception: {e}"})
+    else:
+        for sym, thunk in jobs:
+            try:
+                results.append(thunk())
+            except Exception as e:  # noqa: BLE001
+                results.append({"symbol": sym, "side": side, "status": "failed",
+                                "reject_reason": f"{side}_exception: {e}"})
+    return results
 
 
 def main() -> int:
@@ -776,20 +874,30 @@ def main() -> int:
     if not args.skip and args.decision:
         decision = load_json(Path(args.decision))
         actions = decision.get("actions", [])
-        # sells first (free up shares / honour exits), then buys
-        for a in [x for x in actions if str(x.get("side")).lower() == "sell"]:
-            r = execute_sell(str(a.get("symbol", "")).upper(), a, state, broker, caps, log)
-            results.append(r)
-            # Record sale proceeds as UNSETTLED (T+1) so a later tick can't redeploy them into a buy
-            # and trip a Good-Faith Violation. Proceeds estimated at the sell-reference price.
-            if r.get("status") == "placed" and gfv_guard_on():
-                qd = broker["quotes"].get(r["symbol"], {})
-                px = qd.get("bid") or qd.get("last") or qd.get("ask") or 0.0
-                proceeds = round((_f(r.get("qty"), 0.0) or 0.0) * px, 2)
-                if proceeds > 0:
-                    state.setdefault("unsettled", []).append(
-                        {"settle_date": next_settle_date(today), "amount": proceeds,
-                         "symbol": r["symbol"], "sold_ts": now.isoformat(timespec="seconds")})
+        # sells first (free up shares / honour exits), then buys. Exits are independent I/O-bound
+        # relays (cancel resting stop + place sell), so run them CONCURRENTLY — same as entries below.
+        # Serial exits added each relay's ~30-50s end-to-end; parallel collapses the phase to roughly
+        # one relay. No token cost: each relay is its own subprocess, so N exits cost the same either
+        # way — only wall-clock shrinks.
+        sell_actions = [x for x in actions if str(x.get("side")).lower() == "sell"]
+        if sell_actions:
+            sell_jobs = [(str(a.get("symbol", "")).upper(),
+                          (lambda s=str(a.get("symbol", "")).upper(), act=a:
+                           execute_sell(s, act, state, broker, caps, log)))
+                         for a in sell_actions]
+            for r in _run_relays_parallel(sell_jobs, side="sell"):
+                results.append(r)
+                # Record sale proceeds as UNSETTLED (T+1) so a later tick can't redeploy them into a
+                # buy and trip a Good-Faith Violation. Done HERE (post-relay, single-threaded) so the
+                # unsettled ledger is mutated without races. Proceeds estimated at the sell-ref price.
+                if r.get("status") == "placed" and gfv_guard_on():
+                    qd = broker["quotes"].get(r["symbol"], {})
+                    px = qd.get("bid") or qd.get("last") or qd.get("ask") or 0.0
+                    proceeds = round((_f(r.get("qty"), 0.0) or 0.0) * px, 2)
+                    if proceeds > 0:
+                        state.setdefault("unsettled", []).append(
+                            {"settle_date": next_settle_date(today), "amount": proceeds,
+                             "symbol": r["symbol"], "sold_ts": now.isoformat(timespec="seconds")})
         # Backfill quotes for entry candidates BEFORE sizing. broker_snapshot only quotes the
         # CANDIDATES pins + indexes (it runs before decide, so it can't know the day's movers), so
         # size_entry would reject every discovery name with "no usable quote". Pull any missing buy
@@ -851,11 +959,9 @@ def main() -> int:
 
         # Bound the entry COUNT by available headroom so the PARALLEL entries can't collectively breach
         # the caps (each runs against the same pre-tick snapshot, blind to the others' fills). Even if
-        # every slot fills at the per-entry ceiling (the canary while active, else MAX_POSITION_USD),
-        # the total stays within settled cash AND the exposure cap. Replaces the old serial cumulative
-        # guard; execute_buy still re-checks each entry against the snapshot (belt and suspenders).
-        ceil = (float(os.environ.get("LIVE_CANARY_USD", "20")) if (armed() and not state.get("live_round_trip_done"))
-                else float(caps.get("MAX_POSITION_USD", 0) or 0)) or 1.0
+        # every slot fills at MAX_POSITION_USD ceiling; the total stays within settled cash AND the
+        # exposure cap. execute_buy still re-checks each entry against the snapshot (belt+suspenders).
+        ceil = float(caps.get("MAX_POSITION_USD", 0) or 0) or 1.0
         exp_headroom = max(0.0, float(caps.get("MAX_TOTAL_EXPOSURE_USD", 0.0)) - exposure)
         headroom_slots = int(min(settled_bp, exp_headroom) // ceil)
         slots = max(0, min(max_entries, headroom_slots, len(ready)))
@@ -863,29 +969,16 @@ def main() -> int:
             results.append({"symbol": sym, "side": "buy", "status": "skipped",
                             "reject_reason": f"deferred — slots used (max_entries={max_entries}, headroom_slots={headroom_slots})"})
 
-        # Run the slot entries' review+place relays in PARALLEL (independent I/O-bound cold-start spawns).
+        # Run the slot entries' review+place relays in PARALLEL (independent I/O-bound cold-start
+        # spawns) — same machinery and knob as the exits above (LIVE_PARALLEL_ORDERS / _WORKERS).
         to_run = ready[:slots]
         if to_run:
             npos = len(broker["positions"])
-            do_parallel = str(os.environ.get("LIVE_PARALLEL_ENTRIES", "1")).strip().lower() not in ("0", "false", "no", "")
-            workers = min(len(to_run), int(os.environ.get("LIVE_ENTRY_WORKERS", "5"))) if do_parallel else 1
-            if workers > 1:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-                    futs = {ex.submit(execute_buy, s, act, state, broker, caps, exposure, settled_bp, npos, day_pnl, log): s
-                            for s, act in to_run}
-                    for fut in concurrent.futures.as_completed(futs):
-                        try:
-                            results.append(fut.result())
-                        except Exception as e:
-                            results.append({"symbol": futs[fut], "side": "buy", "status": "failed",
-                                            "reject_reason": f"entry_exception: {e}"})
-            else:
-                for s, act in to_run:
-                    results.append(execute_buy(s, act, state, broker, caps, exposure, settled_bp, npos, day_pnl, log))
+            buy_jobs = [(s, (lambda s=s, act=act:
+                            execute_buy(s, act, state, broker, caps, exposure, settled_bp, npos, day_pnl, log)))
+                        for s, act in to_run]
+            results.extend(_run_relays_parallel(buy_jobs, side="buy"))
 
-    # NOTE: the canary round-trip flag (state["live_round_trip_done"]) is now set in reconcile() when
-    # a lot we entered actually closes — NOT on a placed buy. The cap must survive until a real
-    # entry->exit cycle completes, not lift the moment the first order fills.
     state.pop("_caps", None)
     write_json_atomic(STATE_PATH, state)
 
@@ -902,12 +995,14 @@ def main() -> int:
         "positions": broker["positions"],
         "relay_token_usage": usage_summary(),  # broker-I/O spend this tick (quotes/review/place/cancel)
     }
+    dd_usage: dict = {}
     if not args.skip and args.decision:
         d = load_json(Path(args.decision))
         if d.get("screen"):
             record["screen"] = d["screen"]
         if d.get("dd"):
             record["dd"] = d["dd"]
+        dd_usage = d.get("token_usage") or {}  # Stage-2 DD/manage spend, folded into the tick total below
     ENGINE_LOG.parent.mkdir(parents=True, exist_ok=True)
     with ENGINE_LOG.open("a") as f:
         f.write(json.dumps(record) + "\n")
@@ -926,6 +1021,12 @@ def main() -> int:
     if rtu.get("n_calls"):
         print(f"RELAY-TOKENS: {rtu['n_calls']} call(s), {rtu['total_tokens']:,} tok "
               f"(out {rtu['output_tokens']:,}) ~${rtu['cost_usd']:.4f}  [model={os.environ.get('RH_RELAY_MODEL', os.environ.get('RH_PLACE_MODEL', 'claude-haiku-4-5-20251001'))}]")
+    # Grand-total LLM spend for the whole tick: Stage-2 DD/manage (decide.py) + broker relay (here).
+    dd_cost, dd_calls = float(dd_usage.get("cost_usd") or 0.0), int(dd_usage.get("n_calls") or 0)
+    relay_cost, relay_calls = float(rtu.get("cost_usd") or 0.0), int(rtu.get("n_calls") or 0)
+    if dd_calls or relay_calls:
+        print(f"TICK COST: ${dd_cost + relay_cost:.4f} over {dd_calls + relay_calls} call(s) "
+              f"(dd ${dd_cost:.4f} · relay ${relay_cost:.4f})")
     return 0
 
 
