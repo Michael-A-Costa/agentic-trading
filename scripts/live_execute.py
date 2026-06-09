@@ -184,6 +184,14 @@ def parse_snapshot(snap: dict) -> dict:
     # buying_power, and pending_deposits. We exclude pending (un-cleared ACH) from deployable funds and
     # self-track unsettled SALE proceeds (see settled_buying_power) to avoid Good-Faith Violations.
     pending_deposits = _f(_first(pf, "pending_deposits"), 0.0) or 0.0
+    # Total cash balance — the NAV/equity cash leg. DISTINCT from buying_power: in a cash account
+    # buying_power excludes unsettled sale proceeds (and pending deposits), so buying_power < cash
+    # whenever a recent sell hasn't settled. Equity/day-P&L must use the FULL cash (= broker total_value
+    # cash leg); buying_power is only for what we can SPEND. Conflating them understated equity by the
+    # unsettled amount and manufactured a phantom intraday loss. Falls back to buying_power if absent.
+    cash = _f(_first(pf, "cash", "cash_balance"), None)
+    if cash is None:
+        cash = buying_power
 
     raw_pos = _unwrap(snap.get("positions") or {})
     if isinstance(raw_pos, dict):
@@ -206,7 +214,7 @@ def parse_snapshot(snap: dict) -> dict:
     if isinstance(raw_o, dict):
         raw_o = raw_o.get("orders") or raw_o.get("results") or []
     orders = [o for o in (raw_o or []) if isinstance(o, dict)]
-    return {"buying_power": buying_power, "positions": positions, "quotes": quotes, "orders": orders,
+    return {"buying_power": buying_power, "cash": cash, "positions": positions, "quotes": quotes, "orders": orders,
             "pending_deposits": pending_deposits}
 
 
@@ -853,7 +861,11 @@ def main() -> int:
     today = context.get("ts_et", "")[:10]
     exposure = sum((p["qty"] * (broker["quotes"].get(s, {}).get("last") or p.get("avg_cost") or 0.0))
                    for s, p in broker["positions"].items())
-    equity = round(broker["buying_power"] + exposure, 2)
+    # Equity = FULL cash + marked exposure (≈ broker total_value). Use cash, NOT buying_power: in a
+    # cash account buying_power excludes unsettled sale proceeds, so using it here understated equity
+    # by the unsettled amount and showed a phantom intraday loss. SOD-equity below uses this same
+    # formula, so day_pnl stays internally consistent — it just no longer drifts with settlement timing.
+    equity = round(broker["cash"] + exposure, 2)
     if state.get("day") != today or state.get("start_of_day_equity") is None:
         state["day"] = today
         state["start_of_day_equity"] = equity

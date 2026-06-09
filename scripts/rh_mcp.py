@@ -127,7 +127,13 @@ def snapshot(symbols: list[str] | None = None) -> dict | None:
     syms = sorted({s.upper().strip() for s in (symbols or []) if s and s.strip()})
     steps = [f"1. get_portfolio(account_number=\"{acct}\")",
              f"2. get_equity_positions(account_number=\"{acct}\")",
-             f"3. get_equity_orders(account_number=\"{acct}\", placed_agent=\"agentic\")"]
+             # state="confirmed" returns ONLY live resting orders (the GTC protective stops) instead
+             # of the full agentic ledger. The snapshot's orders are consumed only by open_stops_for,
+             # which discards every filled/cancelled/rejected row anyway — echoing the whole history
+             # verbatim was the dominant relay cost (~130k tok / ~160s) AND, since only the first
+             # newest-first page is fetched, recent fill/cancel churn could push an old resting stop
+             # off the page, hiding it from open_stops_for and triggering a duplicate stop re-arm.
+             f"3. get_equity_orders(account_number=\"{acct}\", placed_agent=\"agentic\", state=\"confirmed\")"]
     shape = ('{"portfolio": <result of step 1>, "positions": <result of step 2>, '
              '"orders": <result of step 3>, "errors": {}}')
     if syms:  # optional: only when a caller explicitly wants broker-side marks
