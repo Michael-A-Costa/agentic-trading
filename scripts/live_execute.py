@@ -38,6 +38,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import live_snapshot  # shared portfolio/positions parser (same source as the live gate)
 import trade_log  # shared trade-history writer (paper + live)
 
 REPO = Path(__file__).resolve().parent.parent
@@ -164,58 +165,25 @@ def _parse_quotes(raw_q) -> dict:
 
 
 def parse_snapshot(snap: dict) -> dict:
-    """Normalise the raw broker blobs into {buying_power, positions{sym:{qty,avg_cost}}, quotes, orders}.
+    """Normalise the raw broker blobs into {buying_power, cash, positions{sym:{qty,avg_cost,sellable}},
+    quotes, orders, pending_deposits}.
 
-    Field shapes confirmed against live MCP output 2026-06-04:
-      get_portfolio       -> data.buying_power.buying_power (nested!) / data.cash
-      get_equity_positions-> data.positions[].{quantity, average_buy_price, shares_available_for_sells}
+    Portfolio (cash/buying_power) + positions parsing is delegated to live_snapshot so it CANNOT drift
+    from the live gate (live_tick_context) — that drift once understated equity and tripped the breaker.
+    Quotes/orders stay here (the executor is their only consumer). Field shapes confirmed 2026-06-04:
       get_equity_quotes   -> data.results[].quote.{bid_price, ask_price, last_trade_price, last_non_reg_trade_price}
       get_equity_orders   -> data.orders[].{id, symbol, side, type, state, stop_price, ...}
     """
-    pf = _unwrap(snap.get("portfolio") or {})
-    bp = pf.get("buying_power") if isinstance(pf, dict) else None
-    if isinstance(bp, dict):  # nested {"buying_power": "1064.0000", "unleveraged_buying_power": ...}
-        buying_power = _f(_first(bp, "buying_power", "unleveraged_buying_power"), None)
-    else:
-        buying_power = _f(bp, None)
-    if buying_power is None:
-        buying_power = _f(_first(pf, "cash", "buying_power_usd", "cash_available_for_trading"), 0.0)
-    # Cash account: the broker exposes NO settled/unsettled split (confirmed 2026-06-08) — only cash,
-    # buying_power, and pending_deposits. We exclude pending (un-cleared ACH) from deployable funds and
-    # self-track unsettled SALE proceeds (see settled_buying_power) to avoid Good-Faith Violations.
-    pending_deposits = _f(_first(pf, "pending_deposits"), 0.0) or 0.0
-    # Total cash balance — the NAV/equity cash leg. DISTINCT from buying_power: in a cash account
-    # buying_power excludes unsettled sale proceeds (and pending deposits), so buying_power < cash
-    # whenever a recent sell hasn't settled. Equity/day-P&L must use the FULL cash (= broker total_value
-    # cash leg); buying_power is only for what we can SPEND. Conflating them understated equity by the
-    # unsettled amount and manufactured a phantom intraday loss. Falls back to buying_power if absent.
-    cash = _f(_first(pf, "cash", "cash_balance"), None)
-    if cash is None:
-        cash = buying_power
-
-    raw_pos = _unwrap(snap.get("positions") or {})
-    if isinstance(raw_pos, dict):
-        raw_pos = raw_pos.get("positions") or raw_pos.get("results") or []
-    positions: dict[str, dict] = {}
-    for p in raw_pos or []:
-        if not isinstance(p, dict):
-            continue
-        sym = (_first(p, "symbol", "ticker", "instrument_symbol") or "").upper().strip()
-        qty = _f(_first(p, "quantity", "qty", "shares"), 0.0) or 0.0
-        if not sym or qty <= 0:
-            continue
-        avg = _f(_first(p, "average_buy_price", "average_price", "cost_basis_per_share", "avg_cost"), None)
-        sellable = _f(_first(p, "shares_available_for_sells"), qty)
-        positions[sym] = {"qty": qty, "avg_cost": avg, "sellable": sellable}
-
+    port = live_snapshot.parse_portfolio(snap)
+    positions = live_snapshot.parse_positions(snap)
     quotes = _parse_quotes(snap.get("quotes"))
 
     raw_o = _unwrap(snap.get("orders") or {})
     if isinstance(raw_o, dict):
         raw_o = raw_o.get("orders") or raw_o.get("results") or []
     orders = [o for o in (raw_o or []) if isinstance(o, dict)]
-    return {"buying_power": buying_power, "cash": cash, "positions": positions, "quotes": quotes, "orders": orders,
-            "pending_deposits": pending_deposits}
+    return {"buying_power": port["buying_power"], "cash": port["cash"], "positions": positions,
+            "quotes": quotes, "orders": orders, "pending_deposits": port["pending_deposits"]}
 
 
 def open_stops_for(orders: list, sym: str) -> list:

@@ -501,6 +501,177 @@ def test_reconcile_cancels_stranded_sell_then_arms():
             sys.modules.pop("rh_mcp", None)
 
 
+def _fake_rh(place_fn, recent_fn=None):
+    """Build a fake rh_mcp module for execute_buy tests: review always clear, place delegates to
+    place_fn, recent_orders to recent_fn (default: empty)."""
+    import types
+    fake = types.ModuleType("rh_mcp")
+    fake.review = lambda spec: {"review": {"data": {"order_checks": {}}}, "errors": {}}
+    fake.place = place_fn
+    fake.recent_orders = recent_fn or (lambda sym, created_at_gte=None: {"orders": {"data": {"orders": []}}, "errors": {}})
+    return fake
+
+
+def test_execute_buy_arms_stop_in_tick():
+    """The core guarantee: a filled whole-share BUY arms a resting stop_market IN THE SAME TICK (not
+    10 min later at the next reconcile). The stop is sized off the REAL average fill price."""
+    calls = {"place": []}
+
+    def _place(spec, ref_id):
+        calls["place"].append(spec)
+        if spec["side"] == "buy":  # echo back a FILLED buy (avg 50.05, 5 shares)
+            return {"order": {"data": {"id": "buy1", "state": "filled",
+                    "cumulative_quantity": "5.000000", "average_price": "50.05"}}, "errors": {}}
+        return {"order": {"data": {"id": "stop1"}}, "errors": {}}  # the resting stop
+    saved = sys.modules.get("rh_mcp")
+    sys.modules["rh_mcp"] = _fake_rh(_place)
+    os.environ["LIVE_ARMED"] = "1"
+    try:
+        state = {"lots": {}}
+        broker = {"positions": {}, "quotes": {"ABC": {"ask": 50.0, "last": 49.9, "bid": 49.8}}}
+        res = le.execute_buy("ABC", {"dollar_amount": 250, "reason": "x"}, state, broker, CAPS,
+                             exposure=0.0, buying_power=1000.0, n_positions=2, day_pnl=0.0, log=(log := []))
+        lot = state["lots"]["ABC"]
+        check("buy placed", res["status"] == "placed", res)
+        stops = [s for s in calls["place"] if s["type"] == "stop_market"]
+        check("a resting stop_market was armed in-tick", len(stops) == 1, calls)
+        # STOP_LOSS_PCT 4% off the real 50.05 fill -> 48.05, whole 5 shares, GTC
+        check("stop sized off real fill (50.05*0.96=48.05)", stops[0]["stop_price"] == "48.05", stops)
+        check("stop is whole-share GTC", stops[0]["quantity"] == "5" and stops[0]["time_in_force"] == "gtc", stops)
+        check("lot holds the resting stop id", lot["resting_stop_order_id"] == "stop1", lot)
+        check("lot is resting, not naked", lot["stop_type"] == "resting", lot)
+        check("lot no longer pending after in-tick fill", lot.get("pending") is False, lot)
+        check("lot entry price = real fill", lot["entry_price"] == 50.05, lot)
+        check("result flags stop armed", res.get("stop_armed") is True, res)
+        check("logged arm_stop_on_entry", any(e["event"] == "arm_stop_on_entry" for e in log), log)
+    finally:
+        os.environ.pop("LIVE_ARMED", None)
+        sys.modules["rh_mcp"] = saved if saved is not None else sys.modules.pop("rh_mcp", None)
+
+
+def test_execute_buy_rereads_fill_then_arms():
+    """If the place echo is pre-fill (state=confirmed, cum=0) — the normal case for a marketable limit
+    — execute_buy re-reads the order from broker truth, sees the fill, and arms the stop off it."""
+    calls = {"place": []}
+
+    def _place(spec, ref_id):
+        calls["place"].append(spec)
+        if spec["side"] == "buy":  # submission echo: not yet filled
+            return {"order": {"data": {"id": "buy2", "state": "confirmed",
+                    "cumulative_quantity": "0.000000", "average_price": None}}, "errors": {}}
+        return {"order": {"data": {"id": "stop2"}}, "errors": {}}
+
+    def _recent(sym, created_at_gte=None):  # broker truth: the buy has since filled
+        return {"orders": {"data": {"orders": [
+            {"id": "buy2", "symbol": sym, "side": "buy", "state": "filled",
+             "cumulative_quantity": "5.000000", "average_price": "50.10"}]}}, "errors": {}}
+    saved = sys.modules.get("rh_mcp")
+    sys.modules["rh_mcp"] = _fake_rh(_place, _recent)
+    os.environ["LIVE_ARMED"] = "1"
+    try:
+        state = {"lots": {}}
+        broker = {"positions": {}, "quotes": {"ABC": {"ask": 50.0, "last": 49.9, "bid": 49.8}}}
+        res = le.execute_buy("ABC", {"dollar_amount": 250, "reason": "x"}, state, broker, CAPS,
+                             exposure=0.0, buying_power=1000.0, n_positions=2, day_pnl=0.0, log=(log := []))
+        lot = state["lots"]["ABC"]
+        stops = [s for s in calls["place"] if s["type"] == "stop_market"]
+        check("stop armed after broker re-read", len(stops) == 1, calls)
+        check("stop sized off re-read fill (50.10*0.96=48.10)", stops[0]["stop_price"] == "48.10", stops)
+        check("lot resting after re-read", lot["resting_stop_order_id"] == "stop2" and lot["stop_type"] == "resting", lot)
+        check("stop_armed flag set", res.get("stop_armed") is True, res)
+    finally:
+        os.environ.pop("LIVE_ARMED", None)
+        sys.modules["rh_mcp"] = saved if saved is not None else sys.modules.pop("rh_mcp", None)
+
+
+def test_execute_buy_unfilled_stays_pending():
+    """If the buy isn't confirmed filled in-tick (echo AND re-read show 0 filled), no stop is placed,
+    the lot stays pending, and reconcile remains the backstop — no naked stop attempt on 0 shares."""
+    calls = {"place": []}
+
+    def _place(spec, ref_id):
+        calls["place"].append(spec)
+        return {"order": {"data": {"id": "buy3", "state": "confirmed",
+                "cumulative_quantity": "0.000000", "average_price": None}}, "errors": {}}
+
+    def _recent(sym, created_at_gte=None):  # still unfilled on re-read
+        return {"orders": {"data": {"orders": [
+            {"id": "buy3", "symbol": sym, "side": "buy", "state": "confirmed",
+             "cumulative_quantity": "0.000000", "average_price": None}]}}, "errors": {}}
+    saved = sys.modules.get("rh_mcp")
+    sys.modules["rh_mcp"] = _fake_rh(_place, _recent)
+    os.environ["LIVE_ARMED"] = "1"
+    try:
+        state = {"lots": {}}
+        broker = {"positions": {}, "quotes": {"ABC": {"ask": 50.0, "last": 49.9, "bid": 49.8}}}
+        res = le.execute_buy("ABC", {"dollar_amount": 250, "reason": "x"}, state, broker, CAPS,
+                             exposure=0.0, buying_power=1000.0, n_positions=2, day_pnl=0.0, log=(log := []))
+        lot = state["lots"]["ABC"]
+        check("no stop placed on an unfilled entry", not any(s["type"] == "stop_market" for s in calls["place"]), calls)
+        check("lot stays pending", lot.get("pending") is True, lot)
+        check("no resting stop id yet", lot.get("resting_stop_order_id") is None, lot)
+        check("stop_armed flag is False", res.get("stop_armed") is False, res)
+    finally:
+        os.environ.pop("LIVE_ARMED", None)
+        sys.modules["rh_mcp"] = saved if saved is not None else sys.modules.pop("rh_mcp", None)
+
+
+def test_execute_buy_synthetic_when_stop_arm_fails():
+    """Fill confirmed but the stop place fails -> the lot is NOT left bare: stop_price + qty are set
+    (so the 1-min sentinel covers it) and stop_type degrades to synthetic for reconcile to re-arm."""
+    calls = {"place": []}
+
+    def _place(spec, ref_id):
+        calls["place"].append(spec)
+        if spec["side"] == "buy":
+            return {"order": {"data": {"id": "buy4", "state": "filled",
+                    "cumulative_quantity": "5.000000", "average_price": "50.05"}}, "errors": {}}
+        return {"order": None, "errors": {"detail": "stop rejected"}}  # the stop arm FAILS
+    saved = sys.modules.get("rh_mcp")
+    sys.modules["rh_mcp"] = _fake_rh(_place)
+    os.environ["LIVE_ARMED"] = "1"
+    try:
+        state = {"lots": {}}
+        broker = {"positions": {}, "quotes": {"ABC": {"ask": 50.0, "last": 49.9, "bid": 49.8}}}
+        res = le.execute_buy("ABC", {"dollar_amount": 250, "reason": "x"}, state, broker, CAPS,
+                             exposure=0.0, buying_power=1000.0, n_positions=2, day_pnl=0.0, log=(log := []))
+        lot = state["lots"]["ABC"]
+        check("stop arm was attempted", any(s["type"] == "stop_market" for s in calls["place"]), calls)
+        check("no resting id after failed arm", lot.get("resting_stop_order_id") is None, lot)
+        check("degraded to synthetic (sentinel-coverable)", lot["stop_type"] == "synthetic", lot)
+        check("synthetic stop level set", lot["stop_price"] == 48.05, lot)
+        check("qty set so sentinel can watch", lot["qty"] == 5.0, lot)
+        check("logged arm_stop_on_entry_failed", any(e["event"] == "arm_stop_on_entry_failed" for e in log), log)
+    finally:
+        os.environ.pop("LIVE_ARMED", None)
+        sys.modules["rh_mcp"] = saved if saved is not None else sys.modules.pop("rh_mcp", None)
+
+
+def test_live_snapshot_shared_cash_parse():
+    """Regression for the breaker bug: cash (full NAV leg) and buying_power (spendable) are DISTINCT on
+    a cash account, and the executor + gate now parse them from the ONE shared module so they can't
+    drift apart again."""
+    import live_snapshot as ls
+    snap = {"portfolio": {"data": {"cash": "1086.39",
+            "buying_power": {"buying_power": "930.78", "unleveraged_buying_power": "930.78"},
+            "pending_deposits": "0"}},
+            "positions": {"data": {"positions": [
+                {"symbol": "ABC", "quantity": "5", "average_buy_price": "50.05",
+                 "shares_available_for_sells": "5"}]}}}
+    port = ls.parse_portfolio(snap)
+    check("buying_power = spendable leg", port["buying_power"] == 930.78, port)
+    check("cash = FULL balance, not buying_power", port["cash"] == 1086.39, port)
+    check("cash != buying_power (the breaker bug conflated them)", port["cash"] != port["buying_power"], port)
+    # the executor's parse_snapshot must surface the SAME cash/bp (shared parser -> can't drift from gate)
+    b = le.parse_snapshot(snap)
+    check("executor parse_snapshot uses shared cash", b["cash"] == 1086.39, b)
+    check("executor parse_snapshot uses shared buying_power", b["buying_power"] == 930.78, b)
+    check("shared position parse", ls.parse_positions(snap)["ABC"]["qty"] == 5.0, ls.parse_positions(snap))
+    # cash falls back to buying_power when the broker omits the cash field
+    port2 = ls.parse_portfolio({"portfolio": {"data": {"buying_power": {"buying_power": "500"}}}})
+    check("cash falls back to buying_power when absent", port2["cash"] == 500.0 and port2["buying_power"] == 500.0, port2)
+
+
 if __name__ == "__main__":
     tests = [test_whole_share_entry, test_rounds_up_to_one_share, test_one_share_over_cap_rejects,
              test_cap_rejects, test_sell_specs, test_review_gating, test_snapshot_parse_real_shapes,
@@ -515,7 +686,10 @@ if __name__ == "__main__":
              test_reconcile_trails_resting_stop, test_reconcile_trail_dryrun_places_nothing,
              test_run_relays_parallel_overlaps_and_isolates,
              test_execute_sell_full_close_is_market, test_execute_sell_rearms_stop_on_failed_sell,
-             test_reconcile_cancels_stranded_sell_then_arms]
+             test_reconcile_cancels_stranded_sell_then_arms,
+             test_execute_buy_arms_stop_in_tick, test_execute_buy_rereads_fill_then_arms,
+             test_execute_buy_unfilled_stays_pending, test_execute_buy_synthetic_when_stop_arm_fails,
+             test_live_snapshot_shared_cash_parse]
     for fn in tests:
         fn()
     print(f"OK — {_passed} assertions passed across {len(tests)} tests")
