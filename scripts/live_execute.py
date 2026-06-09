@@ -696,6 +696,68 @@ def _confirm_recent_buy(sym: str, log: list) -> dict | None:
     return best
 
 
+def _read_order(sym: str, order_id: str) -> dict | None:
+    """Re-read ONE just-placed order from broker truth to get its CURRENT fill state (state /
+    cumulative_quantity / average_price). The place echo is captured at submission, so a marketable
+    limit reads there as unfilled — we re-read to see the fill and size the stop off the real average
+    price. Returns the matching order dict, or None if it isn't visible yet."""
+    import rh_mcp
+    since = (datetime.now(timezone.utc) - timedelta(seconds=180)).isoformat(timespec="seconds")
+    blob = rh_mcp.recent_orders(sym, created_at_gte=since)
+    raw = _unwrap((blob or {}).get("orders") or {})
+    if isinstance(raw, dict):
+        raw = raw.get("orders") or raw.get("results") or []
+    for o in raw or []:
+        if isinstance(o, dict) and _first(o, "id", "order_id") == order_id:
+            return o
+    return None
+
+
+def _arm_entry_stop(sym: str, plan: dict, order: dict | None, order_id: str,
+                    caps: dict, state: dict, log: list) -> None:
+    """Force a protective stop IN THE SAME TICK as the entry, instead of leaving the lot naked until
+    the next reconcile ~10 min later. A whole-share BUY is a marketable limit that fills within
+    seconds; once it's confirmed filled we arm the resting stop_market right away.
+
+    Flow: read the fill (from the place echo, else re-read the order from broker truth) -> if >=1 whole
+    share has filled, size the stop off the REAL average fill price and place a resting stop_market.
+    On a stop-place failure, leave the lot with a synthetic stop level + qty set so the 1-min sentinel
+    covers it AND next tick's reconcile re-arms a real resting stop. If the buy isn't confirmed filled
+    in-tick (rare for a marketable limit), the lot stays 'pending' and reconcile arms it next tick."""
+    import rh_mcp
+    lot = state["lots"][sym]
+    state_str = str(_first(order or {}, "state", "status") or "").lower()
+    filled_qty = _f(_first(order or {}, "cumulative_quantity", "filled_quantity"), 0.0) or 0.0
+    avg = _f(_first(order or {}, "average_price", "average_buy_price"))
+    if state_str != "filled" or filled_qty < 1:  # place echo is pre-fill -> re-read broker truth
+        fresh = _read_order(sym, order_id)
+        if fresh:
+            filled_qty = _f(_first(fresh, "cumulative_quantity", "filled_quantity"), 0.0) or 0.0
+            avg = _f(_first(fresh, "average_price", "average_buy_price")) or avg
+    whole = math.floor(filled_qty)
+    if whole < 1:
+        return  # not filled yet in-tick -> lot stays pending; reconcile + sentinel are the backstop
+    entry = avg or plan.get("limit_price")
+    if not entry or entry <= 0:
+        return  # no price to size a stop off -> leave pending for reconcile
+    sl = caps.get("STOP_LOSS_PCT", 8.0)
+    tp = caps.get("TAKE_PROFIT_PCT", 12.0)
+    stop_price = round(entry * (1 - sl / 100.0), 2)
+    # Fill confirmed in-tick -> the lot is real (no longer pending). Populate the synthetic levels too
+    # so the sentinel can watch it in any window where the resting stop isn't (yet) armed.
+    lot.update(qty=float(whole), entry_price=entry, pending=False, high_water=entry,
+               stop_price=stop_price, take_profit_price=round(entry * (1 + tp / 100.0), 4))
+    ref_id = str(uuid.uuid4())
+    res = rh_mcp.place(stop_spec(sym, whole, stop_price), ref_id=ref_id)
+    o = order_obj(res)
+    sid = _first(o, "id", "order_id") if isinstance(o, dict) else None
+    lot["resting_stop_order_id"] = sid
+    lot["stop_type"] = "resting" if sid else "synthetic"
+    log.append({"event": "arm_stop_on_entry" if sid else "arm_stop_on_entry_failed", "symbol": sym,
+                "stop_price": stop_price, "qty": whole, "order_id": sid, "ref_id": ref_id,
+                "result": None if sid else res})
+
+
 def execute_buy(sym: str, action: dict, state: dict, broker: dict, caps: dict,
                 exposure: float, buying_power: float, n_positions: int,
                 day_pnl: float | None, log: list) -> dict:
@@ -759,8 +821,9 @@ def execute_buy(sym: str, action: dict, state: dict, broker: dict, caps: dict,
         res.update(status="failed", ref_id=ref_id, reject_reason=f"place rejected/failed: {placed}", order=placed)
         log.append({"event": "buy_failed", "symbol": sym, "spec": spec, "ref_id": ref_id, "result": placed})
         return res
-    # record a pending lot; reconciliation next tick confirms the fill from broker positions and
-    # arms the resting stop off the real cost basis.
+    # record a pending lot; _arm_entry_stop below confirms the fill IN-TICK and arms the resting stop
+    # immediately. If the fill isn't confirmed in-tick, the lot stays pending and reconcile arms it
+    # next tick off the real cost basis.
     lots[sym] = {**lots.get(sym, {}), "entry_ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                  "scaled": lots.get(sym, {}).get("scaled", []), "stop_type": plan["stop_type"],
                  "resting_stop_order_id": None, "last_entry_ref_id": ref_id, "pending": True,
@@ -768,6 +831,13 @@ def execute_buy(sym: str, action: dict, state: dict, broker: dict, caps: dict,
     res.update(status="placed", ref_id=ref_id, order_id=order_id, order=placed)
     log.append({"event": "buy_placed", "symbol": sym, "spec": spec, "ref_id": ref_id,
                 "order_id": order_id, "plan": plan, "order": placed})
+    # Force a protective stop on this entry IN THIS TICK (confirm fill -> arm resting stop_market), so
+    # the lot is never left naked for the ~10 min until the next reconcile. Backstop unchanged:
+    # reconcile re-arms on the next tick if the fill wasn't confirmed here.
+    _arm_entry_stop(sym, plan, order, order_id, caps, state, log)
+    res["stop_armed"] = bool(lots[sym].get("resting_stop_order_id"))
+    res["stop_type"] = lots[sym].get("stop_type")
+    res["pending"] = bool(lots[sym].get("pending"))
     return res
 
 

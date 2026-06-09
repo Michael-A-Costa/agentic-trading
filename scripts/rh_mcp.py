@@ -111,9 +111,12 @@ def _exec_model() -> str:
 
 
 def _relay(prompt: str, tools: list[str], model: str | None = None,
-           preamble: str = _RELAY_PREAMBLE, timeout: int | None = None) -> dict | None:
+           preamble: str = _RELAY_PREAMBLE, timeout: int | None = None,
+           label: str = "relay") -> dict | None:
+    # `label` flows into run_claude's per-call progress line + the tick token ledger, so each broker
+    # call shows up named (relay:review:NVDA, relay:place:NVDA, …) instead of an anonymous "claude".
     out = run_claude(preamble + prompt, model or _exec_model(), tools=tools, mcp=True,
-                     timeout=timeout or _timeout())
+                     timeout=timeout or _timeout(), label=label)
     return parse_json_obj(out)
 
 
@@ -142,7 +145,8 @@ def snapshot(symbols: list[str] | None = None) -> dict | None:
         shape = ('{"portfolio": <result of step 1>, "positions": <result of step 2>, '
                  '"quotes": <result of step 3>, "orders": <result of step 4>, "errors": {}}')
     prompt = (f"Account: {acct}\n\nSteps:\n" + "\n".join(steps) + "\n\nOutput JSON shape:\n" + shape)
-    return _relay(prompt, READ_TOOLS, timeout=int(os.environ.get("RH_SNAPSHOT_TIMEOUT_S", "180")))
+    return _relay(prompt, READ_TOOLS, timeout=int(os.environ.get("RH_SNAPSHOT_TIMEOUT_S", "180")),
+                  label="relay:snapshot")
 
 
 def quotes(symbols: list[str]) -> dict | None:
@@ -159,7 +163,8 @@ def quotes(symbols: list[str]) -> dict | None:
         "Output JSON shape:\n"
         '{"quotes": <verbatim result of step 1>, "errors": {}}'
     )
-    return _relay(prompt, ["mcp__robinhood-trading__get_equity_quotes"])
+    return _relay(prompt, ["mcp__robinhood-trading__get_equity_quotes"],
+                  label=f"relay:quotes({len(syms)})")
 
 
 def review(spec: dict) -> dict | None:
@@ -174,7 +179,7 @@ def review(spec: dict) -> dict | None:
         "Output JSON shape:\n"
         '{"review": <verbatim result of step 1>, "errors": {}}'
     )
-    return _relay(prompt, REVIEW_TOOLS)
+    return _relay(prompt, REVIEW_TOOLS, label=f"relay:review:{spec.get('symbol', '?')}")
 
 
 def place(spec: dict, ref_id: str) -> dict | None:
@@ -189,7 +194,8 @@ def place(spec: dict, ref_id: str) -> dict | None:
         "commentary:\n"
         '{"order": <place_equity_order result>, "errors": {}}'
     )
-    return _relay(prompt, PLACE_TOOLS, model=_exec_model(), preamble=_WRITE_PREAMBLE)
+    return _relay(prompt, PLACE_TOOLS, model=_exec_model(), preamble=_WRITE_PREAMBLE,
+                  label=f"relay:place:{spec.get('symbol', '?')}")
 
 
 def recent_orders(symbol: str, created_at_gte: str | None = None) -> dict | None:
@@ -207,7 +213,8 @@ def recent_orders(symbol: str, created_at_gte: str | None = None) -> dict | None
         "Output JSON shape:\n"
         '{"orders": <verbatim result of step 1>, "errors": {}}'
     )
-    return _relay(prompt, ["mcp__robinhood-trading__get_equity_orders"])
+    return _relay(prompt, ["mcp__robinhood-trading__get_equity_orders"],
+                  label=f"relay:orders:{symbol.upper()}")
 
 
 def cancel(order_id: str) -> dict | None:
@@ -220,7 +227,8 @@ def cancel(order_id: str) -> dict | None:
         "commentary:\n"
         '{"cancel": <cancel_equity_order result>, "errors": {}}'
     )
-    return _relay(prompt, CANCEL_TOOLS, model=_exec_model(), preamble=_WRITE_PREAMBLE)
+    return _relay(prompt, CANCEL_TOOLS, model=_exec_model(), preamble=_WRITE_PREAMBLE,
+                  label=f"relay:cancel:{str(order_id)[:8]}")
 
 
 if __name__ == "__main__":
