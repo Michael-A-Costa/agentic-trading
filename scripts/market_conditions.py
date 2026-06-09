@@ -32,6 +32,7 @@ import sys
 import urllib.request
 import urllib.error
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, time, timezone
 from time import sleep
 from pathlib import Path
@@ -200,33 +201,124 @@ def fetch_yahoo(symbols: list[str]) -> dict[str, dict]:
     return out
 
 
+# --------------------------------------------------------------------------- fetch: fallback 3 (Robinhood MCP)
+def _pick(d: dict, *keys):
+    """First present, non-None value among keys (RH quote field names vary by payload)."""
+    for k in keys:
+        v = d.get(k)
+        if v is not None:
+            return v
+    return None
+
+
+def fetch_robinhood(symbols: list[str]) -> dict[str, dict]:
+    """LAST-RESORT quotes via the AUTHENTICATED Robinhood MCP — one haiku relay call, real-time.
+
+    The keyless sources (Stooq/Cboe/Yahoo) are free CDNs with no SLA: when Cloudflare throttles them
+    the whole entry gate stalls on missing index data (seen 2026-06-09 — a lone null SPY). RH is the
+    one reliable, authenticated source we have, but it COSTS a relay call (~$0.02-0.05) and ~10-30s,
+    so it sits dead last and is gated to live mode in fetch_quotes. Same normalized shape as the CDN
+    fetchers. date/time are stamped from ET-now because an RH quote is real-time by construction — the
+    tick's own is_open check separately guards session state, so a stamped date can't fake a live gate
+    on a closed market. RH's quote carries no session OPEN, so intraday_pct (open->last) may be None for
+    these — regime then degrades to neutral (entries still allowed; only a confirmed risk_off blocks)."""
+    import rh_mcp  # lazy: keep the headless-claude stack out of every market_conditions import
+    syms = sorted({s.upper().strip() for s in symbols if s and s.strip()})
+    if not syms:
+        return {}
+    res = rh_mcp.quotes(syms)
+    raw = (res or {}).get("quotes") or {}
+    if isinstance(raw, dict):
+        raw = raw.get("data") if isinstance(raw.get("data"), (dict, list)) else raw
+    if isinstance(raw, dict):
+        raw = raw.get("results") or raw.get("quotes") or []
+    now_et = datetime.now(ET)
+    date, tm = now_et.strftime("%Y-%m-%d"), now_et.strftime("%H:%M:%S")
+    out: dict[str, dict] = {}
+    for item in raw or []:
+        q = item.get("quote") if isinstance(item, dict) and isinstance(item.get("quote"), dict) else item
+        if not isinstance(q, dict):
+            continue
+        sym = str(_pick(q, "symbol", "ticker") or "").upper().strip()
+        if not sym:
+            continue
+        last = _fnum(_pick(q, "last_trade_price", "last_non_reg_trade_price", "last", "price", "current_price"))
+        prev = _fnum(_pick(q, "previous_close", "prev_day_close", "adjusted_previous_close"))
+        out[sym] = {
+            "open": _fnum(_pick(q, "open", "open_price")),
+            "high": _fnum(_pick(q, "high", "high_price")),
+            "low": _fnum(_pick(q, "low", "low_price")),
+            "last": last,
+            "volume": _fnum(_pick(q, "volume")),
+            "date": date,
+            "time": tm,
+            "current_price": last,
+            "bid": _fnum(_pick(q, "bid_price", "bid")),
+            "ask": _fnum(_pick(q, "ask_price", "ask")),
+            "prev_day_close": prev,
+            "price_change_percent": (round((last - prev) / prev * 100, 4) if last and prev else None),
+        }
+    return out
+
+
 def _has_indexes(quotes: dict[str, dict]) -> bool:
     """A usable fetch must have a last price for at least one index ETF."""
     return any(quotes.get(s, {}).get("last") is not None for s in INDEXES)
 
 
 # --------------------------------------------------------------------------- fetch: orchestrator
-def fetch_quotes(symbols: list[str]) -> tuple[dict[str, dict], str]:
-    """Try sources in order until one returns index data. Returns (quotes, source). Raises if all fail.
+# The three keyless CDNs are independent endpoints (different domains), so we fire them CONCURRENTLY
+# instead of waiting for each to fail in turn — when one hangs or 429s, the others are already in hand.
+# But selection stays by PRIORITY, not by who-finished-first: the order encodes data QUALITY, not mere
+# availability. Cboe carries bid/ask/iv30/prev_close that dd_probe reuses; Yahoo is thin and 429-prone.
+# Letting a thin source win a race just because it returned first would quietly degrade the quotes the
+# whole tick (and every parallel DD) runs on. So: race for latency, pick by rank.
+_FREE_SOURCES = [
+    ("stooq", fetch_stooq),            # primary: keyless batch CSV
+    ("cboe(fallback)", fetch_cboe),    # richest fields (dd_probe reuses these) — the workhorse
+    ("yahoo(fallback)", fetch_yahoo),  # thin + usually 429-throttled
+]
 
-    Chain: Stooq (primary, batch + 1 retry) -> Cboe (fallback 1) -> Yahoo (fallback 2). All three are
-    independent keyless providers, so a single provider's outage or throttle doesn't blind the engine.
+
+def fetch_quotes(symbols: list[str]) -> tuple[dict[str, dict], str]:
+    """Return (quotes, source). Races the keyless CDNs in parallel and picks the highest-priority one
+    with usable index data; falls back to the authenticated Robinhood MCP relay only if ALL of them
+    came back empty. Raises if every source fails.
+
+    The RH relay is NOT raced — it costs a haiku call, so it stays strictly sequential and last, firing
+    only on a total keyless outage. It's gated: QUOTES_MCP_FALLBACK=1 forces it on, =0 off, unset/auto =
+    on in live mode only (paper never pays for quotes).
     """
     notes: list[str] = []
-    attempts = [
-        ("stooq", fetch_stooq),
-        ("stooq(retry)", fetch_stooq),
-        ("cboe(fallback)", fetch_cboe),
-        ("yahoo(fallback)", fetch_yahoo),
-    ]
-    for label, fn in attempts:
+    results: dict[str, dict] = {}
+    # Race the free CDNs concurrently; collect whatever each returns (or note why it failed).
+    with ThreadPoolExecutor(max_workers=len(_FREE_SOURCES)) as ex:
+        futs = {ex.submit(fn, symbols): label for label, fn in _FREE_SOURCES}
+        for fut in as_completed(futs):
+            label = futs[fut]
+            try:
+                results[label] = fut.result()
+            except Exception as e:   # a source failing just drops it from the race; we raise only if all do
+                notes.append(f"{label}: {type(e).__name__}: {e}")
+    # Pick by PRIORITY among whatever finished — never by finish order.
+    for label, _ in _FREE_SOURCES:
+        q = results.get(label)
+        if q is None:
+            continue
+        if _has_indexes(q):
+            return q, label
+        notes.append(f"{label}: no index data")
+    # Authenticated last resort — sequential, only when every free source is dark, and only if enabled.
+    flag = (os.environ.get("QUOTES_MCP_FALLBACK") or "").strip().lower()
+    is_live = (os.environ.get("TRADING_MODE", "paper").strip().lower() == "live")
+    if flag in ("1", "true", "yes") or (flag in ("", "auto") and is_live):
         try:
-            q = fn(symbols)
+            q = fetch_robinhood(symbols)
             if _has_indexes(q):
-                return q, label
-            notes.append(f"{label}: no index data")
-        except Exception as e:   # any source failure just falls through to the next; we raise only if all do
-            notes.append(f"{label}: {type(e).__name__}: {e}")
+                return q, "robinhood(mcp)"
+            notes.append("robinhood(mcp): no index data")
+        except Exception as e:
+            notes.append(f"robinhood(mcp): {type(e).__name__}: {e}")
     raise RuntimeError("all sources failed (" + "; ".join(notes) + ")")
 
 
