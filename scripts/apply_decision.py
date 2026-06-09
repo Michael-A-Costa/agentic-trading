@@ -170,15 +170,23 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
             result["reject_reason"] = "non-positive / non-finite qty"
             return result
 
-        # Hybrid stop eligibility: prefer a WHOLE-SHARE lot so it can carry a real resting
-        # stop-market in live (Robinhood fractional lots are broker market-only -> synthetic engine
-        # stop only). Floor to whole shares when >=1 is affordable; never force whole shares on a
-        # name the budget can't reach a share of. Flooring only ever LOWERS notional, so no cap is
-        # breached by it. Off (PREFER_WHOLE_SHARES=0) keeps pure fractional dollar sizing.
-        if bool(caps.get("PREFER_WHOLE_SHARES", 1)) and action.get("dollar_amount") is not None \
-                and math.floor(qty) >= 1:
-            qty = float(math.floor(qty))
-            notional = qty * buy_px
+        # Always whole-share lots — real resting broker stop in live, no sentinel dependency.
+        # Floor to whole shares when budget covers >=1. If budget is short of 1 share, round UP
+        # to exactly 1 when 1 share fits MAX_POSITION_USD. Otherwise reject: not fractional.
+        if action.get("dollar_amount") is not None:
+            if math.floor(qty) >= 1:
+                qty = float(math.floor(qty))
+                notional = qty * buy_px
+            else:
+                max_pos = float(caps.get("MAX_POSITION_USD", 0) or 0)
+                if max_pos > 0 and buy_px <= max_pos:
+                    qty = 1.0
+                    notional = buy_px
+                else:
+                    result["reject_reason"] = (
+                        f"whole-share-only: 1 share (${round(buy_px, 2)}) exceeds "
+                        f"MAX_POSITION_USD ({max_pos})")
+                    return result
 
         min_pos = caps.get("MIN_POSITION_USD", 0.0)
         if min_pos > 0 and notional < min_pos - 1e-6:
@@ -238,14 +246,11 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
         new_qty = prev["qty"] + qty
         new_entry = (prev["qty"] * prev["entry_price"] + qty * buy_px) / new_qty
         sl, tp = caps.get("STOP_LOSS_PCT", 2.0), caps.get("TAKE_PROFIT_PCT", 4.0)
-        # Hybrid stop tag: a WHOLE-SHARE lot is resting-eligible (a real broker stop-market in live,
-        # armed continuously); any fractional remainder (incl. when averaging in) forces synthetic.
-        # NOTE: in PAPER both still sell at the next tick, so resting vs synthetic fill identically
-        # here — the tag drives the live executor + record fidelity, and the protection edge
-        # (continuous arming, surviving between-tick/overnight gaps and engine downtime) only
-        # materializes once live places the resting order. See momentum-v0-plan.md.
-        resting = (bool(caps.get("PREFER_WHOLE_SHARES", 1))
-                   and new_qty == math.floor(new_qty) and new_qty >= 1)
+        # All new entries are whole-share lots, so new_qty should always be a whole number here.
+        # The check is kept as a safety net (averaging into a pre-existing fractional position
+        # could leave a non-integer total). In PAPER both still settle at the next tick; the
+        # resting tag drives the live executor + record fidelity (real broker stop vs synthetic).
+        resting = (new_qty == math.floor(new_qty) and new_qty >= 1)
         stop_type = "resting" if resting else "synthetic"
         stop_note = ("resting stop-market on whole-share lot (broker-armed in live; paper still "
                      "settles at tick)" if resting

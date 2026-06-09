@@ -10,9 +10,9 @@ the broker doesn't track (our stop/TP levels, entry_ts, scale-out progress, rest
 
 Order semantics (pinned by the MCP schema — dollar_amount / fractional are market-only; limit and
 stop_market need whole-share quantity):
-  - whole-share BUY  -> type=limit  (marketable, capped MARKETABLE_LIMIT_PCT above the ask)
-                        + resting type=stop_market (GTC) armed at the broker once the fill confirms
-  - fractional BUY   -> type=market (dollar_amount); SYNTHETIC engine-tick stop only (no broker stop)
+  - BUY  -> ALWAYS whole shares: type=limit (marketable, capped MARKETABLE_LIMIT_PCT above the ask)
+             + resting type=stop_market (GTC) armed at the broker once the fill confirms.
+             If even 1 share exceeds MAX_POSITION_USD, the entry is skipped (not fractional).
   - SELL (exit/scale)-> cancel any resting stop first, then limit (whole) / market (fractional)
 
 Safety gate (no human per-trade approval — this IS the seatbelt):
@@ -29,6 +29,7 @@ the parse_* helpers try the likely keys and fail safe. Lock them down after the 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import math
 import os
@@ -138,6 +139,24 @@ def order_obj(placed: dict | None) -> dict | None:
     return o if isinstance(o, dict) else None
 
 
+def _parse_quotes(raw_q) -> dict:
+    """Parse a get_equity_quotes blob (data.results[].quote.{bid_price,ask_price,last_trade_price})
+    into {SYM: {bid, ask, last}}. Shared by parse_snapshot and the live entry-quote backfill."""
+    raw_q = _unwrap(raw_q or {})
+    if isinstance(raw_q, dict):
+        raw_q = raw_q.get("results") or raw_q.get("quotes") or []
+    quotes: dict[str, dict] = {}
+    for item in raw_q or []:
+        q = item.get("quote") if isinstance(item, dict) and isinstance(item.get("quote"), dict) else item
+        if not isinstance(q, dict):
+            continue
+        sym = (_first(q, "symbol", "ticker") or "").upper().strip()
+        if sym:
+            quotes[sym] = {"bid": _f(_first(q, "bid_price", "bid")), "ask": _f(_first(q, "ask_price", "ask")),
+                           "last": _f(_first(q, "last_trade_price", "last_non_reg_trade_price", "last", "price"))}
+    return quotes
+
+
 def parse_snapshot(snap: dict) -> dict:
     """Normalise the raw broker blobs into {buying_power, positions{sym:{qty,avg_cost}}, quotes, orders}.
 
@@ -175,18 +194,7 @@ def parse_snapshot(snap: dict) -> dict:
         sellable = _f(_first(p, "shares_available_for_sells"), qty)
         positions[sym] = {"qty": qty, "avg_cost": avg, "sellable": sellable}
 
-    raw_q = _unwrap(snap.get("quotes") or {})
-    if isinstance(raw_q, dict):
-        raw_q = raw_q.get("results") or raw_q.get("quotes") or []
-    quotes: dict[str, dict] = {}
-    for item in raw_q or []:
-        q = item.get("quote") if isinstance(item, dict) and isinstance(item.get("quote"), dict) else item
-        if not isinstance(q, dict):
-            continue
-        sym = (_first(q, "symbol", "ticker") or "").upper().strip()
-        if sym:
-            quotes[sym] = {"bid": _f(_first(q, "bid_price", "bid")), "ask": _f(_first(q, "ask_price", "ask")),
-                           "last": _f(_first(q, "last_trade_price", "last_non_reg_trade_price", "last", "price"))}
+    quotes = _parse_quotes(snap.get("quotes"))
 
     raw_o = _unwrap(snap.get("orders") or {})
     if isinstance(raw_o, dict):
@@ -222,10 +230,13 @@ def open_stop_for(orders: list, sym: str) -> dict | None:
 # PURE order-spec builders + cap checks  (unit-tested; no MCP, no I/O)
 # ---------------------------------------------------------------------------
 def size_entry(dollar_amount: float, quote: dict, caps: dict, *, canary_usd: float | None) -> dict:
-    """Decide qty / order kind for a BUY. Returns a plan dict (no MCP call).
+    """Size a BUY as whole shares only (-> marketable limit + real resting broker stop).
 
-    Mirrors the paper hybrid: floor to whole shares when affordable (-> limit + resting stop),
-    else fractional market (-> synthetic stop). Honours the canary notional cap when set.
+    Floor to whole shares when the budget covers >=1. If the budget covers < 1 share, round UP
+    to exactly 1 share when 1 share fits within the position cap — this overspends the DD's
+    conviction sizing by at most 1 share but gets a real resting stop instead of a synthetic one.
+    If even 1 share exceeds the cap, return ok=False: the entry is skipped, not degraded to
+    fractional. Honours the canary notional cap when set.
     """
     ref = quote.get("ask") or quote.get("last") or quote.get("bid")
     if not ref or ref <= 0:
@@ -233,20 +244,23 @@ def size_entry(dollar_amount: float, quote: dict, caps: dict, *, canary_usd: flo
     notional = float(dollar_amount)
     if canary_usd is not None and notional > canary_usd:
         notional = canary_usd  # first live order is a tiny canary until a round-trip completes
-    prefer_whole = str(os.environ.get("PREFER_WHOLE_SHARES", "1")).strip().lower() not in ("0", "false", "no", "")
     limit_pct = caps.get("MARKETABLE_LIMIT_PCT", 0.5)
     raw_qty = notional / ref
-    whole = prefer_whole and math.floor(raw_qty) >= 1
-    if whole:
+    if math.floor(raw_qty) >= 1:
         qty = float(math.floor(raw_qty))
-        limit_price = round(ref * (1 + limit_pct / 100.0), 2)
-        notional = qty * limit_price
-        return {"ok": True, "kind": "limit", "qty": qty, "whole": True, "stop_type": "resting",
-                "limit_price": limit_price, "notional": round(notional, 2),
-                "canary_capped": canary_usd is not None and float(dollar_amount) > canary_usd}
-    # fractional -> market dollar order, synthetic stop only
-    return {"ok": True, "kind": "market", "dollar_amount": round(notional, 2), "whole": False,
-            "stop_type": "synthetic", "qty": round(raw_qty, 6), "notional": round(notional, 2),
+    else:
+        # Budget is short of 1 share — round up to exactly 1 if it fits within the cap.
+        ceiling = canary_usd if canary_usd is not None else float(caps.get("MAX_POSITION_USD", 0) or 0)
+        if ceiling > 0 and ref <= ceiling:
+            qty = 1.0
+        else:
+            return {"ok": False,
+                    "reject_reason": (f"whole-share-only: 1 share (${ref:.2f}) exceeds "
+                                      f"cap (${ceiling:.2f}) — skipping rather than going fractional")}
+    limit_price = round(ref * (1 + limit_pct / 100.0), 2)
+    notional = qty * limit_price
+    return {"ok": True, "kind": "limit", "qty": qty, "whole": True, "stop_type": "resting",
+            "limit_price": limit_price, "notional": round(notional, 2),
             "canary_capped": canary_usd is not None and float(dollar_amount) > canary_usd}
 
 
@@ -596,6 +610,30 @@ def execute_sell(sym: str, action: dict, state: dict, broker: dict, caps: dict, 
     return res
 
 
+def _confirm_recent_buy(sym: str, log: list) -> dict | None:
+    """Re-read broker orders to confirm a place whose relay echo was unparseable. Returns the newest
+    agentic BUY for sym created in the last ~2.5 min that isn't cancelled/rejected — that's our order
+    (we place at most one buy per symbol per tick). None if nothing matches (a genuine no-op)."""
+    import rh_mcp
+    since = (datetime.now(timezone.utc) - timedelta(seconds=150)).isoformat(timespec="seconds")
+    blob = rh_mcp.recent_orders(sym, created_at_gte=since)
+    raw = _unwrap((blob or {}).get("orders") or {})
+    if isinstance(raw, dict):
+        raw = raw.get("orders") or raw.get("results") or []
+    best = None
+    for o in raw or []:
+        if not isinstance(o, dict) or str(o.get("side", "")).lower() != "buy":
+            continue
+        if str(o.get("state", "")).lower() in ("cancelled", "rejected", "failed", "voided"):
+            continue
+        if best is None or str(o.get("created_at", "")) > str(best.get("created_at", "")):
+            best = o
+    if best:
+        log.append({"event": "place_confirmed_via_reread", "symbol": sym,
+                    "order_id": _first(best, "id", "order_id"), "state": best.get("state")})
+    return best
+
+
 def execute_buy(sym: str, action: dict, state: dict, broker: dict, caps: dict,
                 exposure: float, buying_power: float, n_positions: int,
                 day_pnl: float | None, log: list) -> dict:
@@ -647,6 +685,17 @@ def execute_buy(sym: str, action: dict, state: dict, broker: dict, caps: dict,
     # otherwise log it as failed so a rejected order never becomes a phantom position.
     order = order_obj(placed)
     order_id = _first(order, "id", "order_id") if isinstance(order, dict) else None
+    # The place relay is NON-DETERMINISTIC: it can place the order at the broker yet return None or
+    # unparseable prose (a headless agent ignoring "no fences/prose", or a non-zero exit). Trusting
+    # the echo turned real fills into "place rejected/failed" AND left resting orders untracked. So
+    # when the echo lacks an id but didn't explicitly error, CONFIRM from broker truth before
+    # declaring failure (truth is always re-read from the broker — the agent's prose is never trusted).
+    if not order_id and not (isinstance(placed, dict) and placed.get("errors")):
+        confirmed = _confirm_recent_buy(sym, log)
+        if confirmed:
+            order = confirmed
+            order_id = _first(confirmed, "id", "order_id")
+            placed = {"order": confirmed, "confirmed_via": "broker_reread"}
     if not order_id or (isinstance(placed, dict) and placed.get("errors")):
         res.update(status="failed", ref_id=ref_id, reject_reason=f"place rejected/failed: {placed}", order=placed)
         log.append({"event": "buy_failed", "symbol": sym, "spec": spec, "ref_id": ref_id, "result": placed})
@@ -674,6 +723,12 @@ def main() -> int:
     caps = context["caps"]
     now = datetime.now(timezone.utc)
 
+    # Relay token accounting: every rh_mcp call funnels through decide.run_claude, which appends to
+    # decide's in-process usage ledger. Reset it now so usage_summary() at the end is THIS tick's
+    # broker-I/O spend (snapshot runs in a separate process; this captures quotes/review/place/cancel).
+    from decide import reset_usage, usage_summary
+    reset_usage()
+
     if str(context.get("mode", "paper")).lower() != "live":
         print("[live_execute] refusing: context mode is not 'live'", file=sys.stderr)
         return 2
@@ -684,6 +739,17 @@ def main() -> int:
     broker = parse_snapshot(load_json(SNAPSHOT_PATH))
     state = load_state()
     state["_caps"] = caps  # transient: lets reconcile() compute stop/TP off configured pcts
+
+    # Mark held positions from the CONTEXT. tick_context already fetched fresh public (Cboe) quotes for
+    # every holding, so the broker snapshot no longer needs to quote them (it used to quote the pins —
+    # the WRONG symbols — leaving 16/19 holdings marked at cost, which corrupted equity, day-P&L, and
+    # the daily-loss breaker). Merge the context marks into broker["quotes"] so exposure, sell specs,
+    # sell-proceeds, and the trailing stop all use live marks. Entry symbols still come from the backfill.
+    for p in context.get("positions", []):
+        s = str(p.get("symbol", "")).upper()
+        last = p.get("last")
+        if s and last and not (broker["quotes"].get(s) or {}).get("last"):
+            broker["quotes"][s] = {"last": float(last), "bid": float(last), "ask": float(last)}
 
     # equity / day P&L from broker truth; persist start-of-day equity (broker doesn't track it).
     today = context.get("ts_et", "")[:10]
@@ -724,6 +790,21 @@ def main() -> int:
                     state.setdefault("unsettled", []).append(
                         {"settle_date": next_settle_date(today), "amount": proceeds,
                          "symbol": r["symbol"], "sold_ts": now.isoformat(timespec="seconds")})
+        # Backfill quotes for entry candidates BEFORE sizing. broker_snapshot only quotes the
+        # CANDIDATES pins + indexes (it runs before decide, so it can't know the day's movers), so
+        # size_entry would reject every discovery name with "no usable quote". Pull any missing buy
+        # symbols live now in one batched relay call and merge into broker["quotes"].
+        buy_syms = [str(x.get("symbol", "")).upper() for x in actions if str(x.get("side")).lower() == "buy"]
+        missing = sorted({s for s in buy_syms if s and not (broker["quotes"].get(s) or {}).get("ask")
+                          and not (broker["quotes"].get(s) or {}).get("last")})
+        if missing:
+            import rh_mcp
+            qsnap = rh_mcp.quotes(missing)
+            fetched = _parse_quotes((qsnap or {}).get("quotes")) if qsnap else {}
+            broker["quotes"].update(fetched)
+            log.append({"event": "entry_quotes_fetched", "requested": missing,
+                        "got": sorted(fetched.keys())})
+
         # re-check the breaker once before any entry (deterministic, on broker numbers)
         breaker = day_pnl <= -caps.get("DAILY_MAX_LOSS_USD", 150.0)
         # Running tallies so multiple buys in ONE tick respect the caps CUMULATIVELY: a placed buy
@@ -731,7 +812,12 @@ def main() -> int:
         # buy checks against the pre-tick snapshot and N buys could collectively breach the caps.
         # Mirrors paper's per-fill recompute (apply_decision.validate_and_fill). Entries draw on
         # SETTLED cash (the GFV guard), not raw broker buying_power.
-        run_exposure, run_bp, run_npos = exposure, settled_bp, len(broker["positions"])
+        # Gather buy candidates that pass the cheap, deterministic filters (breaker, market-open,
+        # armed-trigger). The expensive part — each entry's review+place relay (~30-50s cold-start
+        # spawn) — runs AFTER, in PARALLEL: the relays are independent and I/O-bound, so serial blew
+        # ticks to 800s+. Bounding the COUNT by headroom keeps the concurrent buys cap-safe.
+        max_entries = int(os.environ.get("MAX_ENTRIES_PER_TICK", "5"))
+        ready: list = []
         for a in [x for x in actions if str(x.get("side")).lower() == "buy"]:
             sym = str(a.get("symbol", "")).upper()
             if breaker:
@@ -742,14 +828,60 @@ def main() -> int:
                 results.append({"symbol": a.get("symbol"), "side": "buy", "status": "skipped",
                                 "reject_reason": "entries disabled (market closed/stale)"})
                 continue
-            r = execute_buy(sym, a, state, broker, caps, run_exposure, run_bp, run_npos, day_pnl, log)
-            results.append(r)
-            if r.get("status") == "placed":
-                notional = (r.get("plan") or {}).get("notional") or 0.0
-                run_exposure += notional
-                run_bp = max(0.0, run_bp - notional)
-                if sym not in broker["positions"]:
-                    run_npos += 1
+            # Level-armed entry: the LLM wants to enter on a price trigger, not now. In PAPER the
+            # sentinel fires these on the cross; in LIVE the sentinel is a no-op, so evaluate the
+            # trigger here against the fresh quote and only enter once it's satisfied — otherwise skip
+            # (re-checked next planner tick from the cached commit).
+            trig = a.get("entry_trigger") if a.get("arm") else None
+            if isinstance(trig, dict) and trig.get("price"):
+                q = broker["quotes"].get(sym, {})
+                px = q.get("last") or q.get("ask") or q.get("bid")
+                tprice = _f(trig.get("price"))
+                direction = str(trig.get("direction", "")).lower()
+                if px is None or tprice is None:
+                    results.append({"symbol": sym, "side": "buy", "status": "skipped",
+                                    "reject_reason": "armed entry: no quote/trigger to evaluate"})
+                    continue
+                crossed = (px <= tprice) if direction == "below" else (px >= tprice) if direction == "above" else False
+                if not crossed:
+                    results.append({"symbol": sym, "side": "buy", "status": "skipped",
+                                    "reject_reason": f"armed entry waiting: px {px} not {direction} {tprice}"})
+                    continue
+            ready.append((sym, a))
+
+        # Bound the entry COUNT by available headroom so the PARALLEL entries can't collectively breach
+        # the caps (each runs against the same pre-tick snapshot, blind to the others' fills). Even if
+        # every slot fills at the per-entry ceiling (the canary while active, else MAX_POSITION_USD),
+        # the total stays within settled cash AND the exposure cap. Replaces the old serial cumulative
+        # guard; execute_buy still re-checks each entry against the snapshot (belt and suspenders).
+        ceil = (float(os.environ.get("LIVE_CANARY_USD", "20")) if (armed() and not state.get("live_round_trip_done"))
+                else float(caps.get("MAX_POSITION_USD", 0) or 0)) or 1.0
+        exp_headroom = max(0.0, float(caps.get("MAX_TOTAL_EXPOSURE_USD", 0.0)) - exposure)
+        headroom_slots = int(min(settled_bp, exp_headroom) // ceil)
+        slots = max(0, min(max_entries, headroom_slots, len(ready)))
+        for sym, a in ready[slots:]:
+            results.append({"symbol": sym, "side": "buy", "status": "skipped",
+                            "reject_reason": f"deferred — slots used (max_entries={max_entries}, headroom_slots={headroom_slots})"})
+
+        # Run the slot entries' review+place relays in PARALLEL (independent I/O-bound cold-start spawns).
+        to_run = ready[:slots]
+        if to_run:
+            npos = len(broker["positions"])
+            do_parallel = str(os.environ.get("LIVE_PARALLEL_ENTRIES", "1")).strip().lower() not in ("0", "false", "no", "")
+            workers = min(len(to_run), int(os.environ.get("LIVE_ENTRY_WORKERS", "5"))) if do_parallel else 1
+            if workers > 1:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                    futs = {ex.submit(execute_buy, s, act, state, broker, caps, exposure, settled_bp, npos, day_pnl, log): s
+                            for s, act in to_run}
+                    for fut in concurrent.futures.as_completed(futs):
+                        try:
+                            results.append(fut.result())
+                        except Exception as e:
+                            results.append({"symbol": futs[fut], "side": "buy", "status": "failed",
+                                            "reject_reason": f"entry_exception: {e}"})
+            else:
+                for s, act in to_run:
+                    results.append(execute_buy(s, act, state, broker, caps, exposure, settled_bp, npos, day_pnl, log))
 
     # NOTE: the canary round-trip flag (state["live_round_trip_done"]) is now set in reconcile() when
     # a lot we entered actually closes — NOT on a placed buy. The cap must survive until a real
@@ -768,6 +900,7 @@ def main() -> int:
         "n_placed": sum(1 for r in results if r.get("status") == "placed"),
         "n_skipped": sum(1 for r in results if r.get("status") in ("skipped", "dryrun")),
         "positions": broker["positions"],
+        "relay_token_usage": usage_summary(),  # broker-I/O spend this tick (quotes/review/place/cancel)
     }
     if not args.skip and args.decision:
         d = load_json(Path(args.decision))
@@ -789,6 +922,10 @@ def main() -> int:
     gfv = f" settled_bp={round(settled_bp, 2)}" + (f" (unsettled={unsettled_total})" if unsettled_total else "")
     print(f"[{record['ts_et']}] {mode_tag.upper()} {note} — {placed} placed, {record['n_skipped']} "
           f"skipped | equity={equity} day_pnl={day_pnl} bp={broker['buying_power']}{gfv}")
+    rtu = record["relay_token_usage"]
+    if rtu.get("n_calls"):
+        print(f"RELAY-TOKENS: {rtu['n_calls']} call(s), {rtu['total_tokens']:,} tok "
+              f"(out {rtu['output_tokens']:,}) ~${rtu['cost_usd']:.4f}  [model={os.environ.get('RH_RELAY_MODEL', os.environ.get('RH_PLACE_MODEL', 'claude-haiku-4-5-20251001'))}]")
     return 0
 
 
