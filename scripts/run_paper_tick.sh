@@ -20,6 +20,10 @@ set -a
 TRADING_MODE=paper
 set +a
 
+# Stream child python stdout/stderr line-by-line (no block buffering through the tee pipe), so the
+# per-call progress narration appears live in the terminal + run log instead of an end-of-tick burst.
+export PYTHONUNBUFFERED=1
+
 PYTHON="${AGENTIC_PYTHON:-/Library/Frameworks/Python.framework/Versions/3.11/bin/python3}"
 [ -x "$PYTHON" ] || PYTHON="$(command -v python3)"
 DD_MODEL="${DD_MODEL:-claude-sonnet-4-6}"
@@ -46,21 +50,26 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
   log "=== tick start (PAPER dd_model=${DD_MODEL}) ==="
 
   # 1) market regime (public data; appends to market_conditions.jsonl)
+  log "▶ [1/4] market regime…"
   "$PYTHON" "${REPO}/scripts/market_conditions.py" --quiet || log "market_conditions failed (continuing)"
 
   # 2) context + gate — writes context/packet, prints GATE=...
+  log "▶ [2/4] context + gate…"
   GATE_LINE="$("$PYTHON" "${REPO}/scripts/tick_context.py" | tail -n 1)"
   log "gate: ${GATE_LINE}"
 
   CTX="${REPO}/data/tick/context_latest.json"
 
   if [[ "$GATE_LINE" == GATE=SKIP* ]]; then
+    log "▶ [3/4] reconcile only (gate=skip — no decision)…"
     "$PYTHON" "$EXEC" --context "$CTX" --skip | tee -a "$RUN_LOG"
   else
     # 3) decide: Stage-1 screen (deterministic) -> Stage-2 deep DD + commit (Sonnet + web)
+    log "▶ [3/4] deciding (Stage-2 DD + manage)…"
     DEC="${REPO}/data/tick/decision_latest.json"
     if "$PYTHON" "${REPO}/scripts/decide.py" 2>>"$RUN_LOG" | tee -a "$RUN_LOG"; then
       # 4) execute + log — re-checks caps, simulates fill, updates paper_state.json
+      log "▶ [4/4] applying fills (simulated)…"
       "$PYTHON" "$EXEC" --context "$CTX" --decision "$DEC" | tee -a "$RUN_LOG"
     else
       log "decide.py failed — logging as skip"

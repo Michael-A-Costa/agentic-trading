@@ -226,6 +226,81 @@ def usage_summary() -> dict:
     }
 
 
+# --- live progress narration --------------------------------------------------------------------
+# Every LLM and every broker-relay call funnels through run_claude() below, and each is a 10-60s
+# headless `claude` subprocess whose output is CAPTURED, not streamed. Without narration a tick is
+# minutes of dead silence. _progress() prints a timestamped, flushed line to stdout (the run
+# scripts tee stdout to the terminal + run log) bracketing each call — what's running, how long it
+# took, what it cost — so the operator can watch a tick unfold live instead of staring at a frozen
+# terminal. Set TICK_PROGRESS=0 to silence it (e.g. in tests).
+def _progress_on() -> bool:
+    return os.environ.get("TICK_PROGRESS", "1").strip().lower() not in ("0", "false", "no", "")
+
+
+def _progress(msg: str) -> None:
+    if not _progress_on():
+        return
+    try:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+    except Exception:  # noqa: BLE001 — narration must never break a tick
+        pass
+
+
+def _short_model(model: str) -> str:
+    m = (model or "").lower()
+    for tag in ("opus", "sonnet", "haiku"):
+        if tag in m:
+            return tag
+    return ((model or "?").split("-") or ["?"])[0] or "?"
+
+
+def _fmt_tok(n: int | None) -> str:
+    n = int(n or 0)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}k"
+    return str(n)
+
+
+def _fmt_usd(cost) -> str:
+    try:
+        return f"${float(cost):.4f}" if cost is not None else "$?"
+    except (TypeError, ValueError):
+        return "$?"
+
+
+def _usage_total(usage: dict | None) -> int:
+    if not isinstance(usage, dict):
+        return 0
+    return sum(int(usage.get(k) or 0) for k in
+              ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+
+
+def _heartbeat_every() -> int:
+    try:
+        return max(0, int(os.environ.get("TICK_PROGRESS_HEARTBEAT_S", "20")))
+    except ValueError:
+        return 20
+
+
+def _start_heartbeat(label: str, t0: float) -> threading.Event:
+    """Tick out a '...still running (Ns)' line every N seconds while a long call is in flight, so a
+    60-180s broker snapshot or DD isn't a silent void. Returns a stop Event the caller .set()s when
+    the call finishes (a no-op if narration/heartbeat is disabled)."""
+    stop = threading.Event()
+    every = _heartbeat_every()
+    if not _progress_on() or every <= 0:
+        return stop
+
+    def _beat() -> None:
+        while not stop.wait(every):
+            _progress(f"    · {label} still running ({int(time.time() - t0)}s)")
+
+    threading.Thread(target=_beat, daemon=True).start()
+    return stop
+
+
 def _parse_claude_json(stdout: str) -> tuple[str | None, dict | None, float | None]:
     """Pull (result_text, usage, total_cost_usd) out of `claude --output-format json`. Falls back
     to treating stdout as raw text with no usage if it isn't the expected JSON envelope."""
@@ -253,19 +328,29 @@ def run_claude(prompt: str, model: str, tools: list | None = None, mcp: bool = F
         cmd += ["--mcp-config", str(REPO / ".mcp.json")]
     if tools:
         cmd += ["--allowedTools", *tools, "--dangerously-skip-permissions"]
+    _progress(f"  → {label} ({_short_model(model)}) running…")
     t0 = time.time()
+    stop_hb = _start_heartbeat(label, t0)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except (subprocess.TimeoutExpired, OSError) as e:
+        el = time.time() - t0
         sys.stderr.write(f"[decide] claude invocation failed: {e}\n")
-        _record_usage(label, model, None, None, time.time() - t0, error=str(e)[:120])
+        _record_usage(label, model, None, None, el, error=str(e)[:120])
+        _progress(f"  ✗ {label} failed after {el:.0f}s ({type(e).__name__})")
         return None
+    finally:
+        stop_hb.set()
     if r.returncode != 0:
+        el = time.time() - t0
         sys.stderr.write(f"[decide] claude exit {r.returncode}: {(r.stderr or '')[:300]}\n")
-        _record_usage(label, model, None, None, time.time() - t0, error=f"exit_{r.returncode}")
+        _record_usage(label, model, None, None, el, error=f"exit_{r.returncode}")
+        _progress(f"  ✗ {label} exit {r.returncode} after {el:.0f}s")
         return None
     text, usage, cost = _parse_claude_json(r.stdout)
-    _record_usage(label, model, usage, cost, time.time() - t0)
+    el = time.time() - t0
+    _record_usage(label, model, usage, cost, el)
+    _progress(f"  ✓ {label} {el:.0f}s · {_fmt_tok(_usage_total(usage))} tok · {_fmt_usd(cost)}")
     return text if (text and text.strip()) else None
 
 
