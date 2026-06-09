@@ -111,7 +111,10 @@ def fill_to_trade(res: dict, *, ts_utc: str, ts_et: str | None, mode: str) -> di
         if res.get(k) is not None:
             row[k] = res[k]
     if side == "buy":
-        for k in ("stop_price", "take_profit_price"):
+        for k in ("stop_price", "take_profit_price",
+                  # DD metadata (P3): pead_qualified ties the trade to the measured gap+vol signal
+                  # (vs free-rein discretion) so win-rate can be split by signal class later.
+                  "pead_qualified", "conviction", "hold_intent", "thesis_type"):
             if res.get(k) is not None:
                 row[k] = res[k]
     else:  # sell
@@ -149,6 +152,8 @@ def _blotter_line(row: dict) -> str:
             extra.append(f"tp {row['take_profit_price']}")
         if row.get("stop_type"):
             extra.append(str(row["stop_type"]))
+        if row.get("pead_qualified") is True:
+            extra.append("PEAD✓")
     else:
         if row.get("realized_usd") is not None:
             extra.append(_fmt_usd(float(row["realized_usd"])))
@@ -157,7 +162,10 @@ def _blotter_line(row: dict) -> str:
     tag = f"  ({', '.join(extra)})" if extra else ""
     reason = str(row.get("reason") or "").strip()
     rtxt = f"  — {reason[:80]}" if reason else ""
-    flag = "" if row.get("status") in ("filled", "placed") else f"  [{row.get('status')}]"
+    # placed != filled (P6): a live "placed" order is an INTENT until confirmed; "dead" never filled.
+    status = str(row.get("status") or "")
+    flag = {"filled": "", "placed": "  [placed — fill unconfirmed]",
+            "dead": "  [NOT FILLED]"}.get(status, f"  [{status}]" if status else "")
     return f"- `{t}` **{side}** {qty} {row.get('symbol')} {px}{tag}{flag}{rtxt}"
 
 
@@ -179,6 +187,51 @@ def _append_blotter(rows: list[dict]) -> None:
                         "machine-readable rows and `scripts/trade_ledger.py` for round-trips.\n\n")
             for r in day_rows:
                 f.write(_blotter_line(r) + "\n")
+
+
+def record_reconcile_events(events: list[dict], *, ts_utc: str, ts_et: str | None,
+                            mode: str) -> list[dict]:
+    """Book reconcile outcomes into the trade history (P6: placed != filled).
+
+    Converts live_execute.reconcile() log events into trade rows so the blotter and stats agree
+    with broker truth:
+      entry_filled_confirmed              -> buy  status=filled (a prior tick's placed order filled)
+      entry_unfilled / _cancelled         -> buy  status=dead   (placed order never filled — GFD
+                                                                 expired / marketable limit missed)
+      closed_external                     -> sell status=filled, price unknown (resting stop fired
+                                                                 or sold while the engine slept)
+    Rows carry order_id where known; consumers dedupe placed/terminal pairs by order_id.
+    Best-effort like record_fills — never crash a tick."""
+    rows: list[dict] = []
+    for ev in (events or []):
+        kind = ev.get("event")
+        sym = str(ev.get("symbol", "")).upper()
+        if not sym:
+            continue
+        if kind == "entry_filled_confirmed":
+            rows.append({"v": SCHEMA_VERSION, "ts_utc": ts_utc, "ts_et": ts_et, "mode": mode,
+                         "symbol": sym, "side": "buy", "status": "filled",
+                         "qty": ev.get("qty"), "price": ev.get("avg_cost"),
+                         "order_id": ev.get("order_id"),
+                         "reason": "fill confirmed by reconcile (placed on a prior tick)"})
+        elif kind in ("entry_unfilled", "entry_unfilled_cancelled"):
+            rows.append({"v": SCHEMA_VERSION, "ts_utc": ts_utc, "ts_et": ts_et, "mode": mode,
+                         "symbol": sym, "side": "buy", "status": "dead",
+                         "qty": None, "price": None, "order_id": ev.get("order_id"),
+                         "reason": "entry never filled (GFD expired / marketable limit missed)"})
+        elif kind == "closed_external":
+            rows.append({"v": SCHEMA_VERSION, "ts_utc": ts_utc, "ts_et": ts_et, "mode": mode,
+                         "symbol": sym, "side": "sell", "status": "filled",
+                         "qty": None, "price": None,
+                         "reason": ev.get("note", "position closed at broker while engine asleep"),
+                         "exit_type": "stop"})
+    if rows:
+        try:
+            _append_jsonl(TRADES_LOG, rows)
+            _append_blotter(rows)
+        except OSError:
+            pass
+    return rows
 
 
 def record_fills(results: list[dict], *, ts_utc: str, ts_et: str | None, mode: str) -> list[dict]:

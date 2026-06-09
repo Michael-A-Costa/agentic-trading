@@ -288,6 +288,42 @@ drawdowns," and the upside is unproven.
 
 ---
 
+---
+
+## Backtest 5 — does the Tier-1 soft-cut earn its keep? (`backtest_exit_policy.py --universe BOTH`, 2026-06-09)
+
+The live audit (docs/remediation-plan-2026-06-09.md P1) found the engine's Tier-1 protective sell
+(`hold_risk.py`: soft-cut at −4% "still falling" + critical-band at ~65%-of-the-way-to-stop) was
+**never backtested** — and on 2026-06-09 it fired 14× in one session, realizing −4..−9% on day-0/1 of
+15–21-day drift theses. `simulate()` now models both layers (close-of-down-day soft-cut; close-based
+critical exit), so the policy is priced instead of vibes. On top of the current live config
+(stop12 / tp40 / trail15@20), gap≥7% / vol≥2× / 15d hold, 15 bps/side:
+
+| Policy (LARGE, n=361) | mean | median | win% | sharpe |
+|---|---:|---:|---:|---:|
+| TIME-ONLY (drift ceiling) | +1.50% | +1.12% | 55% | 0.117 |
+| **LIVE + softcut8** | **+1.48%** | +0.98% | 53% | **0.141** |
+| LIVE config (no Tier-1) | +1.43% | +0.98% | 53% | 0.134 |
+| LIVE + crit65 | +1.40% | +0.94% | 53% | 0.133 |
+| LIVE + softcut6 | +1.33% | +0.74% | 51% | 0.129 |
+| LIVE + softcut4 (what was running) | **+1.04%** | **−1.82%** | **45%** | 0.104 |
+
+MIDCAP (n=601, biased but directionally consistent): softcut8 +1.88%/0.118 vs plain +1.70%/0.103;
+softcut4 +1.17%/win 36%.
+
+**Verdict:**
+1. **The −4% soft-cut was destroying ~0.4%/trade** — about a third of the entire LARGE edge — and
+   cut the win rate from 53% to 45%. Exactly the "tighter stop clips the drift on noise" failure
+   Backtest 4's trailing-stop result predicted. It is strictly worse than having no Tier-1 at all.
+2. **A DEEP soft-cut (8%) is the one Tier-1 variant that beats the plain config on mean AND sharpe
+   in both universes** — it salvages the worst losers a few days before the −12% stop without
+   clipping normal drawdown-then-drift. Adopted: `SOFT_CUT_PCT=8.0`.
+3. **The critical-band auto-sell fails the bar** (mean below plain, sharpe a wash) — disabled as a
+   sell trigger (`HOLD_RISK_CRIT_SELL=0`); the band still drives the Tier-2 re-DD cadence.
+
+Caveats: daily-bar proxy (close-of-down-day ≈ "still falling"; the live monitor reacts intraday);
+the conviction/runner exemption isn't modeled; same survivorship limits as Backtests 3–4.
+
 ## How to reproduce
 
 ```bash
@@ -312,6 +348,9 @@ python3 scripts/backtest_gap_drift.py --sweep                       # gap x hold
 python3 scripts/backtest_catalyst_book.py --universe both           # default 6x15%, gap7/hold15
 python3 scripts/backtest_catalyst_book.py --universe both --gap 5 --hold 20 --max-pos 10 --pos-pct 0.18
 python3 scripts/backtest_catalyst_book.py --sweep --universe both   # gap x hold grid w/ CAGR/MaxDD/Sharpe
+
+# Exit-policy sweep incl. the Tier-1 soft-cut/critical layer (Backtest 5)
+python3 scripts/backtest_exit_policy.py --universe BOTH
 ```
 
 Both cache history under `data/backtest/history/` on first run; subsequent runs are instant.

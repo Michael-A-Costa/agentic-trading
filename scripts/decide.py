@@ -42,6 +42,14 @@ DD_JOBS = REPO / "data" / "dd_jobs"                  # async (DD_ASYNC) mode: on
 PYEXE = sys.executable or "python3"
 
 
+def prompt_text(fname: str) -> str:
+    """Read a prompt template, substituting {MODE} with the real execution mode (PAPER/LIVE).
+    TRADING_MODE is forced by the entry script (run_paper_tick.sh / run_live_tick.sh), so the
+    agent always knows whether its commits move real money — the header used to hardcode one mode."""
+    mode = (os.environ.get("TRADING_MODE") or "paper").upper()
+    return (SCRIPTS / fname).read_text().replace("{MODE}", mode)
+
+
 def load_cache() -> dict:
     try:
         return json.loads(DD_CACHE.read_text())
@@ -438,7 +446,7 @@ def run_dd(c: dict, regime: dict, caps: dict, portfolio: dict, dd_model: str) ->
     # Per-DD wall-clock cap. Kept tight (default 240s) so that — even when several DDs run in
     # parallel — one slow web-research call can't push the tick past the ~5-min launchd cadence.
     dd_timeout = int(os.environ.get("DD_CLAUDE_TIMEOUT_S", "240"))
-    out = run_claude((SCRIPTS / "dd_prompt.txt").read_text() + dd_input,
+    out = run_claude(prompt_text("dd_prompt.txt") + dd_input,
                      dd_model, tools=DD_TOOLS, mcp=True, timeout=dd_timeout, label=f"dd:{sym}")
     if out is None:
         return {"symbol": sym, "decision": "error", "error": "dd_model_failed", "conviction": None,
@@ -467,6 +475,7 @@ def run_dd(c: dict, regime: dict, caps: dict, portfolio: dict, dd_model: str) ->
             "entry_trigger": commit.get("entry_trigger"),        # optional {price,direction} -> sentinel-armed entry
             "catalysts": commit.get("catalysts", []), "risks": commit.get("risks", []),
             "next_earnings_date": commit.get("next_earnings_date"),
+            "pead_qualified": dd.get("pead_qualified"),          # measured gap+vol signal met (label gate, P3)
             "never_buy": bool(commit.get("never_buy")),          # structural disqualifier -> exclude
             "never_buy_reason": commit.get("never_buy_reason")}
 
@@ -546,7 +555,7 @@ def run_dd_batch(fresh_jobs: list[tuple[str, dict]], regime: dict, caps: dict,
         })
 
     dd_timeout = int(os.environ.get("DD_CLAUDE_TIMEOUT_S", "240")) * len(model_jobs)
-    out = run_claude((SCRIPTS / "dd_batch_prompt.txt").read_text() + json.dumps(batch_items),
+    out = run_claude(prompt_text("dd_batch_prompt.txt") + json.dumps(batch_items),
                      dd_model, tools=DD_TOOLS, mcp=True, timeout=dd_timeout, label="dd:batch")
 
     # Error path: model failed — return error verdict for every model-evaluated symbol.
@@ -608,6 +617,7 @@ def run_dd_batch(fresh_jobs: list[tuple[str, dict]], regime: dict, caps: dict,
             "entry_trigger": commit.get("entry_trigger"),
             "catalysts": commit.get("catalysts", []), "risks": commit.get("risks", []),
             "next_earnings_date": commit.get("next_earnings_date"),
+            "pead_qualified": probed.get(sym, {}).get("pead_qualified"),  # label gate (P3)
             "never_buy": bool(commit.get("never_buy")),
             "never_buy_reason": commit.get("never_buy_reason"),
         }
@@ -671,17 +681,22 @@ def run_manage_dd(p: dict, regime: dict, caps: dict, portfolio: dict, dd_model: 
                      "current_value_usd": round(cur_val, 2), "last": p.get("last"),
                      "pnl_pct": p.get("pnl_pct"), "age_hours": age_h,
                      "og_conviction": p.get("conviction"), "og_hold_intent": p.get("hold_intent"),
-                     "og_thesis": p.get("thesis_type")},
+                     "og_thesis": p.get("thesis_type"),
+                     "pead_qualified_at_entry": p.get("pead_qualified")},
         "risk": {"score": risk.get("risk"), "band": risk.get("band"), "reasons": risk.get("reasons")},
         "sizing": {"MAX_POSITION_USD": caps["MAX_POSITION_USD"],
                    "available_headroom_usd": round(headroom, 2),
                    "available_cash": round(portfolio.get("cash", 0.0), 2)},
         "regime": regime,
         "prior_evaluation": memory.get_note(sym),
-        "dd": dd,
+        # Strip TODAY's pead_qualified from the manage packet: it tests today's gap+volume, so a
+        # PEAD position held past its gap day reads false forever after — the manage model was
+        # misreading that as "thesis invalidated" and exiting day-1 holds (seen live 2026-06-09).
+        # The signal class of the ORIGINAL entry rides along as position.pead_qualified_at_entry.
+        "dd": {k: v for k, v in dd.items() if k != "pead_qualified"},
     })
     dd_timeout = int(os.environ.get("DD_CLAUDE_TIMEOUT_S", "240"))
-    out = run_claude((SCRIPTS / "dd_manage_prompt.txt").read_text() + manage_input,
+    out = run_claude(prompt_text("dd_manage_prompt.txt") + manage_input,
                      dd_model, tools=MANAGE_TOOLS, mcp=True, timeout=dd_timeout, label=f"manage:{sym}")
     if out is None:
         return {"symbol": sym, "action": "keep", "error": "manage_model_failed",
@@ -906,12 +921,27 @@ def main() -> int:
                               never_buy=res.get("never_buy"), never_buy_reason=res.get("never_buy_reason"))
             dd_results.append(res)
             if res.get("decision") == "commit" and res.get("dollar_amount"):
+                # Downtrend = PEAD-only mode (regime-split backtest 2026-06-09): in a confirmed SPY
+                # downtrend, ONLY commits meeting the measured gap+vol signal trade (suppressing
+                # free-rein/cached commits deterministically — the screen filter can't catch cached
+                # or flat-gap earnings names), and survivors size down one tier (x0.6): the mean edge
+                # holds in downtrends (+1.74% vs +1.49% LARGE) but win rate drops 55%->48%.
+                downtrend_mode = bool(screen.get("downtrend_pead_only"))
+                if downtrend_mode and res.get("pead_qualified") is not True:
+                    print(f"  REGIME-GATE {sym}: commit suppressed — downtrend PEAD-only mode, "
+                          f"pead_qualified={res.get('pead_qualified')}")
+                    continue
+                dollar = res["dollar_amount"]
                 tag = f"DD/{res.get('conviction', '?')}" + ("/cached" if res.get("cached") else "")
+                if downtrend_mode:
+                    dollar = round(dollar * 0.6, 2)
+                    tag += "/downtrend-0.6x"
                 act = {"symbol": sym, "side": "buy",
-                       "dollar_amount": res["dollar_amount"],
+                       "dollar_amount": dollar,
                        "conviction": res.get("conviction"),     # OG DD -> persisted on the position
                        "hold_intent": res.get("hold_intent"),   #   so the Tier-1 risk monitor can reason
                        "thesis_type": res.get("catalyst_type"),
+                       "pead_qualified": res.get("pead_qualified"),  # measured-signal flag -> trade log (P3)
                        "reason": f"[{tag}] {res.get('reason', '')}"}
                 # Optional level-triggered entry: if the DD returned an entry_trigger, ARM it for the
                 # sentinel to fire on the cross instead of buying now (LLM arms, fast loop fires). No
@@ -990,7 +1020,21 @@ def main() -> int:
                             frac = max(0.0, min(1.0, float(res["trim_fraction"])))
                         except (TypeError, ValueError):
                             frac = 0.0
-                        qty = round(frac * float(p.get("qty") or 0.0), 6)
+                        lot_qty = float(p.get("qty") or 0.0)
+                        qty = round(frac * lot_qty, 6)
+                        # Whole-share discipline (live, P2): a partial sell must leave BOTH legs
+                        # whole — a fractional remainder is stop-less dust (a 0.35-share SRAD trim
+                        # re-created exactly what the dust cleanup removed). Floor the trim to
+                        # whole shares; a lot too small to split keeps (exit is the tool for real
+                        # deterioration).
+                        if (str(context.get("mode", "")).lower() == "live"
+                                and lot_qty >= 1 and lot_qty == int(lot_qty)):
+                            qty = float(int(qty))
+                            if qty < 1 or lot_qty - qty < 1:
+                                sys.stderr.write(f"[decide] manage trim {sym} skipped: "
+                                                 f"{frac:.0%} of {lot_qty:g} sh can't keep both "
+                                                 "legs whole-share (P2)\n")
+                                qty = 0.0
                         if qty > 0:
                             actions.append({"symbol": sym, "side": "sell", "qty": qty,
                                             "reason": f"[manage/trim {int(frac * 100)}%] {res.get('reason', '')}"})
@@ -1016,7 +1060,8 @@ def main() -> int:
         catalyst_log.record_events(context, candidates, dd_results)
 
     rationale = (f"{len(exits)} rule-exit(s), {len(candidates)} screened candidate(s)"
-                 + (" [hostile regime: entries off]" if screen.get("hostile_regime") else "")
+                 + (" [acute risk-off: entries off]" if screen.get("hostile_regime") else "")
+                 + (" [downtrend: PEAD-only entries, sized x0.6]" if screen.get("downtrend_pead_only") else "")
                  + (f" [book full: {book_full_note} — entries skipped]" if book_full else "")
                  + (" [entries gated: market closed/stale]" if not context.get("allow_entries") else ""))
     decision_out = {

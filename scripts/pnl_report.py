@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -41,7 +42,7 @@ EXIT_LABEL = {
 }
 
 
-def load_records(log_path: Path, since: str | None) -> list[dict]:
+def load_records(log_path: Path, since: str | None, mode: str | None = None) -> list[dict]:
     if not log_path.exists():
         raise SystemExit(f"no engine log at {log_path}")
     recs = []
@@ -54,6 +55,8 @@ def load_records(log_path: Path, since: str | None) -> list[dict]:
         except json.JSONDecodeError:
             continue  # skip a torn line rather than abort the whole report
         if since and (r.get("ts_et", "")[:10] < since):
+            continue
+        if mode and mode != "all" and str(r.get("mode", "")) != mode:
             continue
         recs.append(r)
     return recs
@@ -141,10 +144,13 @@ def show_open(state_path: Path) -> None:
         st = json.loads(state_path.read_text())
     except json.JSONDecodeError:
         return
-    pos = st.get("positions", {})
+    pos = st.get("positions") or st.get("lots") or {}   # paper_state uses "positions"; live_state "lots"
     print(f"\n{'=' * 64}\nopen positions (from {state_path.name})\n{'=' * 64}")
-    print(f"cash ${st.get('cash', 0):,.2f}   realized_total {fmt_usd(st.get('realized_total', 0.0))}"
-          f"   day {st.get('day', '?')}")
+    if st.get("cash") is not None:
+        print(f"cash ${st.get('cash', 0):,.2f}   realized_total {fmt_usd(st.get('realized_total', 0.0))}"
+              f"   day {st.get('day', '?')}")
+    else:   # live_state: no cash leg (broker owns it); show SOD equity instead
+        print(f"start-of-day equity ${st.get('start_of_day_equity', 0) or 0:,.2f}   day {st.get('day', '?')}")
     if not pos:
         print("flat — no open positions.")
         return
@@ -158,12 +164,19 @@ def show_open(state_path: Path) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Realized-P&L + exit-type breakdown from the engine log.")
     ap.add_argument("--log", type=Path, default=DEFAULT_LOG)
-    ap.add_argument("--state", type=Path, default=DEFAULT_STATE)
+    ap.add_argument("--state", type=Path, default=None,
+                    help="state file for the open-positions block (default follows --mode: "
+                         "paper_state.json for paper, live_state.json for live)")
     ap.add_argument("--since", help="ET date floor, YYYY-MM-DD (inclusive)")
+    ap.add_argument("--mode", help="filter engine-log records by mode: paper / live / live-dryrun / "
+                    "all. Default: $TRADING_MODE when set, else all (P4: mixed stats must be labeled)")
     ap.add_argument("--by-day", action="store_true", help="one summary block per ET trading day")
     args = ap.parse_args()
 
-    recs = load_records(args.log, args.since)
+    mode = args.mode or os.environ.get("TRADING_MODE") or "all"
+    print(f"MODE: {mode}" + ("  (paper + live MIXED — pass --mode live or --mode paper to split)"
+                             if mode == "all" else ""))
+    recs = load_records(args.log, args.since, mode)
     if not recs:
         print("no records in window.")
         return 0
@@ -176,7 +189,9 @@ def main() -> int:
         span = f"{recs[0].get('ts_et','')[:10]} → {recs[-1].get('ts_et','')[:10]}"
         summarize(recs, f"ALL — {span}")
 
-    show_open(args.state)
+    state = args.state or (REPO / "data" / "live_state.json" if mode.startswith("live")
+                           else DEFAULT_STATE)
+    show_open(state)
     return 0
 
 

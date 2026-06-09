@@ -63,6 +63,10 @@ def simulate(bars, i, entry, hold, pol):
     trail = pol.get("trail") or 0.0  # trail % below high-water (0 = off)
     act = pol.get("activate", 0.0)   # trail activation gain %
     be = pol.get("be")               # breakeven trigger % (None = off)
+    softcut = pol.get("softcut")     # Tier-1 soft-cut proxy (hold_risk.py): exit at the CLOSE of a
+                                     #   DOWN day this % underwater ("down past soft-cut & falling")
+    crit = pol.get("crit_frac")      # Tier-1 critical proxy: exit at the close once this fraction
+                                     #   of the way down to the catastrophe stop (risk>=70 band)
     cost_bps = pol.get("cost_bps", 15.0)
 
     stop_px = entry * (1 - cat / 100.0) if cat else None
@@ -80,6 +84,14 @@ def simulate(bars, i, entry, hold, pol):
             ret, exit_day = stop_px / entry - 1, k; break
         if tp_px is not None and h >= tp_px:              # intraday TP
             ret, exit_day = tp_px / entry - 1, k; break
+        # Tier-1 protective-sell proxies, evaluated at the CLOSE (no intraday peeking): the live
+        # monitor sells a loser that is BOTH deep underwater and still falling (soft-cut), or that
+        # has burned most of the runway to the catastrophe stop (critical).
+        c = bars[i + k]["close"]
+        if softcut is not None and c <= entry * (1 - softcut / 100.0) and c < o:
+            ret, exit_day = c / entry - 1, k; break
+        if crit is not None and cat and c <= entry * (1 - crit * cat / 100.0):
+            ret, exit_day = c / entry - 1, k; break
         # update high-water from today's high -> ratchet the stop for TOMORROW
         if h > hw:
             hw = h
@@ -137,6 +149,17 @@ def main() -> int:
         ("trail12 act0 + be10",           {"stop": 8, "tp": 25, "trail": 12, "activate": 0, "be": 10}),
         ("trail12 act15 + be10 (late)",   {"stop": 8, "tp": 25, "trail": 12, "activate": 15, "be": 10}),
         ("trail12 act0 + be10, NO tp",    {"stop": 8, "tp": None, "trail": 12, "activate": 0, "be": 10}),
+        # --- Tier-1 soft-cut audit (remediation plan P1): does the hold_risk.py protective sell
+        # earn its keep on top of the CURRENT live exit config (stop12 / tp40 / trail15@20)?
+        # softcutN = exit at the close of a down day N% underwater; crit65 = exit at the close once
+        # 65% of the way down to the catastrophe stop (~-7.8% with stop12).
+        ("LIVE cfg (stop12 tp40 tr15a20)", {"stop": 12, "tp": 40, "trail": 15, "activate": 20}),
+        ("LIVE + softcut4",                {"stop": 12, "tp": 40, "trail": 15, "activate": 20, "softcut": 4}),
+        ("LIVE + softcut6",                {"stop": 12, "tp": 40, "trail": 15, "activate": 20, "softcut": 6}),
+        ("LIVE + softcut8",                {"stop": 12, "tp": 40, "trail": 15, "activate": 20, "softcut": 8}),
+        ("LIVE + crit65",                  {"stop": 12, "tp": 40, "trail": 15, "activate": 20, "crit_frac": 0.65}),
+        ("LIVE + softcut4 + crit65",       {"stop": 12, "tp": 40, "trail": 15, "activate": 20,
+                                            "softcut": 4, "crit_frac": 0.65}),
     ]
     unis = [("LARGE", gd.LARGE), ("MIDCAP", gd.MIDCAP)] if args.universe == "BOTH" \
         else [(args.universe, gd.LARGE if args.universe == "LARGE" else gd.MIDCAP)]

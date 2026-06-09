@@ -486,10 +486,17 @@ def reconcile(state: dict, broker: dict, log: list) -> None:
         lot = lots.setdefault(sym, {"entry_ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                                     "scaled": [], "stop_type": "synthetic", "resting_stop_order_id": None,
                                     "adopted": sym not in lots})
+        was_pending = bool(lot.get("pending"))
         lot["qty"] = bp["qty"]
         lot.pop("pending", None)  # broker shows the position -> entry confirmed, no longer pending
         if bp.get("avg_cost"):
             lot["entry_price"] = bp["avg_cost"]
+        if was_pending:
+            # A prior tick logged this entry as status=placed; the broker now shows the position, so
+            # book the FILL into the trade history too (P6: placed != filled). Consumers dedupe by
+            # entry_order_id, keeping the terminal row.
+            log.append({"event": "entry_filled_confirmed", "symbol": sym, "qty": bp["qty"],
+                        "avg_cost": bp.get("avg_cost"), "order_id": lot.get("entry_order_id")})
         sl = state.get("_caps", {}).get("STOP_LOSS_PCT", 4.0)
         tp = state.get("_caps", {}).get("TAKE_PROFIT_PCT", 12.0)
         if lot.get("entry_price"):
@@ -572,9 +579,15 @@ def reconcile(state: dict, broker: dict, log: list) -> None:
                     log.append({"event": "entry_unfilled", "symbol": sym, "order_id": eoid})
                 continue
             state.setdefault("last_exit", {})[sym] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            log.append({"event": "closed_external", "symbol": sym,
-                        "note": "position gone from broker — resting stop fired or sold while engine asleep",
-                        "had_stop": stale.get("resting_stop_order_id")})
+            if stale.get("closing_order_id"):
+                # engine-initiated exit completing — the sell is already in the trade history from
+                # the placing tick, so just confirm it (no second trade row; P6 no-double-count).
+                log.append({"event": "closed_confirmed", "symbol": sym,
+                            "order_id": stale.get("closing_order_id")})
+            else:
+                log.append({"event": "closed_external", "symbol": sym,
+                            "note": "position gone from broker — resting stop fired or sold while engine asleep",
+                            "had_stop": stale.get("resting_stop_order_id")})
 
 
 def execute_sell(sym: str, action: dict, state: dict, broker: dict, caps: dict, log: list) -> dict:
@@ -635,6 +648,10 @@ def execute_sell(sym: str, action: dict, state: dict, broker: dict, caps: dict, 
                         "order_id": roid, "result": None if roid else rearm})
         return res
     res.update(status="placed", ref_id=ref_id, order_id=order_id, order=placed)
+    # Mark the lot as engine-closed so reconcile can tell THIS sell (already in the trade history)
+    # from a genuinely external closure (resting stop fired / sold outside the engine) — only the
+    # latter gets booked as a new trade row when the position disappears (P6, no double-count).
+    lot["closing_order_id"] = order_id
     log.append({"event": "sell_placed", "symbol": sym, "spec": spec, "ref_id": ref_id,
                 "order_id": order_id, "order": placed})
     return res
@@ -732,6 +749,11 @@ def execute_buy(sym: str, action: dict, state: dict, broker: dict, caps: dict,
     import rh_mcp
     lots = state["lots"]
     res = {"symbol": sym, "side": "buy", "reason": action.get("reason", ""), "status": "skipped"}
+    # carry the DD's metadata so the trade history records WHAT KIND of bet this was (P3:
+    # pead_qualified = met the measured gap+vol signal vs free-rein discretion)
+    for k in ("pead_qualified", "conviction", "hold_intent", "thesis_type"):
+        if action.get(k) is not None:
+            res[k] = action[k]
     quote = broker["quotes"].get(sym, {})
     dollar = action.get("dollar_amount")
     if dollar is None:
@@ -795,7 +817,11 @@ def execute_buy(sym: str, action: dict, state: dict, broker: dict, caps: dict,
     lots[sym] = {**lots.get(sym, {}), "entry_ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                  "scaled": lots.get(sym, {}).get("scaled", []), "stop_type": plan["stop_type"],
                  "resting_stop_order_id": None, "last_entry_ref_id": ref_id, "pending": True,
-                 "entry_order_id": order_id}
+                 "entry_order_id": order_id,
+                 # DD metadata on the lot: the Tier-1 risk monitor reasons over conviction/hold_intent,
+                 # and pead_qualified ties the eventual round-trip back to the measured signal (P3).
+                 "conviction": action.get("conviction"), "hold_intent": action.get("hold_intent"),
+                 "thesis_type": action.get("thesis_type"), "pead_qualified": action.get("pead_qualified")}
     res.update(status="placed", ref_id=ref_id, order_id=order_id, order=placed)
     log.append({"event": "buy_placed", "symbol": sym, "spec": spec, "ref_id": ref_id,
                 "order_id": order_id, "plan": plan, "order": placed})
@@ -806,6 +832,15 @@ def execute_buy(sym: str, action: dict, state: dict, broker: dict, caps: dict,
     res["stop_armed"] = bool(lots[sym].get("resting_stop_order_id"))
     res["stop_type"] = lots[sym].get("stop_type")
     res["pending"] = bool(lots[sym].get("pending"))
+    # Placed != filled (P6): when the in-tick confirmation read a real fill, upgrade the result to
+    # status=filled with the actual cost basis — the trade history then records a fill, not an intent.
+    # Still-pending orders stay status=placed; reconcile books them as filled or dead next tick.
+    if not res["pending"]:
+        res["status"] = "filled"
+        if lots[sym].get("entry_price") is not None:
+            res["price"] = lots[sym]["entry_price"]
+        if lots[sym].get("qty") is not None:
+            res["qty"] = lots[sym]["qty"]
     return res
 
 
@@ -965,6 +1000,20 @@ def main() -> int:
 
         # re-check the breaker once before any entry (deterministic, on broker numbers)
         breaker = day_pnl <= -caps.get("DAILY_MAX_LOSS_USD", 150.0)
+        # Cumulative-loss TRIPWIRE (remediation plan P8): the live run is an experiment ahead of its
+        # validation gate (filter-lift unresolved until ~2026-06-26), so it gets a pre-committed stop
+        # rule — if equity falls TRIPWIRE_PCT below the live-start baseline, HALT NEW ENTRIES (exits
+        # and stop management keep running) until the owner reviews and re-arms. Unlike the daily
+        # breaker this never resets overnight.
+        trip_base = _f(os.environ.get("LIVE_TRIPWIRE_BASELINE_USD"), 0.0) or 0.0
+        trip_pct = _f(os.environ.get("LIVE_TRIPWIRE_PCT"), 10.0) or 10.0
+        tripwire = trip_base > 0 and equity <= trip_base * (1 - trip_pct / 100.0)
+        if tripwire:
+            log.append({"event": "tripwire_halt", "equity": equity, "baseline": trip_base,
+                        "pct": trip_pct, "note": "cumulative live loss tripwire — new entries halted; "
+                        "owner review required (docs/remediation-plan-2026-06-09.md P8)"})
+            print(f"[live_execute] TRIPWIRE: equity {equity} <= {trip_base}*(1-{trip_pct}%) — "
+                  f"halting new entries (exits still active). Owner review required.", file=sys.stderr)
         # Running tallies so multiple buys in ONE tick respect the caps CUMULATIVELY: a placed buy
         # consumes buying power, adds exposure, and may open a new position slot. Without this each
         # buy checks against the pre-tick snapshot and N buys could collectively breach the caps.
@@ -981,6 +1030,11 @@ def main() -> int:
             if breaker:
                 results.append({"symbol": a.get("symbol"), "side": "buy", "status": "skipped",
                                 "reject_reason": f"circuit_breaker day_pnl={day_pnl}"})
+                continue
+            if tripwire:
+                results.append({"symbol": a.get("symbol"), "side": "buy", "status": "skipped",
+                                "reject_reason": f"tripwire_halt equity={equity} <= "
+                                                 f"{trip_base}*(1-{trip_pct}%)"})
                 continue
             if not context.get("allow_entries", False):
                 results.append({"symbol": a.get("symbol"), "side": "buy", "status": "skipped",
@@ -1040,7 +1094,7 @@ def main() -> int:
         "unsettled": round(unsettled_total, 2), "pending_deposits": broker.get("pending_deposits", 0.0),
         "exposure": round(exposure, 2),
         "equity": equity, "day_pnl": day_pnl, "results": results, "reconcile": log,
-        "n_placed": sum(1 for r in results if r.get("status") == "placed"),
+        "n_placed": sum(1 for r in results if r.get("status") in ("placed", "filled")),
         "n_skipped": sum(1 for r in results if r.get("status") in ("skipped", "dryrun")),
         "positions": broker["positions"],
         "relay_token_usage": usage_summary(),  # broker-I/O spend this tick (quotes/review/place/cancel)
@@ -1057,10 +1111,15 @@ def main() -> int:
     with ENGINE_LOG.open("a") as f:
         f.write(json.dumps(record) + "\n")
 
-    # Mirror every PLACED live order to the unified trade history (data/trades.jsonl + daily
+    # Mirror every PLACED/FILLED live order to the unified trade history (data/trades.jsonl + daily
     # blotter), tagged with mode_tag (live / live-dryrun). Best-effort; never break a tick.
     trade_log.record_fills(results, ts_utc=record["ts_utc"], ts_et=record.get("ts_et"),
                            mode=mode_tag)
+    # P6: reconcile outcomes also belong in the trade history — a prior tick's "placed" entry that
+    # never filled (dead), one the broker now confirms (filled), or a position closed while the
+    # engine slept (resting stop fired). Without these the blotter shows phantom buys as real.
+    trade_log.record_reconcile_events(log, ts_utc=record["ts_utc"], ts_et=record.get("ts_et"),
+                                      mode=mode_tag)
 
     placed = record["n_placed"]
     note = "DRY-RUN" if is_dryrun else "ARMED"

@@ -378,7 +378,10 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
     # hard STOP_LOSS_PCT stop stays the backstop under it. HOLD_RISK_SELL=0 disables the auto-sell
     # (positions are still scored, for logging + the Tier-2 manage cadence).
     hold_risk_sell = env("HOLD_RISK_SELL", "1") == "1"
-    soft_cut = envf("SOFT_CUT_PCT", 4.0)               # protective-sell a falling loser at this %
+    soft_cut = envf("SOFT_CUT_PCT", 8.0)               # protective-sell a falling loser at this %
+    # critical-band auto-sell OFF by default: backtest_exit_policy (2026-06-09) — crit65 fails to
+    # beat the plain stop on mean+sharpe; the deep soft-cut is the only Tier-1 sell that earns it.
+    crit_sell = env("HOLD_RISK_CRIT_SELL", "0") == "1"
     # Risk-adaptive re-DD cadence (minutes) by band -> drives the Tier-2 manage-DD timing (decide.py):
     # riskier holdings get re-checked sooner; a calm winner coasts.
     redd_ttl = {"low": envf("HOLD_REDD_TTL_LOW_MIN", 60.0), "medium": envf("HOLD_REDD_TTL_MED_MIN", 20.0),
@@ -395,7 +398,8 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
             continue  # need a fresh quote to (synthetically) sell against
         # Tier-1 hold-risk score (cheap, deterministic) — surfaced on the position for logging + the
         # Tier-2 manage cadence, and used below for the protective soft-cut.
-        prisk = hold_risk.score(p, now_utc, soft_cut_pct=soft_cut, redd_ttl=redd_ttl)
+        prisk = hold_risk.score(p, now_utc, soft_cut_pct=soft_cut, redd_ttl=redd_ttl,
+                                crit_sell=crit_sell)
         p["risk"] = prisk
         reason = None
         # Prefer the explicit per-position stop/TP levels set at buy; fall back to the % rule.
@@ -466,9 +470,22 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
     # regime. Ranked by intraday move (liveliest first) purely as ordering. Stage 2 (the agent) has
     # full discretion: it picks what's worth a shot (momentum / breakout / news / its own read) and the
     # hold horizon (scalp or ride). The agent IS the screen.
-    # FREE-REIN: only a CONFIRMED downtrend (risk_off) blocks entries — the seatbelt against buying into
-    # a falling market. Elevated volatility no longer blocks (more vol = more action); agent sizes down.
-    hostile = (regime.get("posture") == "risk_off")
+    # Regime gate, SPLIT by evidence (2026-06-09 regime-split backtest; docs/remediation-plan P-gate):
+    # PEAD entries during confirmed SPY downtrends kept their full mean edge (+1.74%/trade LARGE vs
+    # +1.49% benign, n=56) — a blanket downtrend blackout was discarding ~16% of historical signals.
+    # But those trades are noisier (median -0.9%, win 48% vs 55%) and free-rein pop-chasing into a
+    # falling tape is the trap the override existed to close. So:
+    #   acute stress (<=1 index green AND VIX proxy +3%) -> ALL entries off (rare, same-day pause)
+    #   confirmed downtrend (not acute)                  -> PEAD-ONLY mode: only earnings-window
+    #       candidates pass the screen; decide.py suppresses any commit whose measured gap+vol
+    #       signal (pead_qualified) is not True and sizes the survivors down one tier (x0.6).
+    posture = regime.get("posture")
+    _green, _total = regime.get("breadth_green"), regime.get("breadth_total")
+    _vix = regime.get("vix_proxy_move_pct")
+    acute = bool(posture == "risk_off" and _total and _green is not None and _green <= 1
+                 and _vix is not None and _vix > 3)
+    downtrend_pead_only = bool(posture == "risk_off" and not acute)
+    hostile = acute
     held = {p["symbol"] for p in positions}
     # A quote is only a LIVE signal during regular hours AND when it carries today's date. Don't hang
     # the whole entry gate on ONE symbol: a lone flaky Cboe fetch for SPY (seen 2026-06-09: SPY came
@@ -524,7 +541,11 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
             max_pos = caps.get("MAX_POSITION_USD", 0.0)
             if max_pos > 0 and (q.get("last") or 0.0) > max_pos:
                 continue
-            movers.append(c)                        # FREE REIN: no signal gate — the agent decides
+            # Downtrend = PEAD-only: free-rein movers don't trade into a confirmed falling market
+            # (the override's original trap); earnings-window names keep their measured edge.
+            if downtrend_pead_only and c.get("catalyst") != "earnings":
+                continue
+            movers.append(c)                        # FREE REIN (benign tape): no signal gate — the agent decides
         # PEAD candidates sort first (day 0 most urgent), then by intraday magnitude.
         movers.sort(key=lambda c: (
             1 if c.get("catalyst") == "earnings" else 2,   # PEAD leads
@@ -537,6 +558,8 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
                         f" of drift window) — gap-drift candidate")
             return (f"{c.get('intraday_pct')}% intraday, {regime.get('posture')} "
                     "regime — agent's discretion (free rein)")
+        # (downtrend_pead_only: non-earnings movers were filtered above, so every candidate here
+        #  is in its drift window; decide.py still verifies the measured gap+vol signal.)
         entry_candidates = [{"symbol": c["symbol"], "intraday_pct": c.get("intraday_pct"),
                              "range_pos": c.get("range_pos"), "last": c.get("last"),
                              **({"catalyst": c["catalyst"],
@@ -547,7 +570,8 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
                              "reason": _candidate_reason(c)}
                             for c in movers]
     screen = {"exits": exits, "entry_candidates": entry_candidates,
-              "hostile_regime": hostile, "cooling": sorted(cooling)}
+              "hostile_regime": hostile, "downtrend_pead_only": downtrend_pead_only,
+              "cooling": sorted(cooling)}
 
     # --- GATE decision (deterministic; the wrapper branches on this) ---
     gate, reason = "TRADE", ""

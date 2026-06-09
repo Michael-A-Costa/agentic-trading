@@ -192,6 +192,25 @@ def test_reconcile_pending_not_booked_closed():
     check("no cooldown for unfilled entry", "PEND" not in (state.get("last_exit") or {}))
 
 
+def test_reconcile_adoption_distinct_costs():
+    """Adopting two never-tracked broker positions derives each lot's stop/TP from ITS OWN avg
+    cost. A copy/aliasing bug in the adoption path would hand adopted lots identical risk levels —
+    the F/SRAD identical-state scare from the 2026-06-09 audit (both genuinely filled at $15.17)
+    is exactly what that bug would look like, so this pins the invariant (remediation plan P7)."""
+    state = {"lots": {}, "_caps": {"STOP_LOSS_PCT": 12.0, "TAKE_PROFIT_PCT": 40.0}}
+    broker = {"positions": {"AAA": {"qty": 1.0, "avg_cost": 20.0, "sellable": 1.0},
+                            "BBB": {"qty": 1.0, "avg_cost": 80.0, "sellable": 1.0}},
+              "orders": [], "quotes": {}}
+    le.reconcile(state, broker, log := [])
+    a, b = state["lots"]["AAA"], state["lots"]["BBB"]
+    check("both adopted", a.get("adopted") is True and b.get("adopted") is True, (a, b))
+    check("lot dicts are distinct objects", a is not b)
+    check("entry from OWN avg cost", a["entry_price"] == 20.0 and b["entry_price"] == 80.0, (a, b))
+    check("stops derived per-lot (12%)", a["stop_price"] == 17.6 and b["stop_price"] == 70.4, (a, b))
+    check("tps derived per-lot (40%)", a["take_profit_price"] == 28.0
+          and b["take_profit_price"] == 112.0, (a, b))
+
+
 def test_trail_off_by_default():
     caps = {"STOP_LOSS_PCT": 8.0}  # TRAIL_STOP_PCT absent -> off
     lot = {"entry_price": 100.0, "stop_price": 92.0, "high_water": 100.0}
@@ -532,7 +551,10 @@ def test_execute_buy_arms_stop_in_tick():
         res = le.execute_buy("ABC", {"dollar_amount": 250, "reason": "x"}, state, broker, CAPS,
                              exposure=0.0, buying_power=1000.0, n_positions=2, day_pnl=0.0, log=(log := []))
         lot = state["lots"]["ABC"]
-        check("buy placed", res["status"] == "placed", res)
+        # In-tick fill confirmation upgrades the result to status=filled with the real cost basis
+        # (P6: placed != filled) — the trade history records a fill, not just an intent.
+        check("buy filled (in-tick confirm)", res["status"] == "filled", res)
+        check("result carries the real fill price", res.get("price") == 50.05, res)
         stops = [s for s in calls["place"] if s["type"] == "stop_market"]
         check("a resting stop_market was armed in-tick", len(stops) == 1, calls)
         # STOP_LOSS_PCT 4% off the real 50.05 fill -> 48.05, whole 5 shares, GTC
@@ -687,6 +709,7 @@ if __name__ == "__main__":
              test_run_relays_parallel_overlaps_and_isolates,
              test_execute_sell_full_close_is_market, test_execute_sell_rearms_stop_on_failed_sell,
              test_reconcile_cancels_stranded_sell_then_arms,
+             test_reconcile_adoption_distinct_costs,
              test_execute_buy_arms_stop_in_tick, test_execute_buy_rereads_fill_then_arms,
              test_execute_buy_unfilled_stays_pending, test_execute_buy_synthetic_when_stop_arm_fails,
              test_live_snapshot_shared_cash_parse]

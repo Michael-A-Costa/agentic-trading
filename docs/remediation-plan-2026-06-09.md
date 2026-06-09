@@ -12,6 +12,20 @@ made the research good: **no mechanism trades real money until the harness has p
 Priorities: P1/P2 are stop-the-bleeding (do before the next live session). P3/P4 make the live
 experiment measurable. P5–P7 are hygiene. P8 is the standing decision rule.
 
+## STATUS — implemented 2026-06-09 (same day)
+
+| Item | Status |
+|---|---|
+| P1 | ✅ DONE — soft-cut layer modeled in `backtest_exit_policy.py` (Backtest 5 in `research/signal-backtests.md`). Verdict: softcut4 was destroying ~0.4%/trade (win 53→45 on LARGE); **softcut8 beats the plain config on mean AND sharpe in both universes** → re-enabled at `SOFT_CUT_PCT=8.0`; critical-band auto-sell fails the bar → `HOLD_RISK_CRIT_SELL=0` (band still drives re-DD cadence) |
+| P2 | ✅ DONE — whole-share-or-skip already enforced in `size_entry` (verified + prompt hard rule added; no `MIN_POSITION_USD` floor per owner — the ≥1-share rule IS the dust guard). All 8 fractional dust lots exited 2026-06-09 ~14:40 ET via the engine path (`cleanup/fractional-dust`); book is now 100% whole-share with resting GTC stops |
+| P3 | ✅ DONE — `pead_qualified` computed in `dd_probe.py` (gap ≥ `GAP_THRESHOLD_PCT`=5 AND rel_volume ≥ `VOL_MULT_MIN`=2; null fails closed), threaded through decide → actions → lots → `trades.jsonl` → `catalyst_events.jsonl`; labeling honesty rule in both DD prompts; `catalyst_filter_report.py` splits qualified-PEAD vs free-rein |
+| P4 | ✅ DONE — `--mode` on `trade_ledger.py` + `pnl_report.py` (default `$TRADING_MODE`, else labeled MIXED); ledger dedupes order lifecycles; `pnl_report` open-positions block follows mode (live_state vs paper_state) |
+| P5 | ✅ DONE — canary comment rewritten; dead `live_round_trip_done` stripped from state (no code read it); prompts templated `{MODE}` via `decide.prompt_text`; plan addendum added to `strategies/catalyst-drift-v1-plan.md`; memory updated |
+| P6 | ✅ DONE — in-tick-confirmed buys log `status=filled` with real cost basis; reconcile books `filled`/`dead`/`closed_external` rows (engine-initiated exits marked via `closing_order_id`, no double-count); blotter flags `[placed — fill unconfirmed]` / `[NOT FILLED]`; readers dedupe by `order_id` |
+| P7 | ✅ DONE — `test_reconcile_adoption_distinct_costs` pins per-lot stop/TP derivation (33/33 pass); F/SRAD was a real $15.17 coincidence, no bug |
+| P9 (follow-up) | ✅ DONE — **regime gate split by evidence.** The old gate blanked ALL entries whenever SPY read risk_off, including the weeks-long downtrend override. Regime-split backtest (LARGE, n=56): downtrend-day PEAD entries kept full mean edge (+1.74%/trade vs +1.49% benign) but with lower win rate (48% vs 55%); acute-stress days looked toxic but n too small to trust. New behavior: **acute stress** (≤1 index green + VIX proxy +3%) still halts all entries; **confirmed downtrend** becomes PEAD-only mode — the screen admits only earnings-window candidates, `decide.py` deterministically suppresses any commit without `pead_qualified=True` (covers cached/flat-gap commits), and survivors size down ×0.6. Free-rein entries never trade into a confirmed downtrend (the trap the override was built for). |
+| P8 | ✅ DONE — cumulative tripwire in `live_execute` (`LIVE_TRIPWIRE_BASELINE_USD=2064`, `LIVE_TRIPWIRE_PCT=10` → entries halt at equity ≤ ~$1,858, exits keep running, never resets overnight); June 26 evidence checkpoint recorded in the plan addendum |
+
 ---
 
 ## P1 — The soft-cut / critical risk-exit overrides the backtested exit policy

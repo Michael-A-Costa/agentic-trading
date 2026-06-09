@@ -67,6 +67,13 @@ def load_live_state() -> dict:
             "init_qty": lot.get("init_qty", rp["qty"]),
             "scaled": lot.get("scaled") or [],
             "stop_type": lot.get("stop_type", "synthetic"),
+            # OG DD metadata persisted on the lot at entry (execute_buy): the Tier-1 risk monitor
+            # reasons over conviction/hold_intent, and pead_qualified_at_entry tells the manage-DD
+            # what CLASS of bet this was (today's gap can't re-measure the entry signal).
+            "conviction": lot.get("conviction"),
+            "hold_intent": lot.get("hold_intent"),
+            "thesis_type": lot.get("thesis_type"),
+            "pead_qualified": lot.get("pead_qualified"),
         }
     return {
         "cash": cash, "positions": positions, "realized_total": 0.0,

@@ -1,5 +1,24 @@
 # Catalyst-Drift Engine — v1 Plan (supersedes momentum-v0 for live deployment)
 
+> **ADDENDUM 2026-06-09 — live armed AHEAD of gate #2 (owner decision), with tripwires.**
+> Validation gate #2 below ("paper-validate the filter lift, only then re-arm live") was NOT
+> satisfied when live armed on 2026-06-08: the forward filter-lift ledger had 144 events logged,
+> 0 resolved (first cohort matures ~2026-06-26). The owner chose to run live early, small-sized.
+> So the docs and reality agree, the experiment now carries pre-committed guardrails
+> (docs/remediation-plan-2026-06-09.md P8):
+> 1. **Tripwire:** live entries HALT automatically at −`LIVE_TRIPWIRE_PCT` (10%) cumulative from
+>    the live-start baseline (`LIVE_TRIPWIRE_BASELINE_USD`, $2,064) — enforced in `live_execute`.
+> 2. **Evidence checkpoint:** read `catalyst_filter_report.py` on ~2026-06-26 and weekly after;
+>    if after ≥30 resolved events the REAL/qualified-PEAD cohort shows no lift over gap-alone,
+>    disarm (this plan's own verdict: the book is then a SPY-tracker not worth live risk).
+> 3. The 2026-06-09 audit also found the unbacktested Tier-1 soft-cut was overriding the
+>    backtested exit policy (14 risk-exits in one day at −4..−9% on day-0/1 of drift theses).
+>    `backtest_exit_policy.py` now prices the layer (Backtest 5): softcut-4 was destroying
+>    ~0.4%/trade; the winning cell is `SOFT_CUT_PCT=8.0` with the critical-band auto-sell OFF
+>    (`HOLD_RISK_CRIT_SELL=0`) — adopted same day. PEAD *labeling* is now honesty-gated on the measured signal
+>    (`pead_qualified`: gap ≥ `GAP_THRESHOLD_PCT` on ≥ `VOL_MULT_MIN`× volume), so the
+>    filter-lift report can split qualified-PEAD commits from free-rein discretion.
+
 > **⚠️ SUPERSEDED same day (2026-06-05): pivoted to FREE-REIN.** The owner found catalyst gap-drift too
 > passive — "only buy a ticker that gapped >7% overnight" left the book in cash all session. This is a
 > fun, risk-it-for-the-biscuit sleeve, so the mechanical entry gate was removed entirely and the agent

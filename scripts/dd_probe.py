@@ -281,6 +281,20 @@ def probe(sym: str) -> dict:
         "extended": (d20 > 12 if (closes and d20 is not None) else None),
         "at_high": (d3h > -1.0 if (closes and d3h is not None) else None),
     }
+    # --- PEAD label gate (remediation plan P3) ---
+    # True only when the name meets the MEASURED catalyst gap-drift signal (research/signal-backtests.md
+    # Backtest 3: overnight gap >= GAP_THRESHOLD_PCT on >= VOL_MULT_MIN x normal volume — t>2 from 5%/2x).
+    # Null = unmeasurable (missing gap or volume history) — the commit prompt treats only TRUE as
+    # qualified, so unknown fails closed for the label (the trade itself is still the agent's call).
+    gap = out.get("gap_pct")
+    rv = out.get("rel_volume")
+    try:
+        _gap_thr = float(os.environ.get("GAP_THRESHOLD_PCT", "5") or 5)
+        _vol_min = float(os.environ.get("VOL_MULT_MIN", "2") or 2)
+    except ValueError:
+        _gap_thr, _vol_min = 5.0, 2.0
+    out["pead_qualified"] = (None if (gap is None or rv is None)
+                             else bool(gap >= _gap_thr and rv >= _vol_min))
     return out
 
 

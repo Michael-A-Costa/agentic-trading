@@ -26,7 +26,7 @@ def _f(x):
 
 
 def score(pos: dict, now_utc: datetime, soft_cut_pct: float = 4.0,
-          redd_ttl: dict | None = None) -> dict:
+          redd_ttl: dict | None = None, crit_sell: bool = True) -> dict:
     """Score one position. `pos` carries entry_price, stop_price, last, pnl_pct, conviction,
     hold_intent, entry_ts, range_pos (0=day low,1=day high), intraday_pct.
 
@@ -89,12 +89,15 @@ def score(pos: dict, now_utc: datetime, soft_cut_pct: float = 4.0,
             else "medium" if risk >= 25 else "low")
 
     # Protective sell: a genuinely deteriorating LOSER (down past the soft-cut AND falling), but NOT a
-    # high-conviction runner — or anything that's gone critical. A position that merely dipped and
-    # stabilized (not falling) is left alone, so this doesn't whipsaw like a flat tight stop would.
+    # high-conviction runner — or, when crit_sell, anything that's gone critical. A position that merely
+    # dipped and stabilized (not falling) is left alone, so this doesn't whipsaw like a flat tight stop.
+    # crit_sell default OFF in the engine (HOLD_RISK_CRIT_SELL): backtest_exit_policy 2026-06-09 found
+    # the critical-band auto-sell (~65% of the way to the stop) does NOT beat the plain stop on
+    # mean+sharpe, while a DEEP soft-cut (8%) does — the band still drives the re-DD cadence either way.
     falling = (intr is not None and intr < 0) or (rng is not None and rng < 0.30)
     deep = pnl is not None and pnl <= -soft_cut_pct
     runner = conv == "high" and intent == "runner"
-    protective_sell = bool((deep and falling and not runner) or band == "critical")
+    protective_sell = bool((deep and falling and not runner) or (crit_sell and band == "critical"))
     sell_reason = ""
     if protective_sell:
         head = "risk CRITICAL" if band == "critical" else f"soft-cut {pnl}% (<= -{soft_cut_pct}%) & falling"
