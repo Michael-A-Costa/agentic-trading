@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent: PAPER planner tick every 10 minutes. Simulated fills only — no real orders.
+  Pairs with com.agentic.paper-sentinel.plist (1-min fast loop).
+
+  Install:  cp scripts/com.agentic.trading-paper.plist ~/Library/LaunchAgents/
+            launchctl unload -w ~/Library/LaunchAgents/com.agentic.trading-paper.plist 2>/dev/null
+            launchctl load   -w ~/Library/LaunchAgents/com.agentic.trading-paper.plist
+  Stop:     launchctl unload -w ~/Library/LaunchAgents/com.agentic.trading-paper.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agentic.trading-paper</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/mcosta/agentic-trading/scripts/run_paper_tick.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/mcosta/agentic-trading</string>
+
+    <key>StartInterval</key>
+    <integer>600</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/mcosta/agentic-trading/data/logs/paper-tick.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/mcosta/agentic-trading/data/logs/paper-tick.err</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

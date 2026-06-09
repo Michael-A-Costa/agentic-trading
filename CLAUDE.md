@@ -111,23 +111,33 @@ Autonomous flow for a trade idea: DD / `search` / `get_equity_tradability` →
 `data/`. Skip + log if a cap or a blocking broker alert would be hit.
 
 ### Execution pipeline (how a tick runs)
-`scripts/run_trading_tick.sh` (launchd/cron, ~5 min) drives one tick: market regime →
-`tick_context.py` (deterministic screen + gate) → `decide.py` (Stage-2 DD commit) → an **executor**.
-The executor is chosen by `TRADING_MODE`:
-- **paper** (default) → `apply_decision.py`: simulates marketable-limit fills, tracks
-  `data/paper_state.json`. No real orders.
-- **live** → `broker_snapshot.py` + `live_execute.py`: real `review → place` via a tightly-scoped
-  MCP **relay agent** (`rh_mcp.py`) — Python can't call the MCP directly, so all sizing/cap/gating
-  logic stays in Python and the agent only relays. Truth is re-read from the broker;
-  `data/live_state.json` holds only our stop/TP metadata. Whole-share lots → `limit` entry + resting
-  `stop_market` GTC; fractional → `market` + synthetic stop.
+Mode is selected by **which entry script you run** — there is no `TRADING_MODE` dispatch.
+Each script forces its own mode after sourcing `.env`, so the wrong `.env` value can't
+accidentally flip modes.
 
-**Live is double-gated:** `TRADING_MODE=live` with `LIVE_ARMED!=1` is a **dry-run** (real `review`,
-logs intended orders, places nothing); `LIVE_ARMED=1` actually places (first order capped to
-`LIVE_CANARY_USD`). **Kill switch:** `TRADING_MODE=paper`, `LIVE_ARMED=0`, or disconnect the MCP.
-The live path is built and verified end-to-end against real Robinhood (2026-06-04); it still ships at
-`TRADING_MODE=paper`. Note: the agentic account's **investor profile must be completed** or `place`
-400s before the second trade.
+**Paper** (simulated, default): `run_paper_tick.sh` (launchd via `com.agentic.trading-paper.plist`,
+every 10 min) + `run_paper_sentinel.sh` (1 min). Flow: market regime →
+`tick_context.py` (deterministic screen + gate) → `decide.py` (Stage-2 DD) →
+`apply_decision.py` (simulated fill, tracks `data/paper_state.json`). No real orders.
+
+**Live** (real money): `run_live_tick.sh` (launchd via `com.agentic.trading-live.plist`,
+every 10 min) + `run_live_sentinel.sh` (1 min). Flow: precheck → market regime →
+`broker_snapshot.py` → `live_tick_context.py` (context + gate) → `decide.py` →
+`live_execute.py` (real `review → place` via the MCP relay agent `rh_mcp.py`). All
+sizing/cap/gating logic stays in Python; the agent only relays. Truth is re-read from the
+broker; `data/live_state.json` holds only our stop/TP metadata. Whole-share lots →
+`limit` entry + resting `stop_market` GTC; fractional → `market` + synthetic stop.
+
+**Live is double-gated:** running `run_live_tick.sh` with `LIVE_ARMED!=1` is a **dry-run**
+(real `review`, logs intended orders, places nothing); `LIVE_ARMED=1` actually places (first
+order capped to `LIVE_CANARY_USD`). **Kill switches** (in order of preference):
+1. `launchctl unload com.agentic.trading-live.plist` — stops the live scheduler
+2. `LIVE_ARMED=0` in `.env` — arms nothing new (dry-run mode)
+3. Disconnect the Robinhood MCP — blocks all relay calls
+
+The live path is built and verified end-to-end against real Robinhood (2026-06-04). Note:
+the agentic account's **investor profile must be completed** or `place` 400s before the
+second trade.
 
 ## Directory Structure
 
