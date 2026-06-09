@@ -60,7 +60,18 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
   # 1) market regime (public data; appends to market_conditions.jsonl)
   "$PYTHON" "${REPO}/scripts/market_conditions.py" --quiet || log "market_conditions failed (continuing)"
 
-  # 1b) LIVE only: pull the real broker state (buying power, positions, open orders) via the MCP
+  # 1b) LIVE only: fast hours pre-check (pure time math, no I/O) — bail before the 2-3 min broker
+  # snapshot when the market is plainly closed. Full tick_context runs later and confirms the gate.
+  if [ "$MODE" = "live" ]; then
+    PRECHECK="$("$PYTHON" "${REPO}/scripts/tick_context.py" --precheck 2>>"$RUN_LOG")"
+    if [[ "$PRECHECK" == GATE=SKIP:market_* ]]; then
+      log "gate: ${PRECHECK} (precheck — skipping broker snapshot)"
+      log "=== tick end (${SECONDS}s) ==="
+      exit 0
+    fi
+  fi
+
+  # 1c) LIVE only: pull the real broker state (buying power, positions, open orders) via the MCP
   # relay before anything reads it. Fail-closed — if the snapshot can't be fetched, skip the whole
   # tick rather than trade/reconcile blind. (Paper has no broker step.)
   if [ "$MODE" = "live" ]; then

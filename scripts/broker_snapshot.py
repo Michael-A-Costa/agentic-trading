@@ -16,7 +16,6 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import market_conditions as mc  # sibling: INDEXES list + env helpers
 import rh_mcp
 
 REPO = Path(__file__).resolve().parent.parent
@@ -28,14 +27,12 @@ def main() -> int:
         print("[broker_snapshot] not live mode — nothing to do", file=sys.stderr)
         return 0
 
-    # Quotes we can name up front: the always-watch pins + the index benchmarks. Held-symbol marks
-    # also come from public quotes in tick_context, so this set is best-effort, not load-bearing.
-    pins = [s.strip().upper() for s in os.environ.get(
-        "CANDIDATES", "AAPL,NVDA,TSLA,AMD,MSFT,AMZN,META,GOOGL,F,PLTR").split(",") if s.strip()]
-    symbols = sorted(set(pins) | set(mc.INDEXES))
-
+    # No quote step: held-position marks come from tick_context's public (Cboe) quotes, merged into
+    # the broker view in live_execute. Quoting the pins here was redundant AND the wrong symbol set —
+    # it left our actual holdings unmarked (marked at cost), corrupting equity/day-P&L. So the snapshot
+    # now fetches ONLY broker truth (buying power + positions + open orders) — lighter and faster.
     try:
-        snap = rh_mcp.snapshot(symbols)
+        snap = rh_mcp.snapshot()
     except Exception as e:  # noqa: BLE001 — any failure must fail closed, never trade blind
         print(f"[broker_snapshot] FATAL: snapshot failed: {e}", file=sys.stderr)
         return 2

@@ -20,8 +20,11 @@ set +a
 PYTHON="${AGENTIC_PYTHON:-/Library/Frameworks/Python.framework/Versions/3.11/bin/python3}"
 [ -x "$PYTHON" ] || PYTHON="$(command -v python3)"
 
-# The sentinel manages an existing PAPER book via simulated fills. Live exits run through the broker
-# relay + resting stop orders (not this executor), so the sentinel is a no-op in live mode.
-if [ "${TRADING_MODE:-paper}" = "live" ]; then exit 0; fi
+# LIVE: run the live fast pass — checks FRACTIONAL/synthetic stops against fresh public quotes every
+# minute and fires a protective sell on a breach (whole-share lots are covered by resting broker stops).
+# PAPER: the original sentinel manages the simulated book.
+if [ "${TRADING_MODE:-paper}" = "live" ]; then
+  exec "$PYTHON" "${REPO}/scripts/live_sentinel.py" "$@"
+fi
 
 exec "$PYTHON" "${REPO}/scripts/sentinel.py" "$@"

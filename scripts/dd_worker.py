@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # make sibling modules importable
-from decide import run_dd                       # noqa: E402  the SAME agent the tick uses
+from decide import run_dd, usage_summary        # noqa: E402  the SAME agent the tick uses
 from investigate import _context_inputs, _candidate_signal  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
@@ -65,8 +65,12 @@ def main() -> int:
         verdict = {"symbol": sym, "decision": "error", "error": f"worker_exception: {e}",
                    "conviction": None, "dollar_amount": None, "reason": "", "catalysts": [], "risks": []}
 
+    # This worker is a detached process with its OWN in-process token ledger; usage_summary() here
+    # captures exactly this symbol's DD spend. Persist it so the ingesting tick can fold it into its
+    # TOKENS line (otherwise async DD cost is incurred but never measured/logged).
     _write_atomic(job, {"symbol": sym, "status": "done", "ts": time.time(),
                         "ref_price": sig.get("last"), "ref_range_pos": sig.get("range_pos"),
+                        "usage": usage_summary(),
                         "result": verdict})
     return 0
 
