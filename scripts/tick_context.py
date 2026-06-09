@@ -123,6 +123,42 @@ def latest_regime() -> dict:
     }
 
 
+def _build_caps(equity: float, sod_equity: float) -> dict:
+    """Resolve all .env cap fractions to dollars for one tick's equity snapshot."""
+    max_pos_pct = envf("MAX_POSITION_PCT", 0.10)
+    max_exp_pct = envf("MAX_TOTAL_EXPOSURE_PCT", 0.80)
+    daily_pct = envf("DAILY_MAX_LOSS_PCT", 0.05)
+    daily_cap = envf("DAILY_MAX_LOSS_CAP_USD", 500.0)
+    per_trade_pct = envf("MAX_PER_TRADE_LOSS_PCT", 0.01)
+    return {
+        "MAX_POSITION_PCT": max_pos_pct,
+        "MAX_TOTAL_EXPOSURE_PCT": max_exp_pct,
+        "MAX_POSITION_USD": round(max_pos_pct * equity, 2),
+        "MAX_TOTAL_EXPOSURE_USD": round(max_exp_pct * equity, 2),
+        "MAX_OPEN_POSITIONS": int(envf("MAX_OPEN_POSITIONS", 10)),
+        "STOP_LOSS_PCT": envf("STOP_LOSS_PCT", 4.0),
+        "TAKE_PROFIT_PCT": envf("TAKE_PROFIT_PCT", 4.0),
+        "TRAIL_STOP_PCT": envf("TRAIL_STOP_PCT", 0.0),
+        "TRAIL_ACTIVATE_PCT": envf("TRAIL_ACTIVATE_PCT", 0.0),
+        "TRAIL_BREAKEVEN_AT_PCT": envf("TRAIL_BREAKEVEN_AT_PCT", 0.0),
+        "TRAIL_MIN_STEP_PCT": envf("TRAIL_MIN_STEP_PCT", 0.5),
+        "SIGNAL_THRESHOLD_PCT": envf("SIGNAL_THRESHOLD_PCT", 2.0),
+        "GAP_THRESHOLD_PCT": envf("GAP_THRESHOLD_PCT", 7.0),
+        "VOL_MULT_MIN": envf("VOL_MULT_MIN", 2.0),
+        "MAX_HOLD_DAYS": envf("MAX_HOLD_DAYS", 0.0),
+        "DAILY_MAX_LOSS_PCT": daily_pct,
+        "DAILY_MAX_LOSS_CAP_USD": daily_cap,
+        "DAILY_MAX_LOSS_USD": round(min(daily_pct * sod_equity, daily_cap), 2),
+        "MAX_PER_TRADE_LOSS_PCT": per_trade_pct,
+        "MAX_PER_TRADE_LOSS_USD": round(per_trade_pct * equity, 2),
+        "MIN_POSITION_USD": envf("MIN_POSITION_USD", 0.0),
+        "SLIPPAGE_BPS": envf("SLIPPAGE_BPS", 10.0),
+        "MARKETABLE_LIMIT_PCT": envf("MARKETABLE_LIMIT_PCT", 0.5),
+        "PREFER_WHOLE_SHARES": 1 if str(os.environ.get("PREFER_WHOLE_SHARES", "1")).strip().lower()
+                               not in ("0", "false", "no", "") else 0,
+    }
+
+
 def build_context(now_utc: datetime | None = None, scope: str = "full", *,
                   state: dict | None = None, mode: str = "paper") -> dict:
     """Gather one tick's full deterministic view — fresh quotes, equity-resolved caps, per-position
@@ -147,6 +183,50 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
 
     if state is None:
         state = load_state()
+
+    # Fast path: market closed and off-hours disabled → skip discovery + quote fetches entirely.
+    # session_state() is pure time math; we already know the gate will be SKIP.
+    if not monitor and not is_open and not allow_offhours:
+        pos_value = sum(p["qty"] * p["entry_price"] for p in state["positions"].values())
+        equity = round(state["cash"] + pos_value, 2)
+        sod = state.get("start_of_day_equity") or equity
+        day_pnl = round(equity - sod, 2)
+        positions = [
+            {"symbol": s, "qty": p["qty"], "entry_price": p["entry_price"],
+             "last": None, "value": round(p["qty"] * p["entry_price"], 2),
+             "pnl_usd": 0.0, "pnl_pct": None,
+             "stop_price": p.get("stop_price"), "take_profit_price": p.get("take_profit_price"),
+             "entry_ts": p.get("entry_ts"), "init_qty": p.get("init_qty", p["qty"]),
+             "scaled": p.get("scaled") or [], "stop_type": p.get("stop_type", "synthetic"),
+             "conviction": p.get("conviction"), "hold_intent": p.get("hold_intent"),
+             "thesis_type": p.get("thesis_type"), "range_pos": None, "intraday_pct": None}
+            for s, p in state["positions"].items()
+        ]
+        return {
+            "ts_utc": now_utc.isoformat(timespec="seconds"),
+            "ts_et": now_et.isoformat(timespec="seconds"),
+            "mode": mode, "session": session,
+            "market_open": False, "allow_offhours": False, "allow_entries": False,
+            "data_stale": False, "stale_reason": "market_not_open",
+            "quote_source": None,
+            "regime": latest_regime(),
+            "portfolio": {
+                "cash": round(state["cash"], 2),
+                "positions_value": round(pos_value, 2),
+                "equity": equity,
+                "start_of_day_equity": sod,
+                "day_pnl": day_pnl,
+                "realized_total": round(state.get("realized_total", 0.0), 2),
+                "open_positions": len(state["positions"]),
+            },
+            "positions": positions,
+            "candidates": [],
+            "screen": {"exits": [], "entry_candidates": [], "hostile_regime": False, "cooling": []},
+            "caps": _build_caps(equity, sod),
+            "gate": "SKIP",
+            "gate_reason": f"market_{session}",
+        }
+
     # Universe = dynamic discovery (today's top movers) + held + armed entries.
     # Pure momentum: only trade what the market is already moving. No fixed watchlist —
     # a pinned name on a quiet day is not a momentum trade. CANDIDATES is kept solely as a
@@ -164,9 +244,20 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
             sys.stderr.write(f"[tick] discovery failed, using fallback pins: {e}\n")
     # Use fallback pins ONLY when discovery produced nothing (failed or returned empty).
     pins = fallback_pins if not discovered else []
+    # PEAD discovery: stocks that reported earnings in the last PEAD_LOOKBACK_DAYS days.
+    # These are prepended so the DD agent sees them as prioritized catalyst candidates.
+    # Controlled by PEAD_DISCOVERY_ENABLED (default 1). Cached per ET trading day.
+    pead_meta: dict[str, dict] = {}
+    if not monitor and env("PEAD_DISCOVERY_ENABLED", "1") == "1":
+        try:
+            import discover_pead  # sibling; Nasdaq earnings calendar, cached per day
+            pead_meta = discover_pead.pead_meta()
+        except Exception as e:
+            sys.stderr.write(f"[tick] pead discovery failed: {e}\n")
     # Armed entries must always get a fresh quote so the sentinel can test their trigger.
     armed_syms = list((state.get("armed_entries") or {}).keys())
-    candidates = list(dict.fromkeys(discovered + pins + armed_syms))  # movers first
+    # PEAD candidates lead (freshest catalyst signal), then momentum movers, then pins/fallback.
+    candidates = list(dict.fromkeys(list(pead_meta) + discovered + pins + armed_syms))
     held = list(state["positions"].keys())
     # Index ETFs are ALWAYS fetched: SPY is the rel-strength benchmark and the market-data gate
     # needs index data — but they are excluded from entry candidates below (never momentum-buy beta).
@@ -248,63 +339,22 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
     cand = []
     for sym in candidates:
         q = quotes.get(sym) or {}
-        cand.append({
+        pm = pead_meta.get(sym)
+        entry: dict = {
             "symbol": sym, "last": q.get("last"),
             "intraday_pct": mc.intraday_pct(q) if q else None,
             "range_pos": mc.range_position(q) if q else None,
             "date": q.get("date"),  # per-symbol freshness (fail-closed: stale candidate is excluded)
-        })
+        }
+        if pm:
+            entry["catalyst"] = "earnings"
+            entry["earnings_date"] = pm["earnings_date"]
+            entry["earnings_time"] = pm["time"].replace("time-", "")
+            entry["days_since_earnings"] = pm["days_since"]
+        cand.append(entry)
 
-    # Sizing caps are a FRACTION OF LIVE EQUITY, resolved to dollars against THIS tick's equity so
-    # they auto-scale as the account compounds or draws down (no stale hard-$ ceiling frozen at the
-    # funding balance). MAX_POSITION_PCT is the SINGLE per-name concentration cap — it replaced the
-    # old MAX_SYMBOL_WEIGHT, which was the same formula (symbol_value / equity) once sizing is a %.
-    # Downstream (decide.py headroom, apply_decision checks) consumes the derived *_USD values, so we
-    # expose both the configured pct and the resolved dollars.
-    max_pos_pct = envf("MAX_POSITION_PCT", 0.10)
-    max_exp_pct = envf("MAX_TOTAL_EXPOSURE_PCT", 0.80)
-    # Daily-loss circuit breaker: a fraction of START-OF-DAY equity, but never more than a hard $
-    # ceiling. The % lets the breaker scale with the account; the cap bounds absolute daily pain once
-    # the book is large (at 5% / $500 the cap overtakes the % at $10k equity). Anchored to
-    # start-of-day equity (not live) so the day's threshold is fixed, not shrinking intraday as P&L drops.
     sod_equity = state.get("start_of_day_equity") or equity
-    daily_pct = envf("DAILY_MAX_LOSS_PCT", 0.05)
-    daily_cap = envf("DAILY_MAX_LOSS_CAP_USD", 500.0)
-    daily_max_loss = round(min(daily_pct * sod_equity, daily_cap), 2)
-    # Per-trade loss budget: a fraction of LIVE equity (matches the sizing caps). At a 4% stop this
-    # implies a max notional of 25x the budget = 25% of equity, comfortably above MAX_POSITION_PCT, so
-    # it stays a slack backstop at every account size (only bites if STOP_LOSS_PCT is widened).
-    per_trade_pct = envf("MAX_PER_TRADE_LOSS_PCT", 0.01)
-    caps = {
-        "MAX_POSITION_PCT": max_pos_pct,
-        "MAX_TOTAL_EXPOSURE_PCT": max_exp_pct,
-        "MAX_POSITION_USD": round(max_pos_pct * equity, 2),        # per-name ceiling, % of live equity
-        "MAX_TOTAL_EXPOSURE_USD": round(max_exp_pct * equity, 2),  # total invested ceiling, % of equity
-        "MAX_OPEN_POSITIONS": int(envf("MAX_OPEN_POSITIONS", 10)),
-        "STOP_LOSS_PCT": envf("STOP_LOSS_PCT", 4.0),
-        "TAKE_PROFIT_PCT": envf("TAKE_PROFIT_PCT", 4.0),
-        # Trailing stop (live path): 0 = OFF (static entry-based stop). >0 trails this % below the
-        # high-water mark, ratchet-only, beginning once a lot is up TRAIL_ACTIVATE_PCT. See live_execute.
-        "TRAIL_STOP_PCT": envf("TRAIL_STOP_PCT", 0.0),
-        "TRAIL_ACTIVATE_PCT": envf("TRAIL_ACTIVATE_PCT", 0.0),
-        "TRAIL_BREAKEVEN_AT_PCT": envf("TRAIL_BREAKEVEN_AT_PCT", 0.0),  # lift stop to entry once up this %
-        "TRAIL_MIN_STEP_PCT": envf("TRAIL_MIN_STEP_PCT", 0.5),
-        "SIGNAL_THRESHOLD_PCT": envf("SIGNAL_THRESHOLD_PCT", 2.0),  # DEPRECATED (old intraday-pop trigger)
-        "GAP_THRESHOLD_PCT": envf("GAP_THRESHOLD_PCT", 7.0),        # catalyst entry: min overnight gap %
-        "VOL_MULT_MIN": envf("VOL_MULT_MIN", 2.0),                  # catalyst entry: min volume vs 20d avg
-        "MAX_HOLD_DAYS": envf("MAX_HOLD_DAYS", 0.0),                # multi-day time-exit (drift window)
-        "DAILY_MAX_LOSS_PCT": daily_pct,
-        "DAILY_MAX_LOSS_CAP_USD": daily_cap,
-        "DAILY_MAX_LOSS_USD": daily_max_loss,                      # = min(pct * start-of-day equity, cap)
-        "MAX_PER_TRADE_LOSS_PCT": per_trade_pct,
-        "MAX_PER_TRADE_LOSS_USD": round(per_trade_pct * equity, 2),  # = pct * live equity (slack backstop)
-        "MIN_POSITION_USD": envf("MIN_POSITION_USD", 0.0),  # 0 = no floor; >0 rejects dust fills
-        # --- order execution model (marketable limits + slippage + hybrid stops) ---
-        "SLIPPAGE_BPS": envf("SLIPPAGE_BPS", 10.0),          # adverse bps applied to every paper fill
-        "MARKETABLE_LIMIT_PCT": envf("MARKETABLE_LIMIT_PCT", 0.5),  # buy limit cap above the touch
-        "PREFER_WHOLE_SHARES": 1 if str(os.environ.get("PREFER_WHOLE_SHARES", "1")).strip().lower()
-        not in ("0", "false", "no", "") else 0,             # floor buys to whole shares -> resting-stop eligible
-    }
+    caps = _build_caps(equity, sod_equity)
     regime = latest_regime()
 
     # --- DETERMINISTIC screen (rules, no LLM): exits + entry candidates ---
@@ -420,14 +470,19 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
     # a falling market. Elevated volatility no longer blocks (more vol = more action); agent sizes down.
     hostile = (regime.get("posture") == "risk_off")
     held = {p["symbol"] for p in positions}
-    # A quote is only a LIVE signal during regular hours AND when it carries today's date.
-    spy_date = (quotes.get("SPY") or {}).get("date")
-    data_stale = (spy_date != today) if spy_date else True
+    # A quote is only a LIVE signal during regular hours AND when it carries today's date. Don't hang
+    # the whole entry gate on ONE symbol: a lone flaky Cboe fetch for SPY (seen 2026-06-09: SPY came
+    # back null while QQQ/IWM/DIA were all fresh) would otherwise mark data stale and kill entries for
+    # the tick. Use the NEWEST date across the index proxies — entries gate only when EVERY proxy is
+    # missing/stale (a real data outage), not when a single one flakes.
+    ref_dates = [(quotes.get(s) or {}).get("date") for s in ("SPY", "QQQ", "IWM", "DIA")]
+    ref_date = max((d for d in ref_dates if d), default=None)
+    data_stale = (ref_date != today) if ref_date else True
     near_close = bool(no_entry_last_min > 0 and mins_to_close is not None
                       and mins_to_close <= no_entry_last_min)
     allow_entries = bool(is_open and not data_stale and not near_close)
     stale_reason = ("market_not_open" if not is_open
-                    else f"stale_quote_date={spy_date}" if data_stale
+                    else f"stale_quote_date={ref_date}" if data_stale
                     else f"within_{int(no_entry_last_min)}m_of_close" if near_close else "")
 
     # Symbols still in their post-exit cooldown window (anti-whipsaw; entries only, never exits).
@@ -470,11 +525,26 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
             if max_pos > 0 and (q.get("last") or 0.0) > max_pos:
                 continue
             movers.append(c)                        # FREE REIN: no signal gate — the agent decides
-        movers.sort(key=lambda c: -(c.get("intraday_pct") or 0))   # liveliest first (ordering only)
+        # PEAD candidates sort first (day 0 most urgent), then by intraday magnitude.
+        movers.sort(key=lambda c: (
+            1 if c.get("catalyst") == "earnings" else 2,   # PEAD leads
+            -(c.get("intraday_pct") or 0),
+        ))
+        def _candidate_reason(c: dict) -> str:
+            if c.get("catalyst") == "earnings":
+                day_label = f"day +{c['days_since_earnings']}"
+                return (f"earnings {c['earnings_date']} ({c.get('earnings_time','?')}, {day_label}"
+                        f" of drift window) — gap-drift candidate")
+            return (f"{c.get('intraday_pct')}% intraday, {regime.get('posture')} "
+                    "regime — agent's discretion (free rein)")
         entry_candidates = [{"symbol": c["symbol"], "intraday_pct": c.get("intraday_pct"),
                              "range_pos": c.get("range_pos"), "last": c.get("last"),
-                             "reason": (f"{c.get('intraday_pct')}% intraday, {regime.get('posture')} "
-                                        "regime — agent's discretion (free rein)")}
+                             **({"catalyst": c["catalyst"],
+                                 "earnings_date": c["earnings_date"],
+                                 "earnings_time": c.get("earnings_time"),
+                                 "days_since_earnings": c.get("days_since_earnings")}
+                                if c.get("catalyst") else {}),
+                             "reason": _candidate_reason(c)}
                             for c in movers]
     screen = {"exits": exits, "entry_candidates": entry_candidates,
               "hostile_regime": hostile, "cooling": sorted(cooling)}
