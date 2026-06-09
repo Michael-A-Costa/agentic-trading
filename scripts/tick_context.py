@@ -206,24 +206,26 @@ def build_context(now_utc: datetime | None = None, scope: str = "full") -> dict:
 
     is_live = env("TRADING_MODE", "paper").strip().lower() == "live"
     state = load_live_state() if is_live else load_state()
-    # Universe = dynamic discovery (today's top eligible movers) + always-watch pins + held.
-    # Discovery replaces a static stock allowlist: a momentum engine has to see what's actually
-    # moving market-wide, not a fixed watchlist. The pins (CANDIDATES) stay screened every tick and
-    # are the fallback if discovery is disabled/down. See scripts/discover.py for the eligibility filter.
-    # monitor scope skips BOTH the pins and discovery — the sentinel needs neither (no new-entry screen).
-    pinned = [] if monitor else [s.strip().upper() for s in env(
-        "CANDIDATES", "AAPL,NVDA,TSLA,AMD,MSFT,AMZN,META,GOOGL,F,PLTR").split(",") if s.strip()]
+    # Universe = dynamic discovery (today's top movers) + held + armed entries.
+    # Pure momentum: only trade what the market is already moving. No fixed watchlist —
+    # a pinned name on a quiet day is not a momentum trade. CANDIDATES is kept solely as a
+    # last-resort fallback when discovery fails entirely (rate-limit, network error); it is
+    # never mixed into an otherwise-healthy discovery result.
+    # monitor scope skips discovery — the sentinel needs neither (no new-entry screen).
+    fallback_pins = [] if monitor else [s.strip().upper() for s in env(
+        "CANDIDATES", "").split(",") if s.strip()]
     discovered = []
     if not monitor and env("DISCOVERY_ENABLED", "1") == "1":
         try:
             import discover  # sibling; keyless Nasdaq screener + eligibility filter, cached per tick
             discovered = discover.discover()
-        except Exception as e:  # discovery must NEVER break a tick — fall back to the pins
-            sys.stderr.write(f"[tick] discovery failed, using pinned candidates only: {e}\n")
-    # Armed entries (set by the planner, fired by the sentinel) must always get a fresh quote so the
-    # sentinel can test their trigger — fold them into the universe even if discovery didn't surface them.
+        except Exception as e:
+            sys.stderr.write(f"[tick] discovery failed, using fallback pins: {e}\n")
+    # Use fallback pins ONLY when discovery produced nothing (failed or returned empty).
+    pins = fallback_pins if not discovered else []
+    # Armed entries must always get a fresh quote so the sentinel can test their trigger.
     armed_syms = list((state.get("armed_entries") or {}).keys())
-    candidates = list(dict.fromkeys(discovered + pinned + armed_syms))  # ordered de-dupe (movers first)
+    candidates = list(dict.fromkeys(discovered + pins + armed_syms))  # movers first
     held = list(state["positions"].keys())
     # Index ETFs are ALWAYS fetched: SPY is the rel-strength benchmark and the market-data gate
     # needs index data — but they are excluded from entry candidates below (never momentum-buy beta).
@@ -524,6 +526,12 @@ def build_context(now_utc: datetime | None = None, scope: str = "full") -> dict:
                 continue
             if c.get("date") and c["date"] != today:
                 continue  # this symbol's own quote is stale — fail closed, skip it
+            # Whole-share-only: skip names where even 1 share exceeds the per-name cap.
+            # Buying exactly 1 share is the executor's fallback when the conviction budget
+            # is short of a share; if that 1 share itself exceeds the cap, it can never fill.
+            max_pos = caps.get("MAX_POSITION_USD", 0.0)
+            if max_pos > 0 and (q.get("last") or 0.0) > max_pos:
+                continue
             movers.append(c)                        # FREE REIN: no signal gate — the agent decides
         movers.sort(key=lambda c: -(c.get("intraday_pct") or 0))   # liveliest first (ordering only)
         entry_candidates = [{"symbol": c["symbol"], "intraday_pct": c.get("intraday_pct"),
@@ -604,5 +612,24 @@ def main() -> int:
     return 0
 
 
+def precheck() -> int:
+    """Fast hours-only gate check — no I/O, no quote fetches, no broker snapshot.
+    Prints GATE=SKIP:market_<session> or GATE=GO and exits in milliseconds.
+    Called by run_trading_tick.sh before the expensive broker_snapshot step so that
+    out-of-hours ticks bail immediately without paying the 2-3 min MCP relay cost."""
+    from datetime import datetime, timezone
+    now_et = datetime.now(timezone.utc).astimezone(mc.ET)
+    session, is_open = mc.session_state(now_et)
+    allow_offhours = env("ALLOW_OFFHOURS", "0") == "1"
+    if not is_open and not allow_offhours:
+        print(f"GATE=SKIP:market_{session}")
+    else:
+        print("GATE=GO")
+    return 0
+
+
 if __name__ == "__main__":
+    import sys as _sys
+    if "--precheck" in _sys.argv:
+        raise SystemExit(precheck())
     raise SystemExit(main())
