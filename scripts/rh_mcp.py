@@ -22,7 +22,9 @@ import json
 import os
 import re
 import sys
+import time
 
+import rh_direct  # direct Python→MCP fast path for READ snapshots (falls back to the relay below)
 from decide import run_claude  # reuse the headless-claude runner (handles --mcp-config/--allowedTools)
 
 # Minimum toolsets per role — least privilege. No web, no filesystem; the relay only touches RH.
@@ -125,28 +127,68 @@ def snapshot(symbols: list[str] | None = None) -> dict | None:
     Held-position MARKS no longer come from here: tick_context already fetches fresh public quotes for
     every holding, so quoting symbols in the snapshot was redundant AND it quoted the wrong set (the
     pins, not our holdings). The quote step is now OPT-IN (pass symbols) and OFF by default — dropping
-    it removes the ~24-symbol batch that made this the heaviest/slowest relay. Returns raw tool blobs."""
+    it removes the ~24-symbol batch that made this the heaviest/slowest relay. Returns raw tool blobs.
+
+    FAST PATH (rh_direct): these reads are deterministic HTTP, so we first try speaking the MCP
+    directly from Python (~0.3s, $0, no LLM) using the OAuth token Claude Code keeps in the keychain.
+    On ANY direct failure (token missing/expired, 401, network) we fall back to the agent relay below —
+    which connects through Claude Code and refreshes the keychain token as a side effect, so the next
+    direct call is fast again. Same {portfolio, positions, [quotes], orders, errors} shape either way."""
     acct = account()
     syms = sorted({s.upper().strip() for s in (symbols or []) if s and s.strip()})
-    steps = [f"1. get_portfolio(account_number=\"{acct}\")",
-             f"2. get_equity_positions(account_number=\"{acct}\")",
+    if rh_direct.enabled():
+        t0 = time.time()
+        try:
+            snap = rh_direct.snapshot(acct, syms)
+            print(f"[rh_mcp] snapshot via direct MCP ({time.time() - t0:.2f}s, no LLM)",
+                  file=sys.stderr)
+            return snap
+        except rh_direct.DirectError as e:
+            print(f"[rh_mcp] direct snapshot failed ({e}) — falling back to agent relay",
+                  file=sys.stderr)
+    # These reads are INDEPENDENT — none feeds another — so they're issued as ONE batch of parallel
+    # tool calls in a single agent turn, not numbered sequential "Steps". Sequential phrasing made
+    # haiku call them one-at-a-time (~4 turns), and each turn re-processes the full ~30k MCP tool
+    # schema → ~132k tok / ~31s for an 8.9KB payload. Batched, the loop collapses to ~2 turns: one
+    # that fires all calls at once, one that echoes. Same tools, same output — just fewer round-trips.
+    calls = [f"get_portfolio(account_number=\"{acct}\")",
+             f"get_equity_positions(account_number=\"{acct}\")",
              # state="confirmed" returns ONLY live resting orders (the GTC protective stops) instead
              # of the full agentic ledger. The snapshot's orders are consumed only by open_stops_for,
              # which discards every filled/cancelled/rejected row anyway — echoing the whole history
              # verbatim was the dominant relay cost (~130k tok / ~160s) AND, since only the first
              # newest-first page is fetched, recent fill/cancel churn could push an old resting stop
              # off the page, hiding it from open_stops_for and triggering a duplicate stop re-arm.
-             f"3. get_equity_orders(account_number=\"{acct}\", placed_agent=\"agentic\", state=\"confirmed\")"]
-    shape = ('{"portfolio": <result of step 1>, "positions": <result of step 2>, '
-             '"orders": <result of step 3>, "errors": {}}')
+             f"get_equity_orders(account_number=\"{acct}\", placed_agent=\"agentic\", state=\"confirmed\")"]
+    shape = ('{"portfolio": <get_portfolio result>, "positions": <get_equity_positions result>, '
+             '"orders": <get_equity_orders result>, "errors": {}}')
     if syms:  # optional: only when a caller explicitly wants broker-side marks
-        steps.insert(2, f"3. get_equity_quotes(symbols={json.dumps(syms)})")
-        steps[-1] = steps[-1].replace("3.", "4.", 1)
-        shape = ('{"portfolio": <result of step 1>, "positions": <result of step 2>, '
-                 '"quotes": <result of step 3>, "orders": <result of step 4>, "errors": {}}')
-    prompt = (f"Account: {acct}\n\nSteps:\n" + "\n".join(steps) + "\n\nOutput JSON shape:\n" + shape)
+        calls.insert(2, f"get_equity_quotes(symbols={json.dumps(syms)})")
+        shape = ('{"portfolio": <get_portfolio result>, "positions": <get_equity_positions result>, '
+                 '"quotes": <get_equity_quotes result>, "orders": <get_equity_orders result>, '
+                 '"errors": {}}')
+    prompt = (f"Account: {acct}\n\n"
+              "Make ALL of these tool calls AT ONCE in a single turn (they are independent — do NOT "
+              "wait for one before issuing the next), then output ONE JSON object with each result:\n"
+              + "\n".join(f"- {c}" for c in calls)
+              + "\n\nOutput JSON shape:\n" + shape)
     return _relay(prompt, READ_TOOLS, timeout=int(os.environ.get("RH_SNAPSHOT_TIMEOUT_S", "180")),
                   label="relay:snapshot")
+
+
+def _try_direct(fn, label: str):
+    """Run a rh_direct read fast-path; on any DirectError log + return None so the caller falls back to
+    the agent relay (which refreshes the keychain token, so the next direct call is fast again)."""
+    if not rh_direct.enabled():
+        return None
+    t0 = time.time()
+    try:
+        out = fn()
+        print(f"[rh_mcp] {label} via direct MCP ({time.time() - t0:.2f}s, no LLM)", file=sys.stderr)
+        return out
+    except rh_direct.DirectError as e:
+        print(f"[rh_mcp] direct {label} failed ({e}) — falling back to agent relay", file=sys.stderr)
+        return None
 
 
 def quotes(symbols: list[str]) -> dict | None:
@@ -156,6 +198,9 @@ def quotes(symbols: list[str]) -> dict | None:
     syms = sorted({s.upper().strip() for s in symbols if s and s.strip()})
     if not syms:
         return {"quotes": {"results": []}, "errors": {}}
+    direct = _try_direct(lambda: rh_direct.quotes(syms), f"quotes({len(syms)})")
+    if direct is not None:
+        return direct
     prompt = (
         f"Symbols: {json.dumps(syms)}\n\n"
         "Steps:\n"
@@ -172,6 +217,9 @@ def review(spec: dict) -> dict | None:
     alerts) — Python decides if any alert is blocking. The place tool is NOT in this toolset, so a
     review call can never accidentally execute."""
     acct = account()
+    direct = _try_direct(lambda: rh_direct.review(acct, spec), f"review:{spec.get('symbol', '?')}")
+    if direct is not None:
+        return direct
     params = {"account_number": acct, **spec}
     prompt = (
         "Steps:\n"
@@ -204,6 +252,10 @@ def recent_orders(symbol: str, created_at_gte: str | None = None) -> dict | None
     may place the order yet return no usable JSON), so the order id is re-read from the broker rather
     than trusted from the agent's prose. Read-only toolset — cannot place."""
     acct = account()
+    direct = _try_direct(lambda: rh_direct.recent_orders(acct, symbol, created_at_gte),
+                         f"orders:{symbol.upper()}")
+    if direct is not None:
+        return direct
     params = {"account_number": acct, "symbol": symbol.upper(), "placed_agent": "agentic"}
     if created_at_gte:
         params["created_at_gte"] = created_at_gte
