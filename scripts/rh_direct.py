@@ -9,15 +9,17 @@ module makes the SAME calls directly — ~0.3s, $0, deterministic — by reusing
 Claude Code already maintains for the MCP (macOS keychain item "Claude Code-credentials" →
 mcpOAuth.<server>.accessToken).
 
-READS ONLY. Writes (place/cancel) deliberately stay on the agent relay (rh_mcp): their owner-framed
-prompt, idempotency ref_id, and verbatim-echo reconciliation are the safety design and aren't worth
-re-implementing here.
+Covers READS (snapshot/quotes/recent_orders/review) AND WRITES (place/cancel). The LLM was only ever a
+mechanical relay — Python already decides sizing/caps/whether a review alert is blocking — so calling the
+tool directly removes the model entirely: it's deterministic, $0, ~0.3s, and can't refuse a place or
+echo unparseable prose (the two relay failure modes). Writes are safe to go direct because the order's
+ref_id is the idempotency key: a retry — relay fallback OR live_execute re-attempt — with the SAME id is
+deduped by the broker, so a network failure after the order was accepted can't double-place.
 
 Auth is best-effort, never authoritative: if the keychain token is missing/expired or the MCP returns
-401, we RAISE so the caller (rh_mcp.snapshot) falls back to the agent relay. That relay connects through
-Claude Code, which REFRESHES the keychain token as a side effect — so the next direct call is fast again.
-We never WRITE the keychain (corrupting Claude Code's credential blob would be far worse than one slow
-tick).
+401, we RAISE so the caller (rh_mcp) falls back to the agent relay. That relay connects through Claude
+Code, which REFRESHES the keychain token as a side effect — so the next direct call is fast again. We
+never WRITE the keychain (corrupting Claude Code's credential blob would be far worse than one slow tick).
 """
 from __future__ import annotations
 
@@ -202,8 +204,29 @@ def recent_orders(account: str, symbol: str, created_at_gte: str | None = None) 
 def review(account: str, spec: dict) -> dict:
     """Direct equivalent of rh_mcp.review — review_equity_order (NO execution; a read tool), returning
     {"review": <result>, "errors": {}}. Python still decides if any alert is blocking; this only fetches
-    the raw review payload. place/cancel are NOT in this path and never go direct."""
+    the raw review payload."""
     return _run([("review", "review_equity_order", {"account_number": account, **spec})])
+
+
+def place(account: str, spec: dict, ref_id: str) -> dict:
+    """Direct equivalent of rh_mcp.place — submit a real order via place_equity_order, NO LLM. Returns
+    {"order": <result>, "errors": {}} (the shape live_execute.order_obj parses). The caller MUST have
+    run review() + re-checked caps first.
+
+    ref_id is the idempotency key, and it's the safety net for going direct on a WRITE: a retry with the
+    SAME id — whether rh_mcp.place falls back to the relay, or live_execute re-attempts — is deduped by
+    the broker, so a network failure AFTER the order was accepted can't double-place. Raises DirectError
+    on a transport/auth failure (token expired, network, tool error) so rh_mcp.place falls back to the
+    relay, re-sending the same ref_id."""
+    return _run([("order", "place_equity_order", {"account_number": account, "ref_id": ref_id, **spec})])
+
+
+def cancel(account: str, order_id: str) -> dict:
+    """Direct equivalent of rh_mcp.cancel — cancel one open order by id via cancel_equity_order, NO LLM.
+    Returns {"cancel": <result>, "errors": {}}. Cancel-by-id is naturally idempotent (cancelling an
+    already-cancelled/filled order is a harmless no-op), so a relay fallback is safe. Raises DirectError
+    on a transport/auth failure so rh_mcp.cancel falls back to the relay."""
+    return _run([("cancel", "cancel_equity_order", {"account_number": account, "order_id": order_id})])
 
 
 if __name__ == "__main__":

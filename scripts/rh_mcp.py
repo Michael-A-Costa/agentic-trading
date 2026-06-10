@@ -232,8 +232,17 @@ def review(spec: dict) -> dict | None:
 
 def place(spec: dict, ref_id: str) -> dict | None:
     """Place a real order. Caller MUST have run review() and re-checked caps first. ref_id is the
-    idempotency key (re-send the SAME id on a transient retry; a new id only for a new order)."""
+    idempotency key (re-send the SAME id on a transient retry; a new id only for a new order).
+
+    FAST PATH (rh_direct): place_equity_order is just an MCP tool call — Python already decided the whole
+    order, so the LLM relay added nothing but ~40-56s, ~200-500k tokens, and two failure modes (haiku
+    refusing to place, or placing then echoing unparseable prose). We call the tool directly (~0.3s, $0,
+    deterministic). On ANY direct failure we fall back to the relay below, re-sending the SAME ref_id —
+    so the broker's idempotency prevents a double-place even if direct failed AFTER the order landed."""
     acct = account()
+    direct = _try_direct(lambda: rh_direct.place(acct, spec, ref_id), f"place:{spec.get('symbol', '?')}")
+    if direct is not None:
+        return direct
     params = {"account_number": acct, "ref_id": ref_id, **spec}
     prompt = (
         f"Submit this stock order on Robinhood account {acct} by calling place_equity_order with "
@@ -270,8 +279,14 @@ def recent_orders(symbol: str, created_at_gte: str | None = None) -> dict | None
 
 
 def cancel(order_id: str) -> dict | None:
-    """Cancel one open order by id (used to clear a resting stop before a discretionary sell)."""
+    """Cancel one open order by id (used to clear a resting stop before a discretionary sell).
+
+    FAST PATH (rh_direct): direct cancel_equity_order (~0.3s, $0, no LLM); falls back to the relay on any
+    direct failure. Cancel-by-id is idempotent, so a fallback retry is harmless."""
     acct = account()
+    direct = _try_direct(lambda: rh_direct.cancel(acct, order_id), f"cancel:{str(order_id)[:8]}")
+    if direct is not None:
+        return direct
     prompt = (
         f"Cancel this open order on Robinhood account {acct} by calling cancel_equity_order with "
         f"account_number=\"{acct}\" and order_id=\"{order_id}\".\n\n"
