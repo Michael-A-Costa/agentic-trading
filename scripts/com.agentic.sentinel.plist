@@ -22,11 +22,11 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/mcosta/agentic-trading/scripts/run_sentinel.sh</string>
+        <string>/ABSOLUTE/PATH/TO/agentic-trading/scripts/run_sentinel.sh</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/mcosta/agentic-trading</string>
+    <string>/ABSOLUTE/PATH/TO/agentic-trading</string>
 
     <key>StartInterval</key>
     <integer>60</integer>
@@ -35,9 +35,9 @@
     <false/>
 
     <key>StandardOutPath</key>
-    <string>/Users/mcosta/agentic-trading/data/logs/sentinel.out</string>
+    <string>/ABSOLUTE/PATH/TO/agentic-trading/data/logs/sentinel.out</string>
     <key>StandardErrorPath</key>
-    <string>/Users/mcosta/agentic-trading/data/logs/sentinel.err</string>
+    <string>/ABSOLUTE/PATH/TO/agentic-trading/data/logs/sentinel.err</string>
 
     <key>ProcessType</key>
     <string>Background</string>

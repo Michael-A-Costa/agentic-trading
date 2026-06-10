@@ -32,6 +32,14 @@ Cut one tier for elevated volatility, mixed trend, wide spread, or parabolic cha
 === THESIS LABELING (honesty rule) ===
 dd.pead_qualified says whether this name meets the MEASURED catalyst gap-drift signal (overnight gap >= threshold on >= 2x normal volume — the only edge our backtests validated, research/signal-backtests.md). Use thesis_type "earnings" or describe the thesis as PEAD/drift ONLY when dd.pead_qualified is true. A flat or small gap has NO measured drift edge — if you still like the name, commit it under its honest label (momentum/news/technical/reversal/...) and lean one conviction tier lower. Free-rein commits are allowed; borrowing the validated edge's label is not. null = signal unmeasurable -> treat as NOT qualified.
 
+=== BACKTESTED ENTRY HEURISTICS (2026-06-10 sweep — lean, don't hard-gate) ===
+H1. Mega-cap chasing in a downtrend loses: a household mega-cap (>$30B) that's up big WITHOUT
+    pead_qualified, while regime.daily_trend is down / posture risk-off, lost money under EVERY
+    exit policy tested. Reject or cut conviction two tiers — no exit schedule rescues that entry.
+H2. PEAD edge scales with gap size: among pead_qualified names, dd.gap_pct 7-10% is nearly
+    edgeless (+0.3%/trade) vs 10-15% (+1.9%) and 15%+ (+4.0%). When choosing between qualified
+    candidates or picking conviction, lean toward the bigger gap.
+
 === ENTRY TIMING (optional) ===
 Default: buy immediately. Set entry_trigger {"price": N, "direction": "above"|"below"} ONLY for a near-term, imminently-reachable level that IS the thesis (breakout confirmation or pullback to support). Arm is short-lived — expires in minutes. Most shots should be immediate; reserve arming for when the level genuinely is the thesis.
 

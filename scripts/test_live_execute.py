@@ -717,6 +717,21 @@ def test_execute_buy_synthetic_when_stop_arm_fails():
         sys.modules["rh_mcp"] = saved if saved is not None else sys.modules.pop("rh_mcp", None)
 
 
+def test_lot_take_profit_pct_per_book_overlay():
+    """Two-book v2.1 exit overlay: a disco lot harvests at DISCO_TAKE_PROFIT_PCT, but live only
+    honours it once DISCO_EXITS_LIVE=1 (paper validates first). pead lots always keep the global
+    let-run TP; unlabeled (pre-split) lots default to disco, like book_of()."""
+    import live_execute as lx
+    gated = {"TAKE_PROFIT_PCT": 40.0, "DISCO_TAKE_PROFIT_PCT": 10.0, "DISCO_EXITS_LIVE": 0}
+    armed = {"TAKE_PROFIT_PCT": 40.0, "DISCO_TAKE_PROFIT_PCT": 10.0, "DISCO_EXITS_LIVE": 1}
+    check("live gated -> disco keeps global TP", lx.lot_take_profit_pct({"book": "disco"}, gated) == 40.0)
+    check("live armed -> disco harvests at 10", lx.lot_take_profit_pct({"book": "disco"}, armed) == 10.0)
+    check("pead always let-run", lx.lot_take_profit_pct({"book": "pead"}, armed) == 40.0)
+    check("unlabeled lot defaults to disco", lx.lot_take_profit_pct({}, armed) == 10.0)
+    check("overlay unset -> global TP", lx.lot_take_profit_pct({"book": "disco"},
+                                                               {"TAKE_PROFIT_PCT": 40.0}) == 40.0)
+
+
 def test_live_snapshot_shared_cash_parse():
     """Regression for the breaker bug: cash (full NAV leg) and buying_power (spendable) are DISTINCT on
     a cash account, and the executor + gate now parse them from the ONE shared module so they can't
@@ -763,6 +778,7 @@ if __name__ == "__main__":
              test_reconcile_adoption_distinct_costs,
              test_execute_buy_arms_stop_in_tick, test_execute_buy_rereads_fill_then_arms,
              test_execute_buy_unfilled_stays_pending, test_execute_buy_synthetic_when_stop_arm_fails,
+             test_lot_take_profit_pct_per_book_overlay,
              test_live_snapshot_shared_cash_parse]
     for fn in tests:
         fn()

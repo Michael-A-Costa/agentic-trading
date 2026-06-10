@@ -138,6 +138,17 @@ def _build_caps(equity: float, sod_equity: float) -> dict:
         "MAX_OPEN_POSITIONS": int(envf("MAX_OPEN_POSITIONS", 10)),
         "STOP_LOSS_PCT": envf("STOP_LOSS_PCT", 4.0),
         "TAKE_PROFIT_PCT": envf("TAKE_PROFIT_PCT", 4.0),
+        # Per-book exit overlay (two-book v2.1): disco lots take profit at a TIGHTER level than the
+        # pead let-run TP. 0/unset = off (disco uses the global TAKE_PROFIT_PCT). Backtested
+        # 2026-06-10 (playbook §6e/6f + exit-strategy-findings doc): on the movers entry disco
+        # actually trades, a +10-15% full exit beats let-run on win%/median/give-back at zero mean
+        # cost, and dominates at the account level at every slot count tested (4-30).
+        "DISCO_TAKE_PROFIT_PCT": envf("DISCO_TAKE_PROFIT_PCT", 0.0),
+        # Live arming gate for the overlay: paper applies DISCO_TAKE_PROFIT_PCT immediately (it IS
+        # the validation bed); live ignores it until this flag is 1 (flip after >=30 paper disco
+        # round-trips per the two-book disarm rule).
+        "DISCO_EXITS_LIVE": 1 if str(os.environ.get("DISCO_EXITS_LIVE", "0")).strip().lower()
+                            not in ("0", "false", "no", "") else 0,
         "TRAIL_STOP_PCT": envf("TRAIL_STOP_PCT", 0.0),
         "TRAIL_ACTIVATE_PCT": envf("TRAIL_ACTIVATE_PCT", 0.0),
         "TRAIL_BREAKEVEN_AT_PCT": envf("TRAIL_BREAKEVEN_AT_PCT", 0.0),
@@ -383,6 +394,11 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
     # --- DETERMINISTIC screen (rules, no LLM): exits + entry candidates ---
     # Exits are pure risk rules — never a model decision. Stop/TP first, then time-based exits.
     tp, sl = caps["TAKE_PROFIT_PCT"], caps["STOP_LOSS_PCT"]
+    # Per-book TP overlay for the fallback %-rule below (lots normally carry an explicit
+    # take_profit_price set at entry, already book-aware; this covers legacy lots without one).
+    # Paper applies the disco override immediately; live only once DISCO_EXITS_LIVE=1.
+    disco_tp = caps.get("DISCO_TAKE_PROFIT_PCT", 0.0) or 0.0
+    disco_tp_on = disco_tp > 0 and (mode != "live" or bool(caps.get("DISCO_EXITS_LIVE")))
     # FREE-REIN trader (owner mandate 2026-06-05): NO mechanical entry signal — the agent picks.
     # The deterministic layer only gathers the day's tradable movers + enforces the risk seatbelts
     # (stops, caps, daily breaker); Stage-2 (the agent) decides what's worth a shot and for how long.
@@ -425,6 +441,7 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
                                 crit_sell=crit_sell)
         p["risk"] = prisk
         reason = None
+        eff_tp = disco_tp if (disco_tp_on and str(p.get("book") or "disco") == "disco") else tp
         # Prefer the explicit per-position stop/TP levels set at buy; fall back to the % rule.
         # "synthetic stop" = enforced here at tick time, NOT a resting broker order (no gap cover).
         if sp is not None and lp <= sp:
@@ -433,8 +450,8 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
             reason = f"take-profit hit: {lp} >= {tpp} ({pp}%)"
         elif sp is None and pp is not None and pp <= -sl:
             reason = f"stop-loss {pp}% <= -{sl}%"
-        elif tpp is None and pp is not None and pp >= tp:
-            reason = f"take-profit {pp}% >= {tp}%"
+        elif tpp is None and pp is not None and pp >= eff_tp:
+            reason = f"take-profit {pp}% >= {eff_tp}%"
         # Tier-1 SMART soft-cut: bail a deteriorating loser before the hard stop (risk monitor's call).
         elif hold_risk_sell and prisk.get("protective_sell"):
             reason = f"risk-exit: {prisk.get('sell_reason')}"

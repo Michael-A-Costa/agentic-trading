@@ -285,6 +285,13 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
         new_qty = prev["qty"] + qty
         new_entry = (prev["qty"] * prev["entry_price"] + qty * buy_px) / new_qty
         sl, tp = caps.get("STOP_LOSS_PCT", 2.0), caps.get("TAKE_PROFIT_PCT", 4.0)
+        # Per-book exit overlay (two-book v2.1): disco lots harvest at the tighter
+        # DISCO_TAKE_PROFIT_PCT; pead keeps the global let-run TP. Paper applies it immediately —
+        # paper IS the validation bed for the overlay (live gates on DISCO_EXITS_LIVE).
+        lot_book = str(action.get("book") or prev.get("book") or "disco")
+        disco_tp = caps.get("DISCO_TAKE_PROFIT_PCT", 0.0) or 0.0
+        if lot_book == "disco" and disco_tp > 0:
+            tp = disco_tp
         # All new entries are whole-share lots, so new_qty should always be a whole number here.
         # The check is kept as a safety net (averaging into a pre-existing fractional position
         # could leave a non-integer total). In PAPER both still settle at the next tick; the
@@ -307,7 +314,7 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
                           "pead_qualified": (action.get("pead_qualified")
                                              if action.get("pead_qualified") is not None
                                              else prev.get("pead_qualified")),  # P3 signal-class tag
-                          "book": str(action.get("book") or prev.get("book") or "disco"),  # two-book lot owner
+                          "book": lot_book,  # two-book lot owner (also picked the TP overlay above)
                           "scaled": prev.get("scaled", [])}  # tiers already taken (preserved when averaging in)
         state["cash"] -= notional
         result.update(status="filled", qty=round(qty, 6), price=round(buy_px, 4),

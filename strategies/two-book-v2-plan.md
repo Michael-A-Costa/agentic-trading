@@ -217,3 +217,117 @@ reserve proves insufficient.
    running). Pre-committed now,
    before results exist, for the same reason the PEAD gate was: the kill threshold must be set
    while we don't know the answer, or sunk-cost reasoning will set it later.
+
+---
+
+# v2.1 Addendum — Per-Book Exit Profiles (hybrid: drift vs quick-win)
+
+**Drafted:** 2026-06-10 · **Status:** PROPOSED (design only; owner reviewing before any code).
+**Extends** the v2 split above. v2 routes by *provenance* and shares one exit policy
+("Exits: unchanged" for both books, §Design table line 40). This addendum makes the **exit policy
+itself book-aware**, so the two books run two *return profiles* — without touching the entry
+routing, capital model, or disarm rules already specified.
+
+## Why (owner intent, 2026-06-10)
+
+The owner wants three things from the account: **(1) downside protection, (2) quick wins,
+(3) a little money along the way.** The backtested exit policy optimises the *opposite* profile —
+fewer/bigger/slower/bumpier — because that is what the one validated edge (catalyst gap-drift)
+requires. These are genuinely different objectives. Rather than detune the proven edge, split the
+objective by book, which we already have the substrate for:
+
+| Book | Profile | Rationale |
+|---|---|---|
+| `pead` | **Let winners run** (today's exits, unchanged) | The *only* universe where a multi-day edge is validated (t≈3.1 LARGE-cap). Patience is earned here. |
+| `disco` | **Quick wins + bank along the way + protection** | The names with **no** validated multi-day edge (all of 2026-06-10's fills). Harvest fast *because* the hold can't be trusted. Serves owner goals 2 & 3; goal 1 is the shared layer below. |
+
+This is the honest version of the hybrid: apply patience only where there is evidence for it.
+
+## Shared vs per-book — the split of the exit schedule
+
+**Shared / global (downside protection — both books want it, unchanged):**
+- `STOP_LOSS_PCT=12` — catastrophe stop.
+- `SOFT_CUT_PCT=8` + `HOLD_RISK_SELL=1` — cut a loser that's deep **and** still falling (`hold_risk.py`).
+- `TRAIL_BREAKEVEN_AT_PCT=12` — lift stop to entry once peak ≥+12% (set 2026-06-10; backtest-neutral
+  on pead, pure insurance on disco). Goal 1 is therefore **already live for both books today.**
+
+**Per-book (the profit-harvest profile — NEW overrides, `disco` only; `pead` = the globals):**
+```bash
+DISCO_TAKE_PROFIT_PCT=10        # full-lot exit target for disco (vs pead's far TAKE_PROFIT_PCT=40).
+                                #   The PRIMARY quick-win lever at current equity (see whole-share note).
+DISCO_SCALE_OUT_TIERS=         # OPTIONAL tiered trim, e.g. "5:0.5" = sell 50% at +5%, ride the rest.
+                                #   Default OFF at $2k equity (whole-share math defeats thirds — see below).
+DISCO_TRAIL_ACTIVATE_PCT=      # OPTIONAL: lower than pead's 20 so the disco remainder trails sooner.
+                                #   Default = inherit global (don't over-tune what we can't backtest).
+```
+`pead` lots read the existing globals verbatim. A disco knob left blank inherits the global, so the
+change is strictly additive and reversible (clear the DISCO_* vars → identical to today).
+
+## The whole-share reality check (do not skip)
+
+At ~$2k equity with `MAX_POSITION_PCT=0.15` (~$310/name), disco lots are **1–7 shares** (today: CBRL 2,
+ALOY 7, BKH 1…). Tiered scale-out by *thirds* is barely expressible: ⅓ of a 2-share lot rounds to 0 or
+1 (a 0%/50% trim, not 33%). So:
+
+- **At current equity, the quick-win lever is a single tighter full-exit TP (`DISCO_TAKE_PROFIT_PCT≈10`),
+  NOT fractional scale-outs.** Cleaner, whole-share-native, and it still delivers "quick wins" + caps
+  give-back. Recommend starting here.
+- **Scale-out tiers are an equity-scales-up feature.** Spec the knob now; default it OFF until lots are
+  large enough that a trim is ≥2 whole shares. Implementation rule when on: **trim whole shares only; a
+  tier rounding to 0 shares is skipped; a lot too small to trim rides to TP/trail.** Never create a
+  fractional remnant on purpose (fractional = synthetic-stop-only, no overnight protection — v2 plan §Other).
+
+## Constraints this profile stresses
+
+- **GFV / settled cash (cash account).** Quick-win = higher turnover = more proceeds stuck in T+1
+  settlement and more Good-Faith-Violation surface if disco re-deploys fast. `CASH_SETTLEMENT_GUARD`
+  already gates sizing on *settled* cash, so it fails safe (skips, doesn't violate), but disco may sit
+  cash-starved more often. Measure it; this is the cost of churn in a cash account. (See the GFV note.)
+- **Ledger attribution.** A tighter TP and any scale-out produce partial round-trips. `trade_ledger.py`
+  FIFO already handles partial sells; the disco expectancy calc must treat multiple exits per entry as
+  one round-trip's net. Verify before reading the verdict.
+- **No honest backtest exists for disco.** `backtest_exit_policy.py` is the **pead** universe
+  (mega-cap gap events). The disco universe is the small/mid discretionary tape our own research flagged
+  as survivorship+recency biased. So these numbers (TP 10, tiers) are **reasoned starting points, not
+  validated** — they MUST be earned forward in paper, not asserted.
+
+## File-mapped changes
+
+1. **`scripts/live_execute.py`** — add `book_caps(lot, caps) → dict` that overlays `DISCO_*` onto the
+   base caps when `book_of(lot)=="disco"`. Route `trail_stop_price`, the TP check, and (if enabled)
+   scale-out through `book_caps(lot, caps)` instead of the global `caps`. `pead` lots get the base dict
+   unchanged.
+2. **`scripts/apply_decision.py`** — mirror the same `book_caps` overlay in the paper exit path
+   (keep-in-sync with live, per the existing parity note).
+3. **`scripts/tick_context.py`** — resolve `DISCO_TAKE_PROFIT_PCT` / `DISCO_SCALE_OUT_TIERS` /
+   `DISCO_TRAIL_ACTIVATE_PCT` into `caps` via `envf` (alongside the existing exit knobs at ~line 143).
+4. **`.env` + `.env.example`** — the three knobs above, documented; `DISCO_TAKE_PROFIT_PCT=10` to start,
+   tiers + trail-activate blank (OFF/inherit).
+5. **`scripts/test_live_execute.py`** — unit tests: a disco lot exits at `DISCO_TAKE_PROFIT_PCT`; a pead
+   lot ignores the disco knobs; the whole-share trim-rounding rule (tier→0 shares skipped).
+6. **`scripts/pnl_report.py`** — the existing `--by-book` split already separates the verdicts; confirm
+   partial-exit round-trips aggregate correctly per book.
+
+## Validation & rollout (paper-first — no live money on a guess)
+
+This is an **exit-profile** change, orthogonal to the v2 **capital-enforcement** Phase 1
+(`BOOKS_ENABLED`). Books are already *tagged* (Phase 0 live), so per-book exits can be exercised with
+`BOOKS_ENABLED=0`.
+
+- **Step A — paper.** Ship behind paper (`run_paper_tick.sh` already routes books). Run ≥2 weeks /
+  ≥30 disco round-trips. Read disco **expectancy net of costs** (`pnl_report.py --by-book`) and compare
+  to the pre-change disco round-trips already in `trades.jsonl` (the honest baseline; note regime drift
+  confounds an A/B in one account — flag it, don't hide it).
+- **Step B — promote** to live only if disco-quick-win expectancy ≥ baseline disco net of costs **and**
+  the GFV/cash-starvation cost (Step A measurement) is tolerable. Fold into the **2026-06-26** checkpoint
+  that already reads both books.
+- **Kill path unchanged:** disco's existing disarm (≥30 round-trips, expectancy<0, or P&L tripwire ×2)
+  governs the whole book regardless of exit profile.
+
+## Open questions for the owner
+
+1. **TP level:** start `DISCO_TAKE_PROFIT_PCT` at **10**? (Quick, whole-share-clean. 8 = quicker/smaller,
+   15 = closer to a swing.)
+2. **Scale-out:** leave tiers OFF until equity grows (recommended), or force a single **50%@+5%** trim
+   now to literally bank "a little along the way" despite the rounding coarseness?
+3. **Disco trail:** leave the remainder on the global trail15@20, or trail the post-TP remnant sooner?

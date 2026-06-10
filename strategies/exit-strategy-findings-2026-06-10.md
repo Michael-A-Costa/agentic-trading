@@ -1,0 +1,152 @@
+# Exit-Strategy Findings & Recommendations — 2026-06-10
+
+**What this is:** the conclusions of the full exit-policy research campaign (playbook §6a–6e):
+~62 hand-curated strategies across ~900 cohort evaluations, then a **101,520-config full-factorial
+search** (~557k evaluations: 3 cohorts × split-half validation × a 6-slot portfolio sim each).
+Methodology, raw tables, and reproduction commands live in `strategies/exit-backtest-playbook.md`;
+charts in `data/backtest/plots/`; the full grid in `data/backtest/megasweep_results.json`.
+
+**The question:** the account runs two books — `pead` (validated mega-cap gap-drift edge) and
+`disco` (free-rein discretionary movers). What exit schedule should each run, and how should the
+owner think about the mean-vs-median dial?
+
+---
+
+## 1. The five findings that matter
+
+### F1. The two books need OPPOSITE exits — and now we know why.
+The exit that's right depends on the **entry's return shape**, not on taste:
+- **PEAD entries** (gap ≥7% + 2× volume, mega-cap) have a fat right tail — a minority of trades
+  drift +20–40% and pay for everything. Any harvest (TP or scale-out) clips that tail: every
+  quick-win variant is *significantly* mean-worse (paired bootstrap CIs exclude zero). Let-run wins.
+- **Movers entries** (what disco actually buys: big day's gainers, no gap/volume gate) have a
+  **fat middle and no reliable right tail** — the median trade *touches* +10% within 15 days, but
+  let-run rides it back down (win% 38%, median −0.30%, give-back 34%). Here harvesting is free on
+  mean (CIs straddle zero) and transformative on everything else.
+
+### F2. Under binding capital, full-exit TPs dominate EVERYTHING — including scale-outs.
+The per-trade tables hide the account-level effect: live disco sees ~25 candidates/day against ~6
+full-size slots, so capital binds. In the 6-slot portfolio sim on the movers stream:
+- tight TP frees the slot in ~5–6 days and recycles: protected TP15 compounds **13.1x**, TP10
+  **7.0x**, vs let-run **2.3x** (and with lower drawdown).
+- **scale-outs look pretty per-trade but lose at the account level (~1.9–2.7x)** — the remnant
+  occupies the slot for the full hold, so you pay let-run's slot cost for half the position.
+This flipped my earlier recommendation: the 50%@8 trim was the right call *per-trade*; the full
+TP is the right call *for the account*.
+
+**Slot-count robustness (owner challenge, tested K = 4→30, playbook §6f):** the TP-over-let-run
+ranking holds at *every* slot count on every movers stream — the margin narrows as utilization
+approaches 100% (combined stream, K=30: TP15 1.73x vs let-run 1.48x) but never flips, because even
+with idle capital TP15 earns the same per-trade mean in 6.7 days that let-run takes 8.9 to earn.
+Note the mapping: the sim's K = position-sized chunks of capital, and live's 15%-position /
+95%-exposure caps make the effective K ≈ 6 full-size (≈10–15 with conviction-tiered smaller
+entries) even when 20–30 names are held — `MAX_OPEN_POSITIONS=30` caps the name count, not the
+sizing. In that effective band the TP advantage is 2–4x, not marginal. Scale-outs and ladders never
+beat the TP family at any K.
+
+### F3. Protection (stop12 / softcut8) is an insurance premium of ~1%/trade — pay it anyway.
+The factorial's raw "winners" on the disco cohort are all **no-stop configs** (mean roughly doubles
+without the stop). That is the survivorship trap, quantified: our universe only contains names that
+still exist — the −60% delisted disasters that the stop exists for are invisible to the backtest.
+Priced on matched configs (tp12): stop12/sc8 costs mean +1.88% → +0.91%. We pay it. Also: stop8 is
+strictly worse than stop12 everywhere (clips normal noise), and the breakeven rung (be10–15) is
+free. **Protection layer stays exactly as live: stop12 / softcut8 / be12.**
+
+### F4. The pead config is already at the global optimum — with one optional tweak.
+Out of 101,520 configs, the top of the PEAD-L leaderboard (ranked on half the years, verified on
+the other half) is the *current live config's immediate family*. Nothing structurally different
+beats it. The only consistent improvement: **dropping the +40% take-profit entirely** (+1.30% →
++1.51% mean; the TP occasionally clips a monster). It's within the noise floor (SE ≈ ±0.5%), but
+it's directionally free — the TP almost never binds, and when it does, it's wrong.
+
+### F5. The numbers are honest about their own limits.
+Split-half rank correlation across all 101k configs: **+0.65 (PEAD-L) / +0.62 (MOV-M)** — the
+leaderboard *structure* is real, not noise-mining. But: MIDCAP is survivorship-biased (trust
+direction, not magnitude — the 13x/110x portfolio numbers are shapes, not promises), 2025 was the
+worst disco-proxy year in the sample, daily bars understate intraday whipsaw, and T+1 settlement
+(cash account, GFV guard) will eat part of any velocity edge. Nothing here skips the paper gate.
+
+---
+
+## 2. The mean-vs-median dial (owner's tolerance choice)
+
+All on the disco/movers cohort, all with stop12/sc8 protection. One row = one personality:
+
+| Dial setting | Config | mean | median | win% | give-back | 6-slot port | Who picks this |
+|---|---|---|---|---|---|---|---|
+| **Max consistency** | TP8 | +0.71% | **+7.70%** | **60%** | **11%** | 5.3x | "I want most days green and almost no give-back" |
+| **Quick-win (recommended)** | **TP10** | +0.87% | +9.70%¹ | 56% | 15% | 7.0x | The stated goals: quick wins, bank along the way |
+| **Balanced compounder** | TP15 | **+1.03%** | −1.60% | 48% | 24% | **13.1x** | "Maximize account growth, accept red medians" |
+| **Keep some upside** | 50%@10 trim + be10, no TP | +1.20% | +4.14% | 55% | 16% | 1.9x | "I can't stand fully exiting a runner" — costs slot velocity |
+| **Max mean per trade** | let-run (pead style) | +1.03%² | −0.30% | 38% | 34% | 2.3x | Nobody, on this entry. This is what we're moving OFF |
+
+¹ TP10's +9.7% median says the *majority* of movers touch +10% net within the hold — and let-run
+gives it back (that 34% give-back rate is the owner's original complaint, measured).
+² Identical mean to TP15 — on movers you give up *nothing* in expectancy by harvesting at +15%.
+
+**The honest framing:** on disco there is no mean-vs-median trade-off to agonize over — TP15
+matches let-run's mean exactly while compounding ~6x better at the account level. The real dial is
+**median/win% (TP8–10) vs mean/compounding (TP15)**. TP10 vs TP15 is personality, not statistics.
+
+On **pead** the trade-off is real and resolved the other way: harvesting costs ~0.5%/trade of true
+edge. Don't harvest pead.
+
+---
+
+## 3. Recommendation — concrete config
+
+**pead book (no behavior change, one optional tweak):**
+```
+STOP_LOSS_PCT=12  SOFT_CUT_PCT=8  TRAIL_BREAKEVEN_AT_PCT=12     # unchanged
+TRAIL_STOP_PCT=15  TRAIL_ACTIVATE_PCT=20                        # unchanged
+TAKE_PROFIT_PCT=40 -> consider OFF/raise to 60+                 # optional, +0.2%/trade suggestive
+```
+
+**disco book (the change — via the two-book v2.1 per-book overlay, behind `BOOKS_ENABLED=1`):**
+```
+DISCO_TAKE_PROFIT_PCT=10        # primary recommendation (the owner's stated goals)
+DISCO_SCALE_OUT_TIERS=          # empty — scale-out is dominated under binding capital (F2)
+# protection stays global: stop12 / softcut8 / be12 (F3)
+# if total-return priority wins the day instead: DISCO_TAKE_PROFIT_PCT=15
+```
+
+**IMPLEMENTED 2026-06-10 (same session):** the per-book TP overlay is live in code —
+`apply_decision.py` (paper, applies immediately), `live_execute.lot_take_profit_pct()` (gated
+behind `DISCO_EXITS_LIVE=1`), `tick_context.py` (caps plumbing + book-aware fallback %-rule).
+`.env` set: `DISCO_TAKE_PROFIT_PCT=10`, `DISCO_EXITS_LIVE=0` → **paper is validating the +10%
+disco harvest as of now; live behavior unchanged.** Unit-tested
+(`test_lot_take_profit_pct_per_book_overlay`, suite 150/150). DD prompts carry the two entry
+heuristics (mega-cap-downtrend skip, gap-size ranking). Deferral telemetry already existed.
+
+**Rollout (unchanged discipline):**
+1. Paper first: ≥30 disco round-trips with the TP, judged via `pnl_report.py --by-book` against
+   the let-run history. The backtest question is settled; the universe question only paper answers.
+2. Log slot occupancy + GFV-guard deferrals (the velocity edge only exists if slots actually bind —
+   confirm with live telemetry; if disco never fills its slots, the per-trade view favors TP10–12
+   anyway, so the recommendation is robust either way).
+3. Disarm rule stands: ≥30 round-trips with negative net expectancy, or the book tripwire twice →
+   `BOOK_DISCO_ENABLED=0`.
+
+**Entry-side bonus findings** (not exit, but the grid surfaced them):
+- The pead edge concentrates in **gaps ≥10%** (+0.31%/trade at 7–10% gap vs +1.94% at 10–15%):
+  when DD slots are scarce, rank pead candidates by gap size.
+- **Mega-cap movers bought in a downtrend (SPY<50dMA) lose under every exit tested** — that's an
+  entry mistake no exit fixes; worth a line in the DD prompt.
+- Disco's harvest needs no regime switch (TP10 is the *best* risk-off policy on movers).
+
+---
+
+## 4. What was tested (for the record)
+
+| Phase | Strategies | Evaluations |
+|---|---|---|
+| Hand-curated sweeps (§6a–6b) | 26 | ~100 |
+| Backlog campaign, 12 axes (§6c–6d) | ~36 new | ~800 |
+| Full factorial (§6e) | **101,520** | **~557,000** |
+
+Axes covered: stop {8,10,12,16,off} × softcut {6,8,10,off} × breakeven {off,10,12,15} × TP
+{6,8,10,12,15,20,25,30,40,off} × trail {off + 8 width@activation combos} × scale-out {off + 16
+tier ladders}; entries PEAD (LARGE+MIDCAP) and movers (MIDCAP); plus hold {5,8,10,15,20}, gap×vol
+entry grid, costs to 40bps/leg, whole-share lots at $310, SPY-regime splits, year-by-year
+stability, and capital-constrained portfolio sims at 2/6 slots. Harness fixes that made the
+numbers trustworthy: entry dedupe, paired bootstrap CIs, give-back peak fix, split-half validation.

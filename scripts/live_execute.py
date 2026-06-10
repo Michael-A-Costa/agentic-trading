@@ -101,6 +101,18 @@ def book_arm_on(book: str) -> bool:
     return str(os.environ.get(key, "1")).strip().lower() in ("1", "true", "yes", "on")
 
 
+def lot_take_profit_pct(lot: dict | None, caps: dict) -> float:
+    """Per-book TP (two-book v2.1 exit overlay): a DISCO lot harvests at DISCO_TAKE_PROFIT_PCT;
+    pead keeps the global let-run TAKE_PROFIT_PCT. LIVE honours the override only once
+    DISCO_EXITS_LIVE=1 (paper validates it first — apply_decision.py applies it ungated; keep the
+    two in sync). Backtest basis: playbook §6e/6f + strategies/exit-strategy-findings-2026-06-10.md."""
+    tp = caps.get("TAKE_PROFIT_PCT", 12.0)
+    disco_tp = caps.get("DISCO_TAKE_PROFIT_PCT", 0.0) or 0.0
+    if disco_tp > 0 and caps.get("DISCO_EXITS_LIVE") and book_of(lot) == "disco":
+        return disco_tp
+    return tp
+
+
 def book_exposure(book: str, state: dict, broker: dict) -> float:
     """Market value of the open lots tagged with this book (broker qty + live marks where known)."""
     total = 0.0
@@ -614,7 +626,7 @@ def reconcile(state: dict, broker: dict, log: list) -> None:
             log.append({"event": "entry_filled_confirmed", "symbol": sym, "qty": bp["qty"],
                         "avg_cost": bp.get("avg_cost"), "order_id": lot.get("entry_order_id")})
         sl = state.get("_caps", {}).get("STOP_LOSS_PCT", 4.0)
-        tp = state.get("_caps", {}).get("TAKE_PROFIT_PCT", 12.0)
+        tp = lot_take_profit_pct(lot, state.get("_caps", {}))  # per-book TP overlay
         if lot.get("entry_price"):
             base_stop = round(lot["entry_price"] * (1 - sl / 100.0), 4)
             # ratchet-safe: a trailing stop may have raised stop_price above the initial level on a
@@ -861,7 +873,7 @@ def _arm_entry_stop(sym: str, plan: dict, order: dict | None, order_id: str,
     if not entry or entry <= 0:
         return  # no price to size a stop off -> leave pending for reconcile
     sl = caps.get("STOP_LOSS_PCT", 8.0)
-    tp = caps.get("TAKE_PROFIT_PCT", 12.0)
+    tp = lot_take_profit_pct(lot, caps)  # per-book TP overlay (disco harvests tighter)
     stop_price = round(entry * (1 - sl / 100.0), 2)
     # Fill confirmed in-tick -> the lot is real (no longer pending). Populate the synthetic levels too
     # so the sentinel can watch it in any window where the resting stop isn't (yet) armed.
