@@ -643,6 +643,11 @@ def _r1_reject(sym: str, dd: dict) -> dict | None:
     return {"symbol": sym, "decision": "reject", "conviction": None, "dollar_amount": None,
             "hold_intent": None, "thesis_type": "none", "next_earnings_date": "unknown",
             "reason": f"R1 auto-reject: {reason}",
+            # r1=True marks this as a TRANSIENT microstructure disqualifier (spread/liquidity), not a
+            # thesis. It's recomputed for free by the Python pre-filter every tick, so the cache-writer
+            # must NOT freeze it — a verdict cached under the upside-breakout trigger would lock a name
+            # out for the day on an early-session-wide spread that has since tightened.
+            "r1": True,
             "risks": ["illiquid or wide spread"], "never_buy": False, "never_buy_reason": None,
             "catalysts": []}
 
@@ -950,8 +955,11 @@ def main() -> int:
             if res.get("decision") in ("commit", "reject"):
                 res.setdefault("book", route_book(res, c))
             # Cache commits and rejects (each reused under its asymmetric trigger at read time); never
-            # cache an error — a transient model/timeout failure must be retried, not frozen.
-            if not res.get("cached") and res.get("decision") in ("commit", "reject"):
+            # cache an error — a transient model/timeout failure must be retried, not frozen. Also never
+            # cache an R1 reject (res["r1"]): it's a transient spread/liquidity reading recomputed for
+            # free by the pre-filter every tick, so freezing it under the upside-breakout trigger would
+            # lock a name out for the day on an early-session-wide spread that has since tightened.
+            if not res.get("cached") and not res.get("r1") and res.get("decision") in ("commit", "reject"):
                 cache[sym] = {"ts": now, "day": today_et,          # stamped for age/scoping (reuse is
                                                                    #   indefinite unless DD_CACHE_INDEFINITE=0)
                               "ref_price": c.get("last"),           # price at DD time (drift trigger)
