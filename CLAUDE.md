@@ -121,7 +121,7 @@ every 15 min) + `run_paper_sentinel.sh` (1 min). Flow: market regime →
 `apply_decision.py` (simulated fill, tracks `data/paper_state.json`). No real orders.
 
 **Live** (real money): `run_live_tick.sh` (launchd via `com.agentic.trading-live.plist`,
-every 15 min) + `run_live_sentinel.sh` (1 min). Flow: precheck → market regime →
+every 5 min) + `run_live_sentinel.sh` (1 min). Flow: precheck → market regime →
 `broker_snapshot.py` → `live_tick_context.py` (context + gate) → `decide.py` →
 `live_execute.py` (real `review → place` via the MCP relay agent `rh_mcp.py`). All
 sizing/cap/gating logic stays in Python; the agent only relays. Truth is re-read from the

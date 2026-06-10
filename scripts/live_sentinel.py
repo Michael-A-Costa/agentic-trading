@@ -4,7 +4,7 @@ live_sentinel.py — the FAST live risk pass for FRACTIONAL lots, run every ~1 m
 
 Why it exists: whole-share lots are protected by a REAL resting stop_market GTC at the broker — it
 sits at the exchange and fires on its own, no code needed. FRACTIONAL lots get only a SYNTHETIC stop
-(a price level WE must watch). The planner tick now runs every ~15 min (cost), so between ticks a
+(a price level WE must watch). The planner tick now runs every ~5 min (cost), so between ticks a
 fractional lot's synthetic stop would be unwatched. This pass closes that gap: every minute it checks
 each fractional/synthetic lot's stop & take-profit against a fresh PUBLIC (Cboe) quote — NO LLM — and
 fires a protective market sell via the rh_mcp relay ONLY when a level is breached (the sole LLM call,
