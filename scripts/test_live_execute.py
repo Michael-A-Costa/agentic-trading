@@ -285,19 +285,20 @@ def test_next_settle_date_skips_weekends():
     check("Fri -> Mon (skip weekend)", le.next_settle_date("2026-06-05") == "2026-06-08", le.next_settle_date("2026-06-05"))
 
 
-def test_settled_buying_power_excludes_unsettled_and_pending():
+def test_settled_buying_power_is_broker_bp_not_double_counted():
+    # Robinhood's cash-account buying_power ALREADY excludes unsettled sale proceeds, so settled_bp
+    # IS the broker bp — our ledger is reported as `unsettled` but NOT subtracted (that double-counts).
     os.environ["CASH_SETTLEMENT_GUARD"] = "1"
-    broker = {"buying_power": 2064.0, "pending_deposits": 1000.0}
-    # an unsettled $300 sale that settles tomorrow + the $1000 pending deposit are both excluded
-    state = {"unsettled": [{"settle_date": "2026-06-09", "amount": 300.0, "symbol": "ABC"}]}
-    sbp, uns = le.settled_buying_power(state, broker, "2026-06-08")
-    check("settled = bp - unsettled - pending", sbp == 2064.0 - 300.0 - 1000.0, sbp)
-    check("unsettled total reported", uns == 300.0, uns)
-    # a matured sale (settle_date <= today) is pruned and counts as settled again
-    state2 = {"unsettled": [{"settle_date": "2026-06-08", "amount": 300.0, "symbol": "ABC"}]}
-    sbp2, uns2 = le.settled_buying_power(state2, broker, "2026-06-08")
+    broker = {"buying_power": 402.68, "pending_deposits": 0.0}
+    state = {"unsettled": [{"settle_date": "2026-06-11", "amount": 148.03, "symbol": "ABC"}]}
+    sbp, uns = le.settled_buying_power(state, broker, "2026-06-10")
+    check("settled == broker bp (no double-count)", sbp == 402.68, sbp)
+    check("unsettled total still reported for the log", uns == 148.03, uns)
+    # a matured sale (settle_date <= today) is pruned from the ledger
+    state2 = {"unsettled": [{"settle_date": "2026-06-10", "amount": 300.0, "symbol": "ABC"}]}
+    sbp2, uns2 = le.settled_buying_power(state2, broker, "2026-06-10")
     check("matured sale pruned", uns2 == 0.0 and not state2["unsettled"], (uns2, state2["unsettled"]))
-    check("settled excludes only pending after prune", sbp2 == 2064.0 - 1000.0, sbp2)
+    check("settled still == broker bp after prune", sbp2 == 402.68, sbp2)
 
 
 def test_settled_guard_off_returns_raw_bp():
@@ -703,7 +704,7 @@ if __name__ == "__main__":
              test_trail_off_by_default, test_trail_ratchets_up_and_never_down,
              test_trail_min_step_guard, test_trail_floored_at_initial_stop,
              test_breakeven_rung_lifts_to_entry, test_breakeven_and_trail_compose,
-             test_next_settle_date_skips_weekends, test_settled_buying_power_excludes_unsettled_and_pending,
+             test_next_settle_date_skips_weekends, test_settled_buying_power_is_broker_bp_not_double_counted,
              test_settled_guard_off_returns_raw_bp,
              test_reconcile_trails_resting_stop, test_reconcile_trail_dryrun_places_nothing,
              test_run_relays_parallel_overlaps_and_isolates,

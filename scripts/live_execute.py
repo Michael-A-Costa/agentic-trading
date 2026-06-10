@@ -163,21 +163,24 @@ def next_settle_date(et_today: str) -> str:
 
 
 def settled_buying_power(state: dict, broker: dict, et_today: str) -> tuple[float, float]:
-    """Deployable (settled) cash = broker buying_power - unsettled SALE proceeds - pending deposits.
+    """Deployable (settled) cash for a CASH account. Returns (settled_bp, unsettled_total).
 
     GFV (Good-Faith Violation) on a CASH account happens when you BUY with unsettled funds and then
-    sell before they settle. Sizing every entry against settled-only cash makes that impossible —
-    necessary and sufficient. state['unsettled'] is our ledger of recent sale proceeds, each with a
-    T+1 settle_date; prune the matured ones (in place) and subtract the rest. Returns (settled_bp,
-    unsettled_total)."""
+    sell before they settle. Sizing every entry against settled-only cash makes that impossible.
+
+    Robinhood's cash-account `buying_power` ALREADY excludes unsettled sale proceeds — it IS the
+    settled spendable figure. Verified 2026-06-10: cash($550.75) - buying_power($402.68) == our
+    unsettled ledger($148.03) to the penny, and buying_power stayed flat at 402.68 across ticks while
+    sells flowed into `cash` (it never rose on a sale, so it never included the proceeds). So bp is
+    settled cash; subtracting our ledger again double-counts and under-deploys. We keep the ledger
+    purely to surface `unsettled` in the tick log (prune matured entries here); it is NOT deducted."""
     bp = broker.get("buying_power") or 0.0
     if not gfv_guard_on():
         return bp, 0.0
     led = state.get("unsettled") or []
-    state["unsettled"] = [u for u in led if str(u.get("settle_date", "")) > et_today]  # keep un-matured
+    state["unsettled"] = [u for u in led if str(u.get("settle_date", "")) > et_today]  # prune matured (log only)
     unsettled = sum(_f(u.get("amount"), 0.0) or 0.0 for u in state["unsettled"])
-    pending = broker.get("pending_deposits", 0.0) or 0.0
-    return max(0.0, bp - unsettled - pending), round(unsettled, 2)
+    return bp, round(unsettled, 2)
 
 
 def _first(d: dict, *keys, default=None):
@@ -1063,9 +1066,9 @@ def main() -> int:
     is_dryrun = not armed()
     mode_tag = "live-dryrun" if is_dryrun else "live"
 
-    # Cash-account settlement guard: deployable cash = broker buying_power - unsettled sale proceeds -
-    # pending deposits. Computed BEFORE this tick's sells append to the ledger (this tick's proceeds
-    # are unsettled until T+1, so not deployable now). Also prunes matured entries from the ledger.
+    # Cash-account settlement guard: deployable cash = broker buying_power, which on a cash account
+    # already excludes unsettled sale proceeds (see settled_buying_power). Computed BEFORE this tick's
+    # sells append to the ledger; the ledger is surfaced as `unsettled` in the log but not deducted.
     settled_bp, unsettled_total = settled_buying_power(state, broker, today)
 
     if not args.skip and args.decision:
