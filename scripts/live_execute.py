@@ -355,6 +355,52 @@ def check_entry_caps(plan: dict, *, existing_val: float, exposure: float,
     return True, ""
 
 
+def pack_entries(ready: list, *, cash: float, exp_headroom: float, pead_room: float,
+                 max_entries: int, quotes: dict, caps: dict, books_on: bool) -> tuple[list, list]:
+    """Greedily admit the tick's PARALLEL buy candidates at each one's ACTUAL conviction-tiered
+    (whole-share) notional, decrementing settled-cash / exposure / pead-book budgets as it goes so
+    the concurrent buys stay COLLECTIVELY cap-safe (each relay runs against the same pre-tick
+    snapshot, blind to the others). Returns (to_run, deferred): to_run=[(sym, action)] to place,
+    deferred=[(sym, action, reason)] to skip.
+
+    Walks `ready` in priority order (caller puts pead first). An entry that doesn't fit is deferred
+    and the walk CONTINUES — leftover settled cash funds a smaller, lower-priority entry instead of
+    being stranded behind a full-MAX_POSITION_USD slot reservation. Defer-reason prefixes match the
+    tick-summary skip categories ("deferred: no settled cash" / "exposure cap full" / ...)."""
+    cash_left, exp_left, pead_left = cash, exp_headroom, pead_room
+    to_run: list = []
+    deferred: list = []
+    for sym, a in ready:
+        is_pead = books_on and str(a.get("book") or "disco") == "pead"
+        if len(to_run) >= max_entries:
+            deferred.append((sym, a, f"deferred: MAX_ENTRIES_PER_TICK={max_entries} "
+                                     f"(cached verdicts still served next tick)"))
+            continue
+        # Size at the real (whole-share) notional. If it can't be sized (no quote, or 1 share over
+        # the per-name cap), admit it so execute_buy emits the precise reject — it consumes no cash,
+        # so we don't decrement the budgets for it.
+        plan = size_entry(_f(a.get("dollar_amount"), 0.0) or 0.0, quotes.get(sym, {}), caps)
+        if not plan.get("ok"):
+            to_run.append((sym, a))
+            continue
+        need = plan["notional"]
+        if need > cash_left + 1e-6:
+            deferred.append((sym, a, f"deferred: no settled cash (need ${need:.0f} > ${cash_left:.0f} left)"))
+            continue
+        if need > exp_left + 1e-6:
+            deferred.append((sym, a, f"deferred: exposure cap full (need ${need:.0f} > ${exp_left:.0f} headroom)"))
+            continue
+        if is_pead and need > pead_left + 1e-6:
+            deferred.append((sym, a, f"deferred: pead book ceiling (need ${need:.0f} > ${pead_left:.0f} room)"))
+            continue
+        to_run.append((sym, a))
+        cash_left -= need
+        exp_left -= need
+        if is_pead:
+            pead_left -= need
+    return to_run, deferred
+
+
 def buy_spec(sym: str, plan: dict) -> dict:
     """Build the MCP place_equity_order params for a BUY from a sized plan."""
     if plan["kind"] == "limit":
@@ -1208,78 +1254,49 @@ def main() -> int:
                     continue
             ready.append((sym, a))
 
-        # Bound the entry COUNT by available headroom so the PARALLEL entries can't collectively breach
-        # the caps (each runs against the same pre-tick snapshot, blind to the others' fills). Even if
-        # every slot fills at MAX_POSITION_USD ceiling; the total stays within settled cash AND the
-        # exposure cap. execute_buy still re-checks each entry against the snapshot (belt+suspenders).
-        ceil = float(caps.get("MAX_POSITION_USD", 0) or 0) or 1.0
+        # Admit the PARALLEL entries by PACKING them against settled cash / exposure headroom at each
+        # entry's ACTUAL conviction-tiered (whole-share) notional — NOT by reserving a full
+        # MAX_POSITION_USD slot per entry. A 0.35x ($~108) entry costs ~$108 of cash, so leftover
+        # settled cash funds smaller entries instead of being stranded behind a full-ceiling
+        # reservation. Each entry runs against the same pre-tick snapshot blind to the others, so we
+        # decrement running budgets here to keep the concurrent buys COLLECTIVELY cap-safe;
+        # execute_buy re-checks each against the snapshot (belt+suspenders).
         exp_headroom = max(0.0, float(caps.get("MAX_TOTAL_EXPOSURE_USD", 0.0)) - exposure)
-        headroom_slots = int(min(settled_bp, exp_headroom) // ceil)
         if books_on and ready:
-            # Pead first claim (v2 plan): pead-routed entries go ahead of disco in the slot queue,
-            # so when both want the last settled dollar the measured-edge trade wins. Pead's COUNT
-            # is additionally bounded by its own remaining ceiling, so parallel pead buys can't
-            # collectively breach BOOK_PEAD_MAX_USD (execute_buy still re-checks exactly).
+            # Pead first claim (v2 plan): pead-routed entries go ahead of disco so when both want the
+            # last settled dollar the measured-edge trade wins. Pead is additionally bounded by its
+            # own remaining ceiling (BOOK_PEAD_MAX_USD), tracked as a separate budget below.
             pead_ready = [t for t in ready if str(t[1].get("book") or "disco") == "pead"]
             disco_ready = [t for t in ready if str(t[1].get("book") or "disco") != "pead"]
-            if pead_ready:
-                pead_room = max(0.0, float(caps.get("BOOK_PEAD_MAX_USD", 0.0)) -
-                                book_exposure("pead", state, broker))
-                pead_slots = int(pead_room // ceil)
-                for psym, _ in pead_ready[pead_slots:]:
-                    results.append({"symbol": psym, "side": "buy", "status": "skipped",
-                                    "book": "pead",
-                                    "reject_reason": f"pead_book_ceiling (room={pead_room:.2f})"})
-                pead_ready = pead_ready[:pead_slots]
             ready = pead_ready + disco_ready
-        slots = max(0, min(max_entries, headroom_slots, len(ready)))
-        if ready and headroom_slots == 0:
-            binding = "settled_bp" if settled_bp <= exp_headroom else "exposure"
-            print(
-                f"[live_execute] ENTRY-BLOCKED: {len(ready)} buy candidate(s) ready but 0 slots — "
-                f"{binding} is binding (settled_bp={settled_bp:.2f}, exp_headroom={exp_headroom:.2f}, "
-                f"MAX_POSITION_USD={ceil:.2f}); need ${ceil:.0f} settled to open one position",
-                file=sys.stderr,
-            )
-        elif ready and slots < len(ready):
-            print(
-                f"[live_execute] ENTRY-THROTTLE: {len(ready)} ready, {slots} slots "
-                f"(max_entries={max_entries}, headroom_slots={headroom_slots}, "
-                f"settled_bp={settled_bp:.2f}, MAX_POSITION_USD={ceil:.2f})",
-                file=sys.stderr,
-            )
-        # One binding-aware reason for every candidate deferred this tick — name the cap that's
-        # actually full (settled cash / exposure / per-tick entry count), not a blanket "0 slots".
-        # Numbers go in parens so the tick-summary aggregation keys on the clean category.
-        if headroom_slots == 0:
-            if settled_bp <= exp_headroom:
-                defer_reason = (f"deferred: no settled cash (settled_bp=${settled_bp:.0f} "
-                                f"< ${ceil:.0f}/position)")
-            else:
-                defer_reason = (f"deferred: exposure cap full (headroom=${exp_headroom:.0f} "
-                                f"< ${ceil:.0f}/position)")
-        elif headroom_slots <= max_entries:
-            defer_reason = (f"deferred: funded {headroom_slots} this tick (settled headroom "
-                            f"${min(settled_bp, exp_headroom):.0f}, ${ceil:.0f}/position)")
-        else:
-            defer_reason = (f"deferred: MAX_ENTRIES_PER_TICK={max_entries} (cached verdicts "
-                            f"still served next tick)")
-        for sym, a in ready[slots:]:
+        pead_room = (max(0.0, float(caps.get("BOOK_PEAD_MAX_USD", 0.0)) - book_exposure("pead", state, broker))
+                     if books_on else float("inf"))
+        to_run, deferred = pack_entries(ready, cash=settled_bp, exp_headroom=exp_headroom,
+                                        pead_room=pead_room, max_entries=max_entries,
+                                        quotes=broker["quotes"], caps=caps, books_on=books_on)
+        if ready and not to_run:
+            binding = "settled cash" if settled_bp <= exp_headroom else "exposure"
+            print(f"[live_execute] ENTRY-BLOCKED: {len(ready)} buy candidate(s) ready but none fit — "
+                  f"{binding} binding (settled_bp={settled_bp:.2f}, exp_headroom={exp_headroom:.2f})",
+                  file=sys.stderr)
+        elif deferred:
+            print(f"[live_execute] ENTRY-THROTTLE: {len(ready)} ready, {len(to_run)} funded, "
+                  f"{len(deferred)} deferred (settled_bp={settled_bp:.2f}, "
+                  f"exp_headroom={exp_headroom:.2f}, max_entries={max_entries})", file=sys.stderr)
+        for sym, a, reason in deferred:
             abook = str(a.get("book") or "disco")
             if books_on and abook == "pead":
-                # Count how often a QUALIFIED pead commit goes unfunded because disco has the
-                # account deployed (v2 plan: the event still feeds the evidence ledger; if this
-                # is frequent AND the pead cohort shows lift, enable PEAD_SEASON_RESERVE_PCT).
+                # Count how often a QUALIFIED pead commit goes unfunded (v2 plan: feeds the evidence
+                # ledger; if frequent AND the pead cohort shows lift, enable PEAD_SEASON_RESERVE_PCT).
                 log.append({"event": "pead_unfunded", "symbol": sym,
                             "settled_bp": round(settled_bp, 2),
                             "note": "qualified pead commit deferred — no settled-cash slot"})
             results.append({"symbol": sym, "side": "buy", "status": "skipped",
                             **({"book": abook} if books_on else {}),
-                            "reject_reason": defer_reason})
+                            "reject_reason": reason})
 
-        # Run the slot entries' review+place relays in PARALLEL (independent I/O-bound cold-start
+        # Run the funded entries' review+place relays in PARALLEL (independent I/O-bound cold-start
         # spawns) — same machinery and knob as the exits above (LIVE_PARALLEL_ORDERS / _WORKERS).
-        to_run = ready[:slots]
         if to_run:
             npos = len(broker["positions"])
             buy_jobs = [(s, (lambda s=s, act=act:

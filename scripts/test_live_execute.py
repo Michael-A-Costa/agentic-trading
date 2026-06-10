@@ -310,6 +310,53 @@ def test_settled_guard_off_returns_raw_bp():
     os.environ["CASH_SETTLEMENT_GUARD"] = "1"
 
 
+def test_pack_entries_uses_leftover_cash_for_smaller_buys():
+    # settled $402: the old slot math (402 // 300 = 1) funded only ONE entry; size-aware packing
+    # funds the big one AND a small one with the change left over, deferring only what truly doesn't
+    # fit. Each $100 ask -> 1 share = $100.50 (0.5% marketable-limit markup); $300 -> 3 sh = $301.50.
+    quotes = {"AAA": {"ask": 100.0}, "BBB": {"ask": 100.0}, "CCC": {"ask": 100.0}}
+    ready = [("AAA", {"symbol": "AAA", "dollar_amount": 300}),
+             ("BBB", {"symbol": "BBB", "dollar_amount": 108}),
+             ("CCC", {"symbol": "CCC", "dollar_amount": 108})]
+    to_run, deferred = le.pack_entries(ready, cash=402.0, exp_headroom=9999.0, pead_room=float("inf"),
+                                       max_entries=5, quotes=quotes, caps=CAPS, books_on=False)
+    check("packs big + small from one settled balance", [s for s, _ in to_run] == ["AAA", "BBB"], to_run)
+    check("defers only the genuinely unfunded one", len(deferred) == 1 and deferred[0][0] == "CCC", deferred)
+    check("defer reason keeps the settled-cash category",
+          deferred[0][2].startswith("deferred: no settled cash"), deferred[0][2])
+
+
+def test_pack_entries_respects_exposure_and_max_entries():
+    quotes = {"AAA": {"ask": 100.0}, "BBB": {"ask": 100.0}}
+    ready = [("AAA", {"symbol": "AAA", "dollar_amount": 100}),
+             ("BBB", {"symbol": "BBB", "dollar_amount": 100})]
+    # exposure headroom only fits one $100.50 lot
+    to_run, deferred = le.pack_entries(ready, cash=9999.0, exp_headroom=150.0, pead_room=float("inf"),
+                                       max_entries=5, quotes=quotes, caps=CAPS, books_on=False)
+    check("exposure headroom caps to one", [s for s, _ in to_run] == ["AAA"], to_run)
+    check("exposure defer category", deferred[0][2].startswith("deferred: exposure cap full"), deferred)
+    # MAX_ENTRIES_PER_TICK hard cap regardless of available cash
+    to_run2, deferred2 = le.pack_entries(ready, cash=9999.0, exp_headroom=9999.0, pead_room=float("inf"),
+                                         max_entries=1, quotes=quotes, caps=CAPS, books_on=False)
+    check("max_entries caps to one", len(to_run2) == 1 and len(deferred2) == 1, (to_run2, deferred2))
+    check("max_entries category", deferred2[0][2].startswith("deferred: MAX_ENTRIES_PER_TICK"), deferred2)
+
+
+def test_pack_entries_pead_ceiling_and_unsizable_passthrough():
+    # a pead entry is bounded by the remaining pead-book room; an unsizable entry (1 share over the
+    # per-name cap) passes through to execute_buy (admitted, no budget spent) so it emits the precise
+    # reject there rather than a cash-defer here.
+    quotes = {"PEAD": {"ask": 100.0}, "BIG": {"ask": 500.0}}
+    ready = [("PEAD", {"symbol": "PEAD", "dollar_amount": 100, "book": "pead"}),  # $100.50 > pead_room 50
+             ("BIG", {"symbol": "BIG", "dollar_amount": 100})]  # 1 sh $500 > MAX_POSITION_USD 300 -> unsizable
+    to_run, deferred = le.pack_entries(ready, cash=9999.0, exp_headroom=9999.0, pead_room=50.0,
+                                       max_entries=5, quotes=quotes, caps=CAPS, books_on=True)
+    check("pead deferred by its book ceiling",
+          any(d[0] == "PEAD" and d[2].startswith("deferred: pead book ceiling") for d in deferred), deferred)
+    check("unsizable entry admitted for execute_buy to reject",
+          ("BIG", ready[1][1]) in to_run, to_run)
+
+
 def test_reconcile_trails_resting_stop():
     import types
     calls = {"cancel": [], "place": []}
@@ -706,6 +753,9 @@ if __name__ == "__main__":
              test_breakeven_rung_lifts_to_entry, test_breakeven_and_trail_compose,
              test_next_settle_date_skips_weekends, test_settled_buying_power_is_broker_bp_not_double_counted,
              test_settled_guard_off_returns_raw_bp,
+             test_pack_entries_uses_leftover_cash_for_smaller_buys,
+             test_pack_entries_respects_exposure_and_max_entries,
+             test_pack_entries_pead_ceiling_and_unsizable_passthrough,
              test_reconcile_trails_resting_stop, test_reconcile_trail_dryrun_places_nothing,
              test_run_relays_parallel_overlaps_and_isolates,
              test_execute_sell_full_close_is_market, test_execute_sell_rearms_stop_on_failed_sell,
