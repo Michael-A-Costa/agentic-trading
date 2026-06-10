@@ -598,9 +598,15 @@ def session_state(now_et: datetime) -> tuple[str, bool]:
 
 # --------------------------------------------------------------------------- assess
 def intraday_pct(q: dict) -> float | None:
-    o, last = q.get("open"), q.get("last")
-    if o and last and o != 0:
-        return round((last - o) / o * 100, 3)
+    """% move into `last`, measured from the session OPEN when available. Robinhood quotes carry no
+    session open (only last + previous_close), so with RH as the primary source we fall back to the
+    PRIOR CLOSE — keeping regime (index moves) and the candidate momentum signal working on pure RH
+    data, no extra Cboe call. The prev-close baseline includes the overnight gap, which for a risk-off
+    read is if anything more complete than open->last. Cboe/Stooq still use the open (unchanged)."""
+    last = q.get("last")
+    base = q.get("open") or q.get("prev_day_close") or q.get("previous_close")
+    if base and last and base != 0:
+        return round((last - base) / base * 100, 3)
     return None
 
 
