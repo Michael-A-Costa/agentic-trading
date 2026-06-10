@@ -283,6 +283,12 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
 
     quotes, source = {}, None
     fetch_error = None
+    # The quote fetch is the dominant cost of this step; log the universe size so a slow tick is
+    # attributable (the runner otherwise shows nothing between "[3/5]…" and the GATE line).
+    sys.stderr.write(f"[tick] fetching quotes for {len(symbols)} symbols "
+                     f"({len(mc.INDEXES)} idx + {len(held)} held + {len(armed_syms)} armed + "
+                     f"{len(candidates)} cand)\n")
+    sys.stderr.flush()
     try:
         quotes, source = mc.fetch_quotes(symbols)
     except (OSError, RuntimeError) as e:

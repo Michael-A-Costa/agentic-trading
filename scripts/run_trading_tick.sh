@@ -83,7 +83,7 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
   fi
 
   # 2) context + gate (script) — writes context/packet, prints GATE=...
-  GATE_LINE="$("$PYTHON" "${REPO}/scripts/tick_context.py" | tail -n 1)"
+  GATE_LINE="$("$PYTHON" "${REPO}/scripts/tick_context.py" 2>>"$RUN_LOG" | tail -n 1)"
   log "gate: ${GATE_LINE}"
 
   CTX="${REPO}/data/tick/context_latest.json"

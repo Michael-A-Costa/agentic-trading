@@ -30,11 +30,12 @@ import json
 import os
 import sys
 import urllib.request
+import threading
 import urllib.error
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, time, timezone
-from time import sleep
+from time import perf_counter, sleep
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -101,8 +102,11 @@ def _fnum(v) -> float | None:
 
 
 # --------------------------------------------------------------------------- fetch: primary (Stooq)
-def fetch_stooq(symbols: list[str]) -> dict[str, dict]:
-    """{SYMBOL: {open,high,low,last,volume,date,time}} from Stooq's keyless batch CSV (one request)."""
+def fetch_stooq(symbols: list[str], deadline_ts: float | None = None,
+                stop: "threading.Event | None" = None) -> dict[str, dict]:
+    """{SYMBOL: {open,high,low,last,volume,date,time}} from Stooq's keyless batch CSV (one request).
+    deadline_ts/stop are accepted for a uniform race signature; a single-request batch can't usefully
+    honour them mid-flight, so they're a no-op here."""
     syms = "+".join(f"{s.lower()}.us" for s in symbols)
     text = _http_get(STOOQ_URL.format(syms=syms))
     out: dict[str, dict] = {}
@@ -123,16 +127,25 @@ def fetch_stooq(symbols: list[str]) -> dict[str, dict]:
 
 
 # --------------------------------------------------------------------------- fetch: fallback 1 (Cboe)
-def fetch_cboe(symbols: list[str]) -> dict[str, dict]:
+def fetch_cboe(symbols: list[str], deadline_ts: float | None = None,
+               stop: "threading.Event | None" = None) -> dict[str, dict]:
     """Same shape, from Cboe's keyless delayed-quotes JSON (one request per symbol).
 
     Throttled (CBOE_THROTTLE_S between symbols) and cookie-shared (via _OPENER) so the per-symbol
     loop doesn't read as a bot swarm and trip Cloudflare's 429. If EVERY symbol failed, re-raise the
     last error so the orchestrator reports the real cause (e.g. the 429) instead of a stale Stooq 404.
+
+    deadline_ts (perf_counter seconds) + stop (a shared Event) bound the wall-clock: when Cboe is
+    degraded, each symbol can crawl to the 12s timeout + 429 retries, so the per-symbol loop bails the
+    moment either fires and returns whatever it has SO FAR. Symbols are ordered must-haves-first
+    (indexes -> held -> armed -> movers), so a truncated fetch keeps the data the gate needs and only
+    drops low-priority tail movers — the same clip the burst-ordering already tolerates.
     """
     out: dict[str, dict] = {}
     last_err: Exception | None = None
     for i, s in enumerate(symbols):
+        if (stop is not None and stop.is_set()) or (deadline_ts is not None and perf_counter() >= deadline_ts):
+            break  # raced out / over budget -> return the high-priority prefix gathered so far
         if i:
             sleep(CBOE_THROTTLE_S)   # space the burst — the burst is what gets us rate-limited
         try:
@@ -173,10 +186,14 @@ def fetch_cboe(symbols: list[str]) -> dict[str, dict]:
 
 
 # --------------------------------------------------------------------------- fetch: fallback 2 (Yahoo)
-def fetch_yahoo(symbols: list[str]) -> dict[str, dict]:
-    """Same shape, from Yahoo's keyless chart API (one request per symbol). Used only if Stooq fails."""
+def fetch_yahoo(symbols: list[str], deadline_ts: float | None = None,
+                stop: "threading.Event | None" = None) -> dict[str, dict]:
+    """Same shape, from Yahoo's keyless chart API (one request per symbol). Used only if Stooq fails.
+    Honours deadline_ts/stop (see fetch_cboe) so a slow Yahoo can't hold the race open past the budget."""
     out: dict[str, dict] = {}
     for s in symbols:
+        if (stop is not None and stop.is_set()) or (deadline_ts is not None and perf_counter() >= deadline_ts):
+            break
         try:
             data = json.loads(_http_get(YAHOO_URL.format(sym=urllib.parse.quote(s))))
             res = (data.get("chart", {}).get("result") or [None])[0]
@@ -211,22 +228,12 @@ def _pick(d: dict, *keys):
     return None
 
 
-def fetch_robinhood(symbols: list[str]) -> dict[str, dict]:
-    """LAST-RESORT quotes via the AUTHENTICATED Robinhood MCP — one haiku relay call, real-time.
-
-    The keyless sources (Stooq/Cboe/Yahoo) are free CDNs with no SLA: when Cloudflare throttles them
-    the whole entry gate stalls on missing index data (seen 2026-06-09 — a lone null SPY). RH is the
-    one reliable, authenticated source we have, but it COSTS a relay call (~$0.02-0.05) and ~10-30s,
-    so it sits dead last and is gated to live mode in fetch_quotes. Same normalized shape as the CDN
-    fetchers. date/time are stamped from ET-now because an RH quote is real-time by construction — the
-    tick's own is_open check separately guards session state, so a stamped date can't fake a live gate
-    on a closed market. RH's quote carries no session OPEN, so intraday_pct (open->last) may be None for
-    these — regime then degrades to neutral (entries still allowed; only a confirmed risk_off blocks)."""
-    import rh_mcp  # lazy: keep the headless-claude stack out of every market_conditions import
-    syms = sorted({s.upper().strip() for s in symbols if s and s.strip()})
-    if not syms:
-        return {}
-    res = rh_mcp.quotes(syms)
+def _normalize_rh_quotes(res: dict | None) -> dict[str, dict]:
+    """Normalize a rh_mcp/rh_direct quotes payload ({"quotes": <get_equity_quotes result>, ...}) into
+    the shared quote shape. date/time are stamped from ET-now because an RH quote is real-time by
+    construction — the tick's own is_open check separately guards session state, so a stamped date can't
+    fake a live gate on a closed market. RH carries no session OPEN, so intraday_pct (open->last) may be
+    None — regime then degrades to neutral (entries still allowed; only a confirmed risk_off blocks)."""
     raw = (res or {}).get("quotes") or {}
     if isinstance(raw, dict):
         raw = raw.get("data") if isinstance(raw.get("data"), (dict, list)) else raw
@@ -261,6 +268,29 @@ def fetch_robinhood(symbols: list[str]) -> dict[str, dict]:
     return out
 
 
+def fetch_robinhood_direct(symbols: list[str]) -> dict[str, dict]:
+    """Real-time quotes via the DIRECT Robinhood MCP (rh_direct) — one batch HTTP call, ~0.3s, $0, and
+    NO LLM on our side. This is the FAST authenticated source that rescues the gate when the keyless
+    CDNs stall. Raises (DirectError/etc.) if the direct path is unavailable so the caller falls through
+    to the relay or re-raises — it never silently triggers the headless-claude relay itself."""
+    import rh_direct  # lazy: stdlib-only, but keep the import local to the fetch path
+    syms = sorted({s.upper().strip() for s in symbols if s and s.strip()})
+    if not syms:
+        return {}
+    return _normalize_rh_quotes(rh_direct.quotes(syms))
+
+
+def fetch_robinhood(symbols: list[str]) -> dict[str, dict]:
+    """DEEPEST-fallback quotes via rh_mcp.quotes — tries the direct path first and may fall to the haiku
+    relay (~$0.02-0.05, ~10-30s) if direct is down. Used only when the keyless CDNs AND fetch_robinhood_direct
+    are all dark, so a total quote outage still resolves rather than failing the tick."""
+    import rh_mcp  # lazy: keep the headless-claude stack out of every market_conditions import
+    syms = sorted({s.upper().strip() for s in symbols if s and s.strip()})
+    if not syms:
+        return {}
+    return _normalize_rh_quotes(rh_mcp.quotes(syms))
+
+
 def _has_indexes(quotes: dict[str, dict]) -> bool:
     """A usable fetch must have a last price for at least one index ETF."""
     return any(quotes.get(s, {}).get("last") is not None for s in INDEXES)
@@ -280,45 +310,107 @@ _FREE_SOURCES = [
 ]
 
 
-def fetch_quotes(symbols: list[str]) -> tuple[dict[str, dict], str]:
-    """Return (quotes, source). Races the keyless CDNs in parallel and picks the highest-priority one
-    with usable index data; falls back to the authenticated Robinhood MCP relay only if ALL of them
-    came back empty. Raises if every source fails.
+def _qlog(msg: str) -> None:
+    """Quote-fetch progress to stderr (the [3/5] step otherwise runs silent — its stdout is swallowed by
+    the runner's `| tail -n 1`, and a degraded source can burn minutes with no trace). Gate with
+    QUOTES_LOG=0."""
+    if os.environ.get("QUOTES_LOG", "1").strip().lower() not in ("0", "false", "no", ""):
+        sys.stderr.write(f"[quotes] {msg}\n")
+        sys.stderr.flush()
 
-    The RH relay is NOT raced — it costs a haiku call, so it stays strictly sequential and last, firing
-    only on a total keyless outage. It's gated: QUOTES_MCP_FALLBACK=1 forces it on, =0 off, unset/auto =
-    on in live mode only (paper never pays for quotes).
+
+def fetch_quotes(symbols: list[str]) -> tuple[dict[str, dict], str]:
+    """Return (quotes, source). Sources, in preference order: the keyless CDNs (raced, Cboe richest) and
+    the authenticated Robinhood MCP. Picks the highest-priority source with usable index data.
+
+    DEADLINE-BOUNDED: the keyless race is capped at QUOTES_DEADLINE_S (default 25s). A degraded Cboe used
+    to fetch one symbol at a time to a 12s timeout + 429 retries, hanging the whole [3/5] step for
+    minutes (seen 2026-06-10: 216s). Now the per-symbol fetchers honour a shared deadline + stop Event,
+    so the race returns its high-priority prefix (indexes/held/armed fetched first) and bails the tail.
+
+    RH via the DIRECT MCP (rh_direct) is now ~0.3s and $0 (no LLM), so it's a first-class fast fallback
+    the instant the CDNs come up short — and, with QUOTES_PREFER_RH=1, the PRIMARY source (sub-second
+    ticks, at the cost of Cboe's iv30/session-open enrichment). The LLM relay stays the deepest last
+    resort. RH use is gated: QUOTES_MCP_FALLBACK=1 forces on, =0 off, unset/auto = on in live mode only.
     """
+    t0 = perf_counter()
     notes: list[str] = []
+    is_live = (os.environ.get("TRADING_MODE", "paper").strip().lower() == "live")
+    flag = (os.environ.get("QUOTES_MCP_FALLBACK") or "").strip().lower()
+    rh_allowed = flag in ("1", "true", "yes") or (flag in ("", "auto") and is_live)
+    prefer_rh = os.environ.get("QUOTES_PREFER_RH", "0").strip().lower() in ("1", "true", "yes")
+    n = len(symbols)
+
+    def _won(q: dict, label: str) -> tuple[dict, str]:
+        _qlog(f"{label}: {sum(1 for v in q.values() if (v or {}).get('last') is not None)}/{n} "
+              f"quotes in {perf_counter() - t0:.1f}s")
+        return q, label
+
+    # Optional FAST primary: RH direct first (live only) — one batch call, all symbols, ~0.3s.
+    if rh_allowed and prefer_rh:
+        try:
+            q = fetch_robinhood_direct(symbols)
+            if _has_indexes(q):
+                return _won(q, "robinhood(direct)")
+            notes.append("robinhood(direct): no index data")
+        except Exception as e:
+            notes.append(f"robinhood(direct): {type(e).__name__}: {e}")
+
+    # Race the free CDNs concurrently, BUT under a shared deadline + stop Event so a degraded source
+    # can't hold the step open (and can't keep a non-daemon thread alive past the script's own exit).
+    deadline_s = float(os.environ.get("QUOTES_DEADLINE_S", "25"))
+    deadline_ts = perf_counter() + deadline_s
+    stop = threading.Event()
     results: dict[str, dict] = {}
-    # Race the free CDNs concurrently; collect whatever each returns (or note why it failed).
-    with ThreadPoolExecutor(max_workers=len(_FREE_SOURCES)) as ex:
-        futs = {ex.submit(fn, symbols): label for label, fn in _FREE_SOURCES}
-        for fut in as_completed(futs):
+    ex = ThreadPoolExecutor(max_workers=len(_FREE_SOURCES))
+    futs = {ex.submit(fn, symbols, deadline_ts, stop): label for label, fn in _FREE_SOURCES}
+    try:
+        for fut in as_completed(futs, timeout=deadline_s):
             label = futs[fut]
             try:
                 results[label] = fut.result()
-            except Exception as e:   # a source failing just drops it from the race; we raise only if all do
+            except Exception as e:   # a source failing just drops it; we resolve from the others
                 notes.append(f"{label}: {type(e).__name__}: {e}")
-    # Pick by PRIORITY among whatever finished — never by finish order.
+            if _has_indexes(results.get("cboe(fallback)") or {}):
+                break  # the preferred rich source is in hand — nothing better to wait for
+    except TimeoutError:
+        notes.append(f"keyless race hit {deadline_s:.0f}s deadline")
+    finally:
+        stop.set()              # tell any laggard loop to bail at its next iteration
+        ex.shutdown(wait=True)  # threads now exit promptly (they honour `stop`); no orphan hang
+    # Collect anything that finished during shutdown, then pick by PRIORITY — never by finish order.
+    for fut, label in futs.items():
+        if label not in results and fut.done():
+            try:
+                results[label] = fut.result()
+            except Exception as e:
+                notes.append(f"{label}: {type(e).__name__}: {e}")
     for label, _ in _FREE_SOURCES:
         q = results.get(label)
         if q is None:
             continue
         if _has_indexes(q):
-            return q, label
+            return _won(q, label)
         notes.append(f"{label}: no index data")
-    # Authenticated last resort — sequential, only when every free source is dark, and only if enabled.
-    flag = (os.environ.get("QUOTES_MCP_FALLBACK") or "").strip().lower()
-    is_live = (os.environ.get("TRADING_MODE", "paper").strip().lower() == "live")
-    if flag in ("1", "true", "yes") or (flag in ("", "auto") and is_live):
+
+    # Keyless came up short -> authenticated RH: DIRECT first (fast, no LLM), then the relay (LLM) last.
+    if rh_allowed:
+        if not prefer_rh:  # if prefer_rh, the direct attempt already ran above
+            try:
+                q = fetch_robinhood_direct(symbols)
+                if _has_indexes(q):
+                    return _won(q, "robinhood(direct)")
+                notes.append("robinhood(direct): no index data")
+            except Exception as e:
+                notes.append(f"robinhood(direct): {type(e).__name__}: {e}")
         try:
-            q = fetch_robinhood(symbols)
+            q = fetch_robinhood(symbols)  # may use the LLM relay if direct is down
             if _has_indexes(q):
-                return q, "robinhood(mcp)"
+                return _won(q, "robinhood(mcp)")
             notes.append("robinhood(mcp): no index data")
         except Exception as e:
             notes.append(f"robinhood(mcp): {type(e).__name__}: {e}")
+    _qlog(f"ALL SOURCES FAILED in {perf_counter() - t0:.1f}s — {'; '.join(notes)}")
     raise RuntimeError("all sources failed (" + "; ".join(notes) + ")")
 
 
