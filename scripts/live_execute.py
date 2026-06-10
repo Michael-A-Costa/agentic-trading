@@ -1245,6 +1245,22 @@ def main() -> int:
                 f"settled_bp={settled_bp:.2f}, MAX_POSITION_USD={ceil:.2f})",
                 file=sys.stderr,
             )
+        # One binding-aware reason for every candidate deferred this tick — name the cap that's
+        # actually full (settled cash / exposure / per-tick entry count), not a blanket "0 slots".
+        # Numbers go in parens so the tick-summary aggregation keys on the clean category.
+        if headroom_slots == 0:
+            if settled_bp <= exp_headroom:
+                defer_reason = (f"deferred: no settled cash (settled_bp=${settled_bp:.0f} "
+                                f"< ${ceil:.0f}/position)")
+            else:
+                defer_reason = (f"deferred: exposure cap full (headroom=${exp_headroom:.0f} "
+                                f"< ${ceil:.0f}/position)")
+        elif headroom_slots <= max_entries:
+            defer_reason = (f"deferred: funded {headroom_slots} this tick (settled headroom "
+                            f"${min(settled_bp, exp_headroom):.0f}, ${ceil:.0f}/position)")
+        else:
+            defer_reason = (f"deferred: MAX_ENTRIES_PER_TICK={max_entries} (cached verdicts "
+                            f"still served next tick)")
         for sym, a in ready[slots:]:
             abook = str(a.get("book") or "disco")
             if books_on and abook == "pead":
@@ -1256,7 +1272,7 @@ def main() -> int:
                             "note": "qualified pead commit deferred — no settled-cash slot"})
             results.append({"symbol": sym, "side": "buy", "status": "skipped",
                             **({"book": abook} if books_on else {}),
-                            "reject_reason": f"deferred — 0 slots (settled_bp={settled_bp:.2f} < MAX_POSITION_USD={ceil:.2f})"})
+                            "reject_reason": defer_reason})
 
         # Run the slot entries' review+place relays in PARALLEL (independent I/O-bound cold-start
         # spawns) — same machinery and knob as the exits above (LIVE_PARALLEL_ORDERS / _WORKERS).
