@@ -1325,16 +1325,22 @@ def main() -> int:
     placed = record["n_placed"]
     note = "DRY-RUN" if is_dryrun else "ARMED"
     gfv = f" settled_bp={round(settled_bp, 2)}" + (f" (unsettled={round(unsettled_total, 2)})" if unsettled_total else "")
-    # Aggregate skip reasons so the summary line explains *why*, not just how many.
+    # Aggregate skip reasons so the summary line explains *why*, not just how many. Group by the
+    # paren-free category; if every skip in a group shares the SAME full reason (e.g. the tick-global
+    # deferral figures), show it verbatim so the headroom/cap numbers land in the summary. Only when
+    # members differ per-symbol (varying parens) do we fall back to the bare category.
     skip_groups: dict = {}
     for r in results:
         if r.get("status") in ("skipped", "dryrun"):
             raw = r.get("reject_reason", "unknown")
             key = raw.split("(")[0].strip().rstrip(" —") if "(" in raw else raw[:50]
-            skip_groups[key] = skip_groups.get(key, 0) + 1
+            g = skip_groups.setdefault(key, {"n": 0, "full": set()})
+            g["n"] += 1
+            g["full"].add(raw)
     skip_detail = ""
     if skip_groups:
-        parts = [f"{v}×{k}" for k, v in skip_groups.items()]
+        parts = [f"{g['n']}×{next(iter(g['full'])) if len(g['full']) == 1 else k}"
+                 for k, g in skip_groups.items()]
         skip_detail = f" [{'; '.join(parts)}]"
     # Name what was placed (side/qty/symbol@price) so the summary says what the orders actually did.
     placed_parts = []
