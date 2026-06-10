@@ -1,0 +1,19 @@
+{
+    // data/ is gitignored, so disable ignore-file filtering to make logs/journals searchable
+    "search.useIgnoreFiles": false,
+    "search.exclude": {
+        "**/node_modules": true,
+        "**/__pycache__": true,
+        "**/.git": true,
+        "**/.venv": true,
+        "**/venv": true,
+        "**/*.pyc": true
+    },
+    // Keep data/, research/, and docs/ visible in explorer and Cmd+P
+    "files.exclude": {
+        "**/data": false,
+        "**/research": false,
+        "**/docs": false,
+        "**/backtest": false
+    }
+}
