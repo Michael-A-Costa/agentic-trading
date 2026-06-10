@@ -118,6 +118,8 @@ def run(closes: dict[str, dict[str, float]], spy_dates: list[str], lookback: int
         ranked = []
         avail_returns = []
         for sym, cl in closes.items():
+            if sym == BENCH:                           # SPY is the external anchor, not a tradable name
+                continue
             p_now, p_next = cl.get(d_now), cl.get(d_next)
             if p_now is None or p_next is None:
                 continue
@@ -166,20 +168,43 @@ def main() -> int:
     ap.add_argument("--topk", type=int, default=10)
     ap.add_argument("--rebalance", type=int, default=21, help="rebalance period in trading days")
     ap.add_argument("--cost-bps", type=float, default=10.0, help="per side, charged on turnover")
+    ap.add_argument("--universe", type=str, default="",
+                    help="comma-separated symbols to override the default universe (e.g. sector ETFs)")
+    ap.add_argument("--drop-top", type=int, default=0,
+                    help="drop the N best full-span performers (survivorship-floor sanity test)")
     ap.add_argument("--sweep", action="store_true")
     ap.add_argument("--refresh", action="store_true")
     args = ap.parse_args()
 
-    print(f"Loading {len(UNIVERSE)} names + {BENCH} (cached from backtest_signal.py if present)...",
+    universe = ([s.strip().upper() for s in args.universe.split(",") if s.strip()]
+                if args.universe else list(UNIVERSE))
+    print(f"Loading {len(universe)} names + {BENCH} (cached from backtest_signal.py if present)...",
           file=sys.stderr)
     closes = {BENCH: load_closes(BENCH, args.refresh)}
-    for s in UNIVERSE:
+    for s in universe:
         closes[s] = load_closes(s, args.refresh)
     closes = {s: c for s, c in closes.items() if c}
     if BENCH not in closes:
         print("FATAL: no benchmark history.", file=sys.stderr)
         return 1
     spy_dates = sorted(closes[BENCH].keys())
+
+    if args.drop_top > 0:
+        start = args.lookback + args.skip
+        start_date = spy_dates[start] if start < len(spy_dates) else spy_dates[0]
+        rets = []
+        for sym, cl in closes.items():
+            if sym == BENCH:
+                continue
+            ds = sorted(d for d in cl if d >= start_date)
+            if len(ds) < 2:
+                continue
+            rets.append((cl[ds[-1]] / cl[ds[0]] - 1, sym))   # full-span total return
+        rets.sort(reverse=True)
+        for _, sym in rets[:args.drop_top]:
+            closes.pop(sym, None)
+        print(f"[drop-top {args.drop_top}] removed best full-span performers: "
+              + ", ".join(f"{s}({t*100:.0f}%)" for t, s in rets[:args.drop_top]), file=sys.stderr)
 
     if args.sweep:
         print("=" * 78)

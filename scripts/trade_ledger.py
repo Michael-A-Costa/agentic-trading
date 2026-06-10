@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections import defaultdict, deque
 from datetime import datetime
@@ -53,10 +54,36 @@ def load_rows(path: Path, since: str | None, symbol: str | None, mode: str | Non
             continue
         if symbol and str(r.get("symbol", "")).upper() != symbol.upper():
             continue
-        if mode and str(r.get("mode", "")) != mode:
+        if mode and mode != "all" and str(r.get("mode", "")) != mode:
             continue
         rows.append(r)
-    return rows
+    return _dedupe_order_lifecycle(rows)
+
+
+def _dedupe_order_lifecycle(rows: list[dict]) -> list[dict]:
+    """Collapse one order's lifecycle rows into its terminal truth (P6: placed != filled).
+
+    A live order can appear up to twice: status=placed at the placing tick, then a reconcile row
+    with status=filled (real fill price) or status=dead (never filled). Per order_id:
+      - any 'dead' row  -> the order never executed; drop EVERY row for that id
+      - a 'filled' row  -> keep it (real price), drop the superseded 'placed' row
+      - 'placed' only   -> keep it (legacy rows / fill-not-yet-confirmed)
+    Rows without an order_id (paper fills, external closures) pass through untouched."""
+    by_oid: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        oid = r.get("order_id")
+        if oid:
+            by_oid[str(oid)].append(r)
+    drop: set[int] = set()
+    for oid, group in by_oid.items():
+        if len(group) < 2 and group[0].get("status") != "dead":
+            continue
+        statuses = {g.get("status") for g in group}
+        if "dead" in statuses:
+            drop.update(id(g) for g in group)                       # never executed
+        elif "filled" in statuses:
+            drop.update(id(g) for g in group if g.get("status") == "placed")  # superseded
+    return [r for r in rows if id(r) not in drop]
 
 
 def show_blotter(rows: list[dict]) -> None:
@@ -182,12 +209,18 @@ def main() -> int:
     ap.add_argument("--ledger", type=Path, default=DEFAULT_LEDGER)
     ap.add_argument("--since", help="ET date floor, YYYY-MM-DD (inclusive)")
     ap.add_argument("--symbol", help="filter to one symbol")
-    ap.add_argument("--mode", help="filter by mode (paper / live / live-dryrun)")
+    ap.add_argument("--mode", help="filter by mode: paper / live / live-dryrun / all. Default: "
+                    "$TRADING_MODE when set (so a live shell reads live truth), else all")
     ap.add_argument("--blotter", action="store_true", help="show only the chronological blotter")
     ap.add_argument("--round-trips", action="store_true", help="show only the round-trips")
     args = ap.parse_args()
 
-    rows = load_rows(args.ledger, args.since, args.symbol, args.mode)
+    # Mixed paper+live stats masquerading as truth is how the win-rate question went unanswerable
+    # (remediation plan P4) — default to the ambient TRADING_MODE and always SAY what's included.
+    mode = args.mode or os.environ.get("TRADING_MODE") or "all"
+    print(f"MODE: {mode}" + ("  (paper + live MIXED — pass --mode live for live truth)"
+                             if mode == "all" else ""))
+    rows = load_rows(args.ledger, args.since, args.symbol, mode)
     if not rows:
         print("no trades in window.")
         return 0

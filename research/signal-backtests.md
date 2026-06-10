@@ -201,6 +201,129 @@ constituent dataset.
 
 ---
 
+## Validation (2026-06-05): the cross-sectional momentum edge WAS the bias
+
+Two cheap, keyless tests — run *before* sourcing any delisted-price data — answer the gate above.
+**Cross-sectional single-name momentum collapses to zero out-of-universe.** (Harness: `backtest_xsection.py`
+gained `--universe` / `--drop-top`, and `run()` now excludes SPY from the tradable basket — it was
+previously ranked/EW'd as a name. That fix nudges the pinned top-5/126d cell to **+11.9%/yr, t=3.01,
+61.0% MaxDD**; same story, cleaner number.)
+
+### Test A — drop the 10 best full-span performers (`--drop-top 10`)
+Real momentum skill rotates among whatever is strong; it shouldn't hinge on a few names. It does.
+Removing the 10 biggest 22-year winners — **AVGO (+4,792,200%), NVDA, AAPL, NFLX, TSLA, BKNG, GOOGL,
+AMZN, MA, CRM** — from the same 50-name remainder:
+
+| | CAGR | MaxDD | spread vs EW | t-stat |
+|---|---:|---:|---:|---:|
+| Full 60-name universe | 28.5% | 61.0% | **+11.9%/yr** | **+3.01** |
+| Drop best 10 → 50 names | 12.6% | 66.3% | **+0.0%/yr** | **+0.30** |
+
+The spread goes to **exactly zero**. Momentum had no timing skill — it "worked" only by being
+mechanically overweight names that rose monotonically. (Dropping by end-of-sample return is an
+*attribution* test, not a tradable rule — it measures how concentrated the "edge" is in known winners.)
+
+### Test B — sector-ETF momentum, a survivorship-FREE universe
+The 9 SPDR sectors (XLK XLF XLE XLV XLY XLP XLI XLB XLU) **never delist** — no universe bias to exploit.
+Top-3, monthly, 5 bps/side:
+
+| lookback | topk | spread vs EW | t-stat |
+|---:|---:|---:|---:|
+| 252d | 3 | +0.5% | +0.26 |
+| 126d | 3 | −0.5% | −0.32 |
+| 63d | 3 | −0.8% | −0.40 |
+| 252d | 2 | +1.2% | +0.58 |
+
+**No edge at any window or concentration.** In a universe that can't be survivorship-inflated,
+momentum ≈ equal-weight.
+
+### Conclusion 4 (supersedes Conclusion 2 for live deployment)
+**Do not build the live engine around cross-sectional single-name momentum.** The +12% was the
+universe, not the signal — Tests A and B are two independent confirmations. The planned sleeve upgrades
+(residualize / vol-scale / absolute-gate) would have polished a number that isn't there; this **cancels
+the swing-momentum rewrite.** The survivor is **Backtest 3 (catalyst gap-drift / PEAD)** above — the
+only construction here with a real t-stat on the *trustworthy* large-cap control (t up to 3.10 at
+10–20d holds) and the most agent-native. The catalyst-drift thread is the one to pull next.
+
+---
+
+## Backtest 4 — does gap-drift survive as a TRADED book? (`backtest_catalyst_book.py`, 2026-06-05)
+
+Backtest 3's t-stats are an *event study* (per-event forward returns) — not tradable. This turns the
+same signal into the owner-locked risky-sleeve book (`strategies/catalyst-drift-v1-plan.md`):
+concentrated, whole-share, multi-day hold, gap-aware + optional trailing stop, shared cash account,
+compounded. ~22y, LARGE+MIDCAP (100 survivor names), vs SPY buy&hold.
+
+| Config (BOTH baskets) | CAGR | MaxDD | Sharpe | avg trade | avg invested |
+|---|---:|---:|---:|---:|---:|
+| 6×15%, gap7/hold15 | 5.6% | 38.5% | 0.43 | +1.62% | **21%** |
+| 10×18%, gap5/hold20 | 9.2% | 57.7% | 0.53 | +1.95% | **38%** |
+| + trailing stop 12% | −0.3% | 47.2% | 0.05 | +0.35% | 35% |
+| SPY buy&hold | 8.9% | 56.5% | 0.55 | — | 100% |
+
+**Three findings that matter more than the headline:**
+1. **Per-trade expectancy is genuinely positive** (+1.4% to +1.95%/trade, net of 15bps/side, *unfiltered*,
+   win 42–51%). The signal works at the trade level.
+2. **The book is capital-starved, not edge-starved.** At 100 names a gap≥7% catalyst is rare, so the
+   book sits **~80–90% in cash** — that idle capital, not a bad signal, is what drags CAGR. Forcing
+   deployment (lower gap, more/longer positions) lifts CAGR toward SPY but **dilutes signal quality and
+   pushes MaxDD to SPY-like levels**. Best risk-adjusted cells (Sharpe 0.65–0.69) are gap≥10–15% /
+   15–20d — high-quality but *rare* (2–8% invested). It's a selective, mostly-cash, concentrated edge.
+3. **Trailing stops destroy it** (Sharpe 0.05). The edge *is* the multi-day drift; a tight trail exits
+   before it plays out. Exits must be time-based (~15–20d) + a hard stop, **not** a tight trail.
+
+**The three levers the backtest can't model — all favorable, all the agent's actual job:**
+(a) **market-wide breadth** — live discovery ranges over the *whole* market's gappers each day, not 100
+fixed names, so the book can stay deployed on *high-quality* (gap≥10%) signals without lowering the bar;
+(b) the **catalyst-confirmation / pump-filter** — the one thing that could lift the 42–49% unfiltered win
+rate; (c) **survivorship/recency** drags MIDCAP down here (pessimistic).
+
+### Conclusion 5 — plausible, not proven
+Unfiltered and capped at 100 names, the catalyst book **≈ SPY risk-adjusted in-sample** — a SPY-tracker
+with extra steps. The case for it being a *real edge* rests entirely on the three unmodeled levers above.
+That is a legitimate live thesis (breadth + pump-filter are exactly what an agent adds), but it is **not
+backtest-proven** — so: build it, **paper-validate that the agent's filter lifts win rate**, size small,
+and don't bet big real money on the in-sample numbers. Go in knowing the floor is "≈SPY with concentrated
+drawdowns," and the upside is unproven.
+
+---
+
+---
+
+## Backtest 5 — does the Tier-1 soft-cut earn its keep? (`backtest_exit_policy.py --universe BOTH`, 2026-06-09)
+
+The live audit (docs/remediation-plan-2026-06-09.md P1) found the engine's Tier-1 protective sell
+(`hold_risk.py`: soft-cut at −4% "still falling" + critical-band at ~65%-of-the-way-to-stop) was
+**never backtested** — and on 2026-06-09 it fired 14× in one session, realizing −4..−9% on day-0/1 of
+15–21-day drift theses. `simulate()` now models both layers (close-of-down-day soft-cut; close-based
+critical exit), so the policy is priced instead of vibes. On top of the current live config
+(stop12 / tp40 / trail15@20), gap≥7% / vol≥2× / 15d hold, 15 bps/side:
+
+| Policy (LARGE, n=361) | mean | median | win% | sharpe |
+|---|---:|---:|---:|---:|
+| TIME-ONLY (drift ceiling) | +1.50% | +1.12% | 55% | 0.117 |
+| **LIVE + softcut8** | **+1.48%** | +0.98% | 53% | **0.141** |
+| LIVE config (no Tier-1) | +1.43% | +0.98% | 53% | 0.134 |
+| LIVE + crit65 | +1.40% | +0.94% | 53% | 0.133 |
+| LIVE + softcut6 | +1.33% | +0.74% | 51% | 0.129 |
+| LIVE + softcut4 (what was running) | **+1.04%** | **−1.82%** | **45%** | 0.104 |
+
+MIDCAP (n=601, biased but directionally consistent): softcut8 +1.88%/0.118 vs plain +1.70%/0.103;
+softcut4 +1.17%/win 36%.
+
+**Verdict:**
+1. **The −4% soft-cut was destroying ~0.4%/trade** — about a third of the entire LARGE edge — and
+   cut the win rate from 53% to 45%. Exactly the "tighter stop clips the drift on noise" failure
+   Backtest 4's trailing-stop result predicted. It is strictly worse than having no Tier-1 at all.
+2. **A DEEP soft-cut (8%) is the one Tier-1 variant that beats the plain config on mean AND sharpe
+   in both universes** — it salvages the worst losers a few days before the −12% stop without
+   clipping normal drawdown-then-drift. Adopted: `SOFT_CUT_PCT=8.0`.
+3. **The critical-band auto-sell fails the bar** (mean below plain, sharpe a wash) — disabled as a
+   sell trigger (`HOLD_RISK_CRIT_SELL=0`); the band still drives the Tier-2 re-DD cadence.
+
+Caveats: daily-bar proxy (close-of-down-day ≈ "still falling"; the live monitor reacts intraday);
+the conviction/runner exemption isn't modeled; same survivorship limits as Backtests 3–4.
+
 ## How to reproduce
 
 ```bash
@@ -211,13 +334,23 @@ python3 scripts/backtest_signal.py --refresh                        # re-pull hi
 
 # Cross-sectional momentum
 python3 scripts/backtest_xsection.py                                # 12-1, top 10, monthly
-python3 scripts/backtest_xsection.py --lookback 126 --topk 5        # best config, full stats
+python3 scripts/backtest_xsection.py --lookback 126 --topk 5        # pinned cell, full stats
 python3 scripts/backtest_xsection.py --sweep                        # lookback x topk grid
+python3 scripts/backtest_xsection.py --lookback 126 --topk 5 --drop-top 10   # Test A: survivorship floor (-> t=0.30)
+python3 scripts/backtest_xsection.py --universe XLK,XLF,XLE,XLV,XLY,XLP,XLI,XLB,XLU --topk 3 --cost-bps 5  # Test B: sector ETFs
 
-# Catalyst gap-drift (PEAD)
+# Catalyst gap-drift (PEAD) — event study
 python3 scripts/backtest_gap_drift.py                               # both universes, 5% gap, 10d
 python3 scripts/backtest_gap_drift.py --gap 10 --hold 20            # bigger surprise, longer drift
 python3 scripts/backtest_gap_drift.py --sweep                       # gap x hold grid, both universes
+
+# Catalyst-drift as a TRADED book (portfolio sim)
+python3 scripts/backtest_catalyst_book.py --universe both           # default 6x15%, gap7/hold15
+python3 scripts/backtest_catalyst_book.py --universe both --gap 5 --hold 20 --max-pos 10 --pos-pct 0.18
+python3 scripts/backtest_catalyst_book.py --sweep --universe both   # gap x hold grid w/ CAGR/MaxDD/Sharpe
+
+# Exit-policy sweep incl. the Tier-1 soft-cut/critical layer (Backtest 5)
+python3 scripts/backtest_exit_policy.py --universe BOTH
 ```
 
 Both cache history under `data/backtest/history/` on first run; subsequent runs are instant.
@@ -228,14 +361,16 @@ Both cache history under `data/backtest/history/` on first run; subsequent runs 
    horizon; fills are not the bottleneck.
 2. **The intraday absolute-pop strategy operates in the reversal zone** and caps out before the
    momentum zone. Its premise ("bigger move = buy more") is backwards intraday.
-3. **Two constructions show a real edge**, both multi-day: cross-sectional momentum (t≈3, top-5,
-   3–6mo lookback) and **catalyst gap-drift / PEAD (t up to 3.1, strongest in large caps, scales with
-   gap size and horizon)**. Gap-drift is the most agentic-friendly — it rewards reading catalysts
-   across a wide universe and filtering pumps.
-4. **The engine's architecture is the real blocker.** Every edge found lives at a multi-day-to-weeks
+3. **Only ONE construction survives the survivorship test: catalyst gap-drift / PEAD** (t up to 3.1,
+   strongest in large caps, scales with gap size and horizon). Cross-sectional single-name momentum
+   *looked* like an edge (t≈3) but **collapsed to zero** once the 10 best winners were dropped
+   (t=0.30) and on a never-delisting sector universe (|t|<0.6) — see Validation above. It was the
+   universe, not the signal. Gap-drift is also the most agentic-friendly — it rewards reading
+   catalysts across a wide universe and filtering pumps.
+4. **The engine's architecture is the real blocker.** The surviving edge lives at a 10–20 day
    horizon; the intraday-flatten / 120-min-max-hold / 5-min-synthetic-stop design is built to avoid
    exactly the horizon that pays. A profitable engine needs overnight holds and resting broker stops.
-5. **Next gate is data, not tuning:** the momentum and mid-cap gap numbers are survivorship- (and for
-   mid-caps, recency-) inflated. Validate on a survivorship-free / point-in-time universe before
-   committing the rewrite. The agent's catalyst-confirmation filter — the load-bearing piece for the
-   dirty mid-cap signal — can't be backtested here; it's the live thesis to prove.
+5. **The data gate is half-closed already.** Two keyless robustness tests (drop-best-10, sector ETFs)
+   killed the momentum thesis *without* needing a delisted-price dump — the cheap test pre-empted the
+   expensive one. For gap-drift, the load-bearing unknowns remain the agent's live catalyst-confirmation
+   filter (can't be backtested here) and an out-of-universe / leakage-clean re-run of the large-cap drift.

@@ -13,14 +13,28 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import market_conditions as mc  # sibling: INDEXES list + env helpers
 import rh_mcp
 
 REPO = Path(__file__).resolve().parent.parent
 OUT = REPO / "data" / "tick" / "broker_snapshot.json"
+
+
+def _try_snapshot() -> dict | None:
+    """One snapshot attempt. Returns a complete snapshot dict, or None if the relay failed OR came
+    back without a portfolio (a single flaky get_portfolio nulls the whole view)."""
+    try:
+        snap = rh_mcp.snapshot()
+    except Exception as e:  # noqa: BLE001 — any failure is a miss; caller retries / fails closed
+        print(f"[broker_snapshot] attempt failed: {e}", file=sys.stderr)
+        return None
+    if not isinstance(snap, dict) or snap.get("portfolio") is None:
+        print("[broker_snapshot] attempt incomplete (no portfolio)", file=sys.stderr)
+        return None
+    return snap
 
 
 def main() -> int:
@@ -28,20 +42,30 @@ def main() -> int:
         print("[broker_snapshot] not live mode — nothing to do", file=sys.stderr)
         return 0
 
-    # Quotes we can name up front: the always-watch pins + the index benchmarks. Held-symbol marks
-    # also come from public quotes in tick_context, so this set is best-effort, not load-bearing.
-    pins = [s.strip().upper() for s in os.environ.get(
-        "CANDIDATES", "AAPL,NVDA,TSLA,AMD,MSFT,AMZN,META,GOOGL,F,PLTR").split(",") if s.strip()]
-    symbols = sorted(set(pins) | set(mc.INDEXES))
-
-    try:
-        snap = rh_mcp.snapshot(symbols)
-    except Exception as e:  # noqa: BLE001 — any failure must fail closed, never trade blind
-        print(f"[broker_snapshot] FATAL: snapshot failed: {e}", file=sys.stderr)
-        return 2
-    if not isinstance(snap, dict) or snap.get("portfolio") is None:
-        print("[broker_snapshot] FATAL: snapshot missing/incomplete (no portfolio) — failing closed",
-              file=sys.stderr)
+    # No quote step: held-position marks come from tick_context's public (Cboe) quotes, merged into
+    # the broker view in live_execute. Quoting the pins here was redundant AND the wrong symbol set —
+    # it left our actual holdings unmarked (marked at cost), corrupting equity/day-P&L. So the snapshot
+    # now fetches ONLY broker truth (buying power + positions + open orders) — lighter and faster.
+    #
+    # Retry before failing closed: the snapshot is a single point of failure each tick — one transient
+    # MCP hiccup on get_portfolio (auth blip / rate-limit / 5xx) nulls the whole view and skips the
+    # tick (seen 2026-06-09 13:34). One quick retry rides out that class of one-call flake while
+    # keeping the fail-closed guarantee: if EVERY attempt is incomplete, we still write nothing and
+    # exit non-zero. Tunable via RH_SNAPSHOT_RETRIES / RH_SNAPSHOT_RETRY_BACKOFF_S.
+    attempts = max(1, int(os.environ.get("RH_SNAPSHOT_RETRIES", "2")))
+    backoff = float(os.environ.get("RH_SNAPSHOT_RETRY_BACKOFF_S", "5"))
+    snap = None
+    for i in range(attempts):
+        snap = _try_snapshot()
+        if snap is not None:
+            break
+        if i < attempts - 1:
+            print(f"[broker_snapshot] retrying in {backoff:.0f}s ({i + 1}/{attempts - 1})",
+                  file=sys.stderr)
+            time.sleep(backoff)
+    if snap is None:
+        print(f"[broker_snapshot] FATAL: snapshot missing/incomplete after {attempts} attempt(s) "
+              "(no portfolio) — failing closed", file=sys.stderr)
         return 2
 
     snap["_fetched_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")

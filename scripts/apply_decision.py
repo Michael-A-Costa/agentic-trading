@@ -23,11 +23,12 @@ import math
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import trade_log  # shared trade-history writer (paper + live)
+from state_lock import state_lock  # short critical section around every paper_state read-modify-write
 
 REPO = Path(__file__).resolve().parent.parent
 DATA = REPO / "data"
@@ -85,7 +86,7 @@ def decide_summary(filled: list, rejected: list, decision: dict, equity, day_pnl
     # A post-commit cap rejection is its own important 'why': the LLM wanted in, a guardrail blocked it.
     rej = [f"{r['symbol']} {r['side']} REJECTED: {r.get('reject_reason')}" for r in rejected]
     if parts or rej:
-        return (f"{len(filled)} filled, {len(rejected)} rejected | equity={equity} "
+        return (f"{len(filled)} filled, {len(rejected)} rejected | "
                 f"day_pnl={day_pnl} | " + " ; ".join(parts + rej))
     # No actions at all -> the screen surfaced candidates but Stage-2 DD committed to none. Surface
     # each candidate's verdict + reason so the operator sees why no entry was taken.
@@ -93,8 +94,8 @@ def decide_summary(filled: list, rejected: list, decision: dict, equity, day_pnl
     if dd:
         why = " ; ".join(f"{d.get('symbol')} {(d.get('decision') or '?').upper()}: "
                          f"{(d.get('reason') or d.get('error') or '').strip()[:90]}" for d in dd)
-        return f"HOLD — 0 of {len(dd)} candidate(s) committed: {why} | equity={equity}"
-    return f"HOLD ({decision.get('rationale', 'no action')[:80]}) | equity={equity}"
+        return f"HOLD — 0 of {len(dd)} candidate(s) committed: {why}"
+    return f"HOLD ({decision.get('rationale', 'no action')[:80]})"
 
 
 def cand_last(context: dict, sym: str) -> float | None:
@@ -169,15 +170,23 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
             result["reject_reason"] = "non-positive / non-finite qty"
             return result
 
-        # Hybrid stop eligibility: prefer a WHOLE-SHARE lot so it can carry a real resting
-        # stop-market in live (Robinhood fractional lots are broker market-only -> synthetic engine
-        # stop only). Floor to whole shares when >=1 is affordable; never force whole shares on a
-        # name the budget can't reach a share of. Flooring only ever LOWERS notional, so no cap is
-        # breached by it. Off (PREFER_WHOLE_SHARES=0) keeps pure fractional dollar sizing.
-        if bool(caps.get("PREFER_WHOLE_SHARES", 1)) and action.get("dollar_amount") is not None \
-                and math.floor(qty) >= 1:
-            qty = float(math.floor(qty))
-            notional = qty * buy_px
+        # Always whole-share lots — real resting broker stop in live, no sentinel dependency.
+        # Floor to whole shares when budget covers >=1. If budget is short of 1 share, round UP
+        # to exactly 1 when 1 share fits MAX_POSITION_USD. Otherwise reject: not fractional.
+        if action.get("dollar_amount") is not None:
+            if math.floor(qty) >= 1:
+                qty = float(math.floor(qty))
+                notional = qty * buy_px
+            else:
+                max_pos = float(caps.get("MAX_POSITION_USD", 0) or 0)
+                if max_pos > 0 and buy_px <= max_pos:
+                    qty = 1.0
+                    notional = buy_px
+                else:
+                    result["reject_reason"] = (
+                        f"whole-share-only: 1 share (${round(buy_px, 2)}) exceeds "
+                        f"MAX_POSITION_USD ({max_pos})")
+                    return result
 
         min_pos = caps.get("MIN_POSITION_USD", 0.0)
         if min_pos > 0 and notional < min_pos - 1e-6:
@@ -237,14 +246,11 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
         new_qty = prev["qty"] + qty
         new_entry = (prev["qty"] * prev["entry_price"] + qty * buy_px) / new_qty
         sl, tp = caps.get("STOP_LOSS_PCT", 2.0), caps.get("TAKE_PROFIT_PCT", 4.0)
-        # Hybrid stop tag: a WHOLE-SHARE lot is resting-eligible (a real broker stop-market in live,
-        # armed continuously); any fractional remainder (incl. when averaging in) forces synthetic.
-        # NOTE: in PAPER both still sell at the next tick, so resting vs synthetic fill identically
-        # here — the tag drives the live executor + record fidelity, and the protection edge
-        # (continuous arming, surviving between-tick/overnight gaps and engine downtime) only
-        # materializes once live places the resting order. See momentum-v0-plan.md.
-        resting = (bool(caps.get("PREFER_WHOLE_SHARES", 1))
-                   and new_qty == math.floor(new_qty) and new_qty >= 1)
+        # All new entries are whole-share lots, so new_qty should always be a whole number here.
+        # The check is kept as a safety net (averaging into a pre-existing fractional position
+        # could leave a non-integer total). In PAPER both still settle at the next tick; the
+        # resting tag drives the live executor + record fidelity (real broker stop vs synthetic).
+        resting = (new_qty == math.floor(new_qty) and new_qty >= 1)
         stop_type = "resting" if resting else "synthetic"
         stop_note = ("resting stop-market on whole-share lot (broker-armed in live; paper still "
                      "settles at tick)" if resting
@@ -255,6 +261,13 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
                           "stop_price": round(new_entry * (1 - sl / 100), 4),
                           "take_profit_price": round(new_entry * (1 + tp / 100), 4),
                           "stop_type": stop_type,
+                          # OG DD persisted for the Tier-1 hold-risk monitor (hold_risk.py); kept on averaging-in.
+                          "conviction": action.get("conviction") or prev.get("conviction"),
+                          "hold_intent": action.get("hold_intent") or prev.get("hold_intent"),
+                          "thesis_type": action.get("thesis_type") or prev.get("thesis_type"),
+                          "pead_qualified": (action.get("pead_qualified")
+                                             if action.get("pead_qualified") is not None
+                                             else prev.get("pead_qualified")),  # P3 signal-class tag
                           "scaled": prev.get("scaled", [])}  # tiers already taken (preserved when averaging in)
         state["cash"] -= notional
         result.update(status="filled", qty=round(qty, 6), price=round(buy_px, 4),
@@ -321,6 +334,51 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
     return result
 
 
+def arm_entry(action: dict, state: dict, now: datetime) -> dict:
+    """Stash a level-triggered entry for the SENTINEL to fire on a price cross, instead of buying
+    now (the "LLM arms, fast loop fires" path). We persist only intent here — the sentinel re-runs
+    the full cap gate (validate_and_fill) at fire time, so a stale/oversized armed entry is still
+    caught. A planner buy without an entry_trigger fills immediately (process_action below), so the
+    default entry behaviour is unchanged; arming is opt-in from the DD output."""
+    sym = str(action.get("symbol", "")).upper().strip()
+    trig = action.get("entry_trigger") or {}
+    direction = str(trig.get("direction") or "above").lower()
+    result: dict[str, object] = {"symbol": sym, "side": "buy",
+                                 "reason": str(action.get("reason", "")).strip(), "status": "armed"}
+    if not sym:
+        result.update(status="rejected", reject_reason="bad symbol"); return result
+    try:
+        price = float(trig.get("price"))
+    except (TypeError, ValueError):
+        result.update(status="rejected", reject_reason="bad entry_trigger price"); return result
+    if not (price > 0) or direction not in ("above", "below"):
+        result.update(status="rejected", reject_reason="bad entry_trigger"); return result
+    if action.get("dollar_amount") is None and action.get("qty") is None:
+        result.update(status="rejected", reject_reason="no qty/dollar_amount to arm"); return result
+    ttl_min = float(os.environ.get("ENTRY_ARM_TTL_MIN", "10"))
+    expires = (now + timedelta(minutes=ttl_min)).isoformat(timespec="seconds")
+    state.setdefault("armed_entries", {})[sym] = {
+        "trigger_price": round(price, 4), "direction": direction,
+        "dollar_amount": action.get("dollar_amount"), "qty": action.get("qty"),
+        "conviction": action.get("conviction"), "hold_intent": action.get("hold_intent"),
+        "thesis_type": action.get("thesis_type"), "pead_qualified": action.get("pead_qualified"),
+        "reason": result["reason"],
+        "armed_ts": now.isoformat(timespec="seconds"), "expires_ts": expires,
+    }
+    result.update(trigger_price=round(price, 4), direction=direction,
+                  dollar_amount=action.get("dollar_amount"), qty=action.get("qty"),
+                  expires_ts=expires)
+    return result
+
+
+def process_action(action: dict, context: dict, state: dict, caps: dict, now: datetime) -> dict:
+    """Route one planner action: an armed buy (side=buy + arm) is stashed for the sentinel; anything
+    else fills immediately under the cap gate. Keeps validate_and_fill the single execution path."""
+    if str(action.get("side", "")).lower() == "buy" and action.get("arm"):
+        return arm_entry(action, state, now)
+    return validate_and_fill(action, context, state, caps)
+
+
 def recompute_portfolio(state: dict, context: dict) -> tuple[float, float]:
     """(equity, day_pnl) valued at this tick's quotes — single source of truth for both branches."""
     pos_val = sum(p["qty"] * (cand_last(context, s) or p["entry_price"])
@@ -348,6 +406,15 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
+    # All paper_state.json read-modify-write runs under .state.lock so the 1-min sentinel and this
+    # 5-min executor never lose each other's updates. apply_decision does NO LLM/network work, so the
+    # lock is held only for this fast compute span (ms) — NOT during the planner's DD (decide.py runs
+    # before this and never touches paper_state), which is why the sentinel is no longer starved.
+    with state_lock():
+        return _run(context, caps, now, args)
+
+
+def _run(context: dict, caps: dict, now: datetime, args) -> int:
     state_path = STATE_PATH
     if state_path.exists():
         try:
@@ -412,24 +479,31 @@ def main() -> int:
         )
         if filled:
             parts = [f"SELL {r.get('qty', '?')} {r['symbol']} @ {r.get('price', '?')}" for r in filled]
-            summary = (f"BREAKER-EXIT {len(filled)} sold | equity={equity} day_pnl={day_pnl} | "
+            summary = (f"BREAKER-EXIT {len(filled)} sold | day_pnl={day_pnl} | "
                        + " ; ".join(parts))
         else:
-            summary = f"SKIP — {gate_reason or 'gated'} | equity={equity} day_pnl={day_pnl}"
+            summary = f"SKIP — {gate_reason or 'gated'} | day_pnl={day_pnl}"
     else:
         raw = Path(args.decision).read_text()
         decision = extract_decision(raw)
-        results = [validate_and_fill(a, context, state, caps) for a in decision["actions"]]
+        results = [process_action(a, context, state, caps, now) for a in decision["actions"]]
+        # A fresh immediate buy supersedes any pending armed entry for that name, so a name can't be
+        # both bought now AND fired again later by the sentinel (double-entry guard).
+        armed_map = state.get("armed_entries") or {}
+        for r in results:
+            if r.get("status") == "filled" and r.get("side") == "buy":
+                armed_map.pop(r["symbol"], None)
         # Recompute equity post-fills with the same quotes used this tick.
         equity, day_pnl = recompute_portfolio(state, context)
         write_json_atomic(state_path, state)
         filled = [r for r in results if r["status"] == "filled"]
-        rejected = [r for r in results if r["status"] != "filled"]
+        armed = [r for r in results if r["status"] == "armed"]   # stashed for the sentinel, not a fill
+        rejected = [r for r in results if r["status"] not in ("filled", "armed")]
         record.update(
             action="decide",
             rationale=decision.get("rationale", ""),
             results=results,
-            n_filled=len(filled), n_rejected=len(rejected),
+            n_filled=len(filled), n_armed=len(armed), n_rejected=len(rejected),
             portfolio_after={"cash": round(state["cash"], 2), "equity": equity,
                              "day_pnl": day_pnl, "open_positions": len(state["positions"]),
                              "realized_total": round(state["realized_total"], 2)},
@@ -438,9 +512,14 @@ def main() -> int:
             record["dd"] = decision["dd"]          # Stage-2 commit/reject DD + catalysts (audit)
         if decision.get("screen"):
             record["screen"] = decision["screen"]  # Stage-1 exits + entry candidates (audit)
+        if decision.get("token_usage"):
+            record["token_usage"] = decision["token_usage"]  # per-tick headless-Claude token + cost rollup
         if decision.get("_parse_error"):
             record["parse_error"] = True
         summary = decide_summary(filled, rejected, decision, equity, day_pnl)
+        if armed:
+            summary += " | ARMED " + ", ".join(
+                f"{r['symbol']} {r.get('direction')} {r.get('trigger_price')}" for r in armed)
 
     ENGINE_LOG.parent.mkdir(parents=True, exist_ok=True)
     with ENGINE_LOG.open("a") as f:
@@ -451,7 +530,7 @@ def main() -> int:
     trade_log.record_fills(record.get("results", []), ts_utc=record["ts_utc"],
                            ts_et=record.get("ts_et"), mode=record["mode"])
 
-    print(f"[{record['ts_et']}] {record['mode'].upper()} {summary}")
+    print(f"[{record['ts_et']}] equity={equity} {record['mode'].upper()} {summary}")
     return 0
 
 

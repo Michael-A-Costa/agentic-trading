@@ -119,16 +119,22 @@ both executors, so paper/live never drift):
 - **`data/journal/trades-<ET-date>.md`** — human-readable daily blotter, one bullet per trade.
 
 ```bash
-python3 scripts/trade_ledger.py             # blotter + reconstructed round-trips (FIFO entry→exit)
+python3 scripts/trade_ledger.py --mode live # blotter + round-trips, LIVE truth only (FIFO entry→exit)
 python3 scripts/trade_ledger.py --symbol NVDA   # one name's whole life
 python3 scripts/trade_ledger.py --round-trips --since 2026-06-04  # closed trips: hold time, P&L, P&L%
-python3 scripts/pnl_report.py               # realized P&L + exit-type breakdown (off the engine log)
+python3 scripts/pnl_report.py --mode paper  # realized P&L + exit-type breakdown (off the engine log)
 cat data/journal/trades-$(date +%F).md      # today's blotter at a glance
 ```
 
 `trade_ledger.py` reconstructs round-trips (hold time, entry/exit price, P&L%) the per-tick log
 can't show; `pnl_report.py` stays the realized-P&L/exit-type summary. Both share one exit-type
-classifier (`trade_log.classify_exit`).
+classifier (`trade_log.classify_exit`). **Both take `--mode paper|live|live-dryrun|all`** and
+default to `$TRADING_MODE` (else `all`, labeled MIXED) — paper and live stats blended silently is
+how the live win-rate question went unanswerable (remediation plan P4). Live order rows track a
+lifecycle (`placed` → `filled` / `dead`, deduped by `order_id` in the readers): a `placed` row is
+an intent, only `filled` is a real execution, and a `dead` row means the entry never filled
+(blotter shows `[NOT FILLED]`). Positions closed at the broker while the engine slept (resting
+stop fired) are booked by reconcile as `closed_external` sell rows (P6).
 
 Each tick's console/`tick_*.log` now spells out the **why**, not just counts: every screened
 candidate's signal, its Stage-2 DD verdict (`COMMIT`/`REJECT`/`ERROR`) with the model's reason and
@@ -204,7 +210,7 @@ covers the gap); fractional → **`market`** entry + synthetic engine-tick stop.
 TRADING_MODE=live LIVE_ARMED=0 scripts/run_trading_tick.sh
 tail -n 3 data/engine-log.jsonl     # look for "buy_dryrun" / "DRY-RUN would place"
 
-# 2) ARMED: real orders; first one capped to LIVE_CANARY_USD until a round-trip completes
+# 2) ARMED: real orders, each sized to MAX_POSITION_USD within the exposure/settled-cash caps
 TRADING_MODE=live LIVE_ARMED=1 scripts/run_trading_tick.sh
 ```
 **Gate (no human per-trade approval):** account hard-pinned to `AGENTIC_ACCOUNT` · `review` before
