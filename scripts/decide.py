@@ -644,9 +644,8 @@ def _r1_reject(sym: str, dd: dict) -> dict | None:
             "hold_intent": None, "thesis_type": "none", "next_earnings_date": "unknown",
             "reason": f"R1 auto-reject: {reason}",
             # r1=True marks this as a TRANSIENT microstructure disqualifier (spread/liquidity), not a
-            # thesis. It's recomputed for free by the Python pre-filter every tick, so the cache-writer
-            # must NOT freeze it — a verdict cached under the upside-breakout trigger would lock a name
-            # out for the day on an early-session-wide spread that has since tightened.
+            # thesis. The cache gives r1 verdicts a SHORT TTL (DD_R1_TTL_MIN, ~25m) so a name wide-spread
+            # at the open is re-checked within minutes instead of frozen all day under the breakout trigger.
             "r1": True,
             "risks": ["illiquid or wide spread"], "never_buy": False, "never_buy_reason": None,
             "catalysts": []}
@@ -793,7 +792,10 @@ def main() -> int:
     # old once-a-day scoping. The drift trigger now measures from the ORIGINAL DD price however old, so a
     # name that has run/dropped meaningfully since its verdict still re-DDs on the next tick it resurfaces.
     indefinite = os.environ.get("DD_CACHE_INDEFINITE", "1").strip().lower() not in ("0", "false", "no", "")
-    rolling_ttl = int(os.environ.get("DD_CACHE_TTL_MIN", "0")) * 60   # 0 = no sub-day cap (once/day)
+    rolling_ttl = int(os.environ.get("DD_CACHE_TTL_MIN", "0")) * 60   # global max verdict age (0 = none)
+    # R1 rejects (spread/liquidity) are TRANSIENT — a name wide-spread at the open is often fine later —
+    # so they get their own SHORT TTL and are re-checked often instead of frozen under the breakout trigger.
+    r1_ttl = int(os.environ.get("DD_R1_TTL_MIN", "25")) * 60
     # A cached COMMIT is re-DD'd mid-day if the live price has moved more than this % (either way)
     # since the DD — the "significant price movement" that invalidates a same-day entry thesis.
     drift_pct = float(os.environ.get("DD_CACHE_DRIFT_PCT", "3.0"))
@@ -879,7 +881,12 @@ def main() -> int:
                 # can further cap reuse to sub-day if set, in either mode.
                 cday = cached.get("day")
                 same_day = True if indefinite else ((cday == today_et) if cday else (age < 86400))
-                within_rolling = rolling_ttl <= 0 or age < rolling_ttl
+                # R1 (spread/liquidity) verdicts get the short r1_ttl; everything else the global rolling_ttl.
+                # A 0 TTL means no cap for that class. R1's short cap is what unfreezes a name whose spread
+                # has since tightened, without re-probing it every single tick.
+                is_r1 = bool((cached.get("result") or {}).get("r1"))
+                eff_ttl = r1_ttl if is_r1 else rolling_ttl
+                within_rolling = eff_ttl <= 0 or age < eff_ttl
                 # Asymmetric re-DD trigger (see policy comment above): commit = move either way;
                 # reject = upside breakout only (price OR range_pos). move_pct is signed: + is up.
                 ref, cur = cached.get("ref_price"), c.get("last")
@@ -954,12 +961,11 @@ def main() -> int:
             # setdefault: a verdict cached earlier today keeps the book it was routed to at DD time.
             if res.get("decision") in ("commit", "reject"):
                 res.setdefault("book", route_book(res, c))
-            # Cache commits and rejects (each reused under its asymmetric trigger at read time); never
-            # cache an error — a transient model/timeout failure must be retried, not frozen. Also never
-            # cache an R1 reject (res["r1"]): it's a transient spread/liquidity reading recomputed for
-            # free by the pre-filter every tick, so freezing it under the upside-breakout trigger would
-            # lock a name out for the day on an early-session-wide spread that has since tightened.
-            if not res.get("cached") and not res.get("r1") and res.get("decision") in ("commit", "reject"):
+            # Cache commits and rejects (each reused under its asymmetric trigger + TTL at read time);
+            # never cache an error — a transient model/timeout failure must be retried, not frozen. R1
+            # rejects ARE cached (res["r1"]) but read back under the short r1_ttl, so a transient spread/
+            # liquidity veto is re-checked within ~25 min instead of frozen all day or re-probed every tick.
+            if not res.get("cached") and res.get("decision") in ("commit", "reject"):
                 cache[sym] = {"ts": now, "day": today_et,          # stamped for age/scoping (reuse is
                                                                    #   indefinite unless DD_CACHE_INDEFINITE=0)
                               "ref_price": c.get("last"),           # price at DD time (drift trigger)
