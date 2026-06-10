@@ -170,8 +170,10 @@ def _quote_from_tick_cache(sym: str) -> dict | None:
     if time.time() - (blob.get("ts") or 0) >= QUOTE_FILE_MAX_AGE_S:
         return None  # stale (e.g. a standalone run hours later) -> fetch live instead
     q = (blob.get("quotes") or {}).get(sym.upper())
-    # require a real price; a non-Cboe source (stooq/yahoo) lacks current_price -> fetch live
-    return q if (q and q.get("current_price") is not None) else None
+    # Require a real price AND volume. An RH-sourced cache entry (QUOTES_PREFER_RH=1) has current_price
+    # but NO volume/open/high/low — reusing it would null today's liquidity, gap, and range for every
+    # candidate (liquid=False on names like CHWY). Bypass it so the DD re-fetches a FULL Cboe quote.
+    return q if (q and q.get("current_price") is not None and q.get("volume") is not None) else None
 
 
 def cboe_quote(sym: str) -> dict:
@@ -266,10 +268,15 @@ def probe(sym: str) -> dict:
     rv = out.get("rel_volume")
     d3h = out.get("dist_3mo_high_pct")
     iv = out.get("iv30")
+    # Liquidity = today's $-volume, falling back to the 20d average $-volume when today's is missing
+    # (a partial/absent intraday volume shouldn't read a structurally-liquid name as illiquid).
+    _avg20 = out.get("avg_volume_20d")
+    avg_dollar_vol = round(_avg20 * last, 0) if (_avg20 and last) else None
+    liq_dollar_vol = dollar_vol if dollar_vol is not None else avg_dollar_vol
     out["flags"] = {
         # keyless tradeability / structure
         "spread_ok": spread_pct is not None and spread_pct < 0.5,
-        "liquid": dollar_vol is not None and dollar_vol >= LIQ_FLOOR_USD,
+        "liquid": liq_dollar_vol is not None and liq_dollar_vol >= LIQ_FLOOR_USD,
         "iv_ok": iv is None or iv < IV_CEIL,           # unknown IV -> don't veto on it
         "parabolic": bool((out.get("gap_pct") is not None and out["gap_pct"] > PARABOLIC_GAP_PCT)
                           or (range_pos is not None and range_pos > 0.98
