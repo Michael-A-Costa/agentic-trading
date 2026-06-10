@@ -1,0 +1,30 @@
+Review done — I read the methodology doc and verified it claim-by-claim against .env, the launchd plists, and the actual code paths (live_execute.py, live_sentinel.py, tick_context.py, decide.py, hold_risk.py, discover_pead.py).
+
+Verdict
+
+The doc is unusually honest and ~90% accurate against the code. Every numeric parameter in §5–§7 matches .env exactly, the tripwire/breaker/GFV-guard behavior is implemented as described (live_execute.py:1002-1037, live_execute.py:98-113), the asymmetric DD-cache rules match (decide.py:744-852), and the Known Gaps section is real, not decorative. The places it diverges from the code are worth fixing, and there’s one structural tension in the methodology itself.
+
+Doc inaccuracies
+
+1.  §8’s lock claim is wrong for the live sentinel — and it overstates exit latency. The doc says “The sentinel never holds this lock — it only acquires the lighter data/.state.lock.” That describes the paper sentinel (sentinel.py + state_lock.py). The live sentinel acquires .tick.lock itself to fire a sell (live_sentinel.py:43, live_sentinel.py:143-146), and when the planner holds it, the breach defers and retries next minute. Since a planner tick runs 2–3 minutes, “protective exits have ~1-minute latency regardless of what the planner is doing” is not true — worst case is ~3–4 minutes during a planner pass, precisely when entries (and fresh risk) are being created.
+
+2.  §5’s conviction table is prompt-enforced, not code-enforced. The 1.0×/0.6×/0.35× tiers live only in dd_prompt.txt:28-29 — the LLM proposes dollar_amount and code merely caps it (check_entry_caps, live_execute.py:262-285). The hard caps make a breach impossible, but the tier ratios are advisory to a stochastic model. The doc presents them as mechanical sizing; they aren’t.
+
+3.  §3’s PEAD lookback is thinner than stated after weekends. _trading_dates_back walks back 4 calendar days keeping weekdays (discover_pead.py:88-99), so a Monday scan covers only Friday + Monday. A Wednesday/Thursday reporter — still day 2–3 of a 10–20 day drift window — silently drops out of discovery. The fix is trivial (count trading days, not calendar days).
+
+4.  §6’s exit precedence is slightly misdrawn. The trailing stop isn’t exit #2 in an evaluation order — it’s a stop-price ratchet applied in reconcile (live_execute.py:541-560); the actual tick-time order is stop → TP → soft-cut → time exits (tick_context.py:405-447). Cosmetic, but “order of precedence” implies something the code doesn’t do.
+
+5.  CLAUDE.md is stale against both the doc and the code. It says ticks run every 10 minutes and “every entry sized to MAX_POSITION_USD”; the plists are StartInterval 900 and sizing is conviction-tiered. The methodology doc is right; the repo guidance is what’s wrong.
+
+Methodology substance
+
+What’s good: §9 is the strongest section — it admits the agent-lift hypothesis is unproven, that live was armed ahead of the evidence gate as an owner decision, and pre-commits a falsifiable disarm criterion (≥30 resolved events, no lift → disarm). The risk math is internally coherent at current size: 15% position × 12% stop = 1.8% equity at risk, under the 2% per-trade cap; the whole-share-preferred design with in-tick stop arming (_arm_entry_stop) and re-arm-after-failed-sell (live_execute.py:638-648) shows real adversarial thinking about failure modes.
+
+The structural tension: the backtested edge is PEAD gap-up on large caps, but in benign regimes the engine grants full free-rein discretion with no signal gate (“the agent IS the screen,” tick_context.py:468-472). Free-rein and PEAD bets share the same capital, the same 90% exposure ceiling, and the same 10% tripwire. A free-rein drawdown can trip the tripwire and kill the experiment before the PEAD cohort ever resolves (~2026-06-26) — the unvalidated strategy can falsify the validated one’s test. If the point of the live run is the §9 evidence gate, free-rein entries are contaminating the denominator and carrying veto power over the experiment’s lifespan. Worth considering: cap free-rein exposure separately, or run PEAD-only until the first cohort resolves.
+
+Smaller substantive notes:
+- The sentinel fires an irreversible market sell off a single Cboe last print with no sanity check (live_sentinel.py:84-93) — a bad print ≤ stop, or ≥ +40% on the TP side, executes immediately. A two-consecutive-reads confirmation would cost one minute of latency on real breaches and eliminate the bad-print class.
+- start_of_day_equity is stamped on the first tick of the day (live_execute.py:942-944). If the Mac wakes mid-day after losses, the breaker baseline is already-depressed equity, making the 5% daily breaker more permissive on exactly the bad days.
+- review_blocking is a denylist (live_execute.py:385-387) — a novel blocking alert type fails open. The comment acknowledges this; it’s still the only fail-open in an otherwise fail-closed pipeline.
+
+Net: the engineering is more careful than the doc, not less — most divergences are the doc under- or mis-describing protections that exist. The two things I’d actually act on are the live-sentinel lock-latency claim (#1, because it’s a safety property the doc asserts and the code doesn’t deliver) and the free-rein/PEAD experiment contamination, which is a design decision only the owner can make.

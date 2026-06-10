@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  launchd agent: the SLOW PLANNER pass every 5 minutes (StartInterval 300), around the clock. This
+  launchd agent: the SLOW PLANNER pass every 15 minutes (StartInterval 900), around the clock. This
   is the deliberative half of the two-rate loop (docs/two-rate-architecture.md): discovery + DD +
   manage + entry commit/arm (the LLM work). The FAST half — protective exits + armed-entry triggers,
   no LLM — runs every minute via com.agentic.sentinel.plist. The two share data/.tick.lock, so they
-  never race; a DD-heavy planner tick just makes that minute's sentinel pass skip. 5 min gives a DD
+  never race; a DD-heavy planner tick just makes that minute's sentinel pass skip. 15 min gives a DD
   tick room to finish (a DD is ~85s) and matches the multi-day drift horizon; the once-a-day DD cache
-  keeps token cost bounded. (Was 60 = 1 min, before the sentinel owned fast risk latency.)
+  keeps token cost bounded. (Was 600 = 10 min.)
 
   Off-hours ticks are NOT failures. market_conditions.py + tick_context.py compute the session in
   America/New_York and print GATE=SKIP outside weekday 09:30-15:55 ET; run_trading_tick.sh then logs
@@ -39,7 +39,7 @@
     <string>/Users/mcosta/agentic-trading</string>
 
     <key>StartInterval</key>
-    <integer>600</integer>
+    <integer>900</integer>
 
     <key>RunAtLoad</key>
     <false/>

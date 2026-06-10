@@ -4,7 +4,7 @@ live_sentinel.py — the FAST live risk pass for FRACTIONAL lots, run every ~1 m
 
 Why it exists: whole-share lots are protected by a REAL resting stop_market GTC at the broker — it
 sits at the exchange and fires on its own, no code needed. FRACTIONAL lots get only a SYNTHETIC stop
-(a price level WE must watch). The planner tick now runs every ~10 min (cost), so between ticks a
+(a price level WE must watch). The planner tick now runs every ~15 min (cost), so between ticks a
 fractional lot's synthetic stop would be unwatched. This pass closes that gap: every minute it checks
 each fractional/synthetic lot's stop & take-profit against a fresh PUBLIC (Cboe) quote — NO LLM — and
 fires a protective market sell via the rh_mcp relay ONLY when a level is breached (the sole LLM call,
@@ -87,10 +87,23 @@ def _breach(sym: str, lot: dict, now_s: float) -> tuple[str, float] | None:
         return None
     last = float(last)
     if last <= float(stop):
-        return ("synthetic_stop", last)
-    if tp and last >= float(tp):
-        return ("take_profit", last)
-    return None
+        reason = "synthetic_stop"
+    elif tp and last >= float(tp):
+        reason = "take_profit"
+    else:
+        return None
+    # Confirm on a second read 3 s later — a single bad Cboe print cannot fire an irreversible sell.
+    time.sleep(3)
+    q2 = dd_probe.cboe_quote(sym)
+    last2_raw = q2.get("last") if isinstance(q2, dict) else None
+    if last2_raw is None:
+        return None
+    last2 = float(last2_raw)
+    if reason == "synthetic_stop" and last2 > float(stop):
+        return None
+    if reason == "take_profit" and tp and last2 < float(tp):
+        return None
+    return (reason, last2)
 
 
 def main() -> int:
@@ -108,6 +121,13 @@ def main() -> int:
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)
         print(f"[sentinel] force-tick fired at {now_et.strftime('%H:%M')} ET")
+    # Heartbeat: write before the is_open gate so off-hours runs are visible too.
+    try:
+        hb = REPO / "data" / "sentinel_heartbeat.txt"
+        hb.write_text(datetime.now(timezone.utc).isoformat(timespec="seconds") + "\n")
+    except OSError:
+        pass
+
     if not is_open:
         return 0  # only act on a fresh regular-hours quote
 
@@ -117,13 +137,9 @@ def main() -> int:
     except (OSError, ValueError):
         return 0
     now_s = time.time()
-    # Heartbeat: write last-run timestamp to a separate file so the user can verify the sentinel
-    # is alive without a breach event — avoids racing with the planner's live_state.json writes.
-    try:
-        hb = REPO / "data" / "sentinel_heartbeat.txt"
-        hb.write_text(datetime.now(timezone.utc).isoformat(timespec="seconds") + "\n")
-    except OSError:
-        pass
+    watched = [sym for sym, lot in (state.get("lots") or {}).items() if _needs_watch(lot)]
+    print(f"[sentinel] {now_et.strftime('%H:%M:%S')} ET — watching {len(watched)} synthetic lot(s)"
+          + (f": {', '.join(watched)}" if watched else ""))
     breaches = []  # (sym, reason, last, qty)
     for sym, lot in (state.get("lots") or {}).items():
         if not _needs_watch(lot):

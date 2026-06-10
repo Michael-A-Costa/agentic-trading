@@ -85,17 +85,15 @@ def _exclude_set() -> set[str]:
     return set(mc.INDEXES) | extra
 
 
-def _trading_dates_back(n_calendar_days: int) -> list[date]:
-    """Return the last n_calendar_days calendar dates (incl. today) that are weekdays (Mon-Fri)."""
+def _trading_dates_back(n_trading_days: int) -> list[date]:
+    """Return the last n_trading_days weekday dates (Mon-Fri) going back from today inclusive."""
     today = datetime.now(mc.ET).date()
     out = []
     d = today
-    seen_days = 0
-    while seen_days < n_calendar_days:
+    while len(out) < n_trading_days:
         if d.weekday() < 5:  # Mon-Fri
             out.append(d)
         d -= timedelta(days=1)
-        seen_days += 1
     return out
 
 

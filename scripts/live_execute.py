@@ -1069,9 +1069,24 @@ def main() -> int:
         exp_headroom = max(0.0, float(caps.get("MAX_TOTAL_EXPOSURE_USD", 0.0)) - exposure)
         headroom_slots = int(min(settled_bp, exp_headroom) // ceil)
         slots = max(0, min(max_entries, headroom_slots, len(ready)))
+        if ready and headroom_slots == 0:
+            binding = "settled_bp" if settled_bp <= exp_headroom else "exposure"
+            print(
+                f"[live_execute] ENTRY-BLOCKED: {len(ready)} buy candidate(s) ready but 0 slots — "
+                f"{binding} is binding (settled_bp={settled_bp:.2f}, exp_headroom={exp_headroom:.2f}, "
+                f"MAX_POSITION_USD={ceil:.2f}); need ${ceil:.0f} settled to open one position",
+                file=sys.stderr,
+            )
+        elif ready and slots < len(ready):
+            print(
+                f"[live_execute] ENTRY-THROTTLE: {len(ready)} ready, {slots} slots "
+                f"(max_entries={max_entries}, headroom_slots={headroom_slots}, "
+                f"settled_bp={settled_bp:.2f}, MAX_POSITION_USD={ceil:.2f})",
+                file=sys.stderr,
+            )
         for sym, a in ready[slots:]:
             results.append({"symbol": sym, "side": "buy", "status": "skipped",
-                            "reject_reason": f"deferred — slots used (max_entries={max_entries}, headroom_slots={headroom_slots})"})
+                            "reject_reason": f"deferred — 0 slots (settled_bp={settled_bp:.2f} < MAX_POSITION_USD={ceil:.2f})"})
 
         # Run the slot entries' review+place relays in PARALLEL (independent I/O-bound cold-start
         # spawns) — same machinery and knob as the exits above (LIVE_PARALLEL_ORDERS / _WORKERS).
@@ -1123,9 +1138,20 @@ def main() -> int:
 
     placed = record["n_placed"]
     note = "DRY-RUN" if is_dryrun else "ARMED"
-    gfv = f" settled_bp={round(settled_bp, 2)}" + (f" (unsettled={unsettled_total})" if unsettled_total else "")
+    gfv = f" settled_bp={round(settled_bp, 2)}" + (f" (unsettled={round(unsettled_total, 2)})" if unsettled_total else "")
+    # Aggregate skip reasons so the summary line explains *why*, not just how many.
+    skip_groups: dict = {}
+    for r in results:
+        if r.get("status") in ("skipped", "dryrun"):
+            raw = r.get("reject_reason", "unknown")
+            key = raw.split("(")[0].strip().rstrip(" —") if "(" in raw else raw[:50]
+            skip_groups[key] = skip_groups.get(key, 0) + 1
+    skip_detail = ""
+    if skip_groups:
+        parts = [f"{v}×{k}" for k, v in skip_groups.items()]
+        skip_detail = f" [{'; '.join(parts)}]"
     print(f"[{record['ts_et']}] {mode_tag.upper()} {note} — {placed} placed, {record['n_skipped']} "
-          f"skipped | equity={equity} day_pnl={day_pnl} bp={broker['buying_power']}{gfv}")
+          f"skipped{skip_detail} | equity={equity} day_pnl={day_pnl} bp={broker['buying_power']}{gfv}")
     rtu = record["relay_token_usage"]
     if rtu.get("n_calls"):
         print(f"RELAY-TOKENS: {rtu['n_calls']} call(s), {rtu['total_tokens']:,} tok "

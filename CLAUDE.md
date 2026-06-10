@@ -116,12 +116,12 @@ Each script forces its own mode after sourcing `.env`, so the wrong `.env` value
 accidentally flip modes.
 
 **Paper** (simulated, default): `run_paper_tick.sh` (launchd via `com.agentic.trading-paper.plist`,
-every 10 min) + `run_paper_sentinel.sh` (1 min). Flow: market regime →
+every 15 min) + `run_paper_sentinel.sh` (1 min). Flow: market regime →
 `tick_context.py` (deterministic screen + gate) → `decide.py` (Stage-2 DD) →
 `apply_decision.py` (simulated fill, tracks `data/paper_state.json`). No real orders.
 
 **Live** (real money): `run_live_tick.sh` (launchd via `com.agentic.trading-live.plist`,
-every 10 min) + `run_live_sentinel.sh` (1 min). Flow: precheck → market regime →
+every 15 min) + `run_live_sentinel.sh` (1 min). Flow: precheck → market regime →
 `broker_snapshot.py` → `live_tick_context.py` (context + gate) → `decide.py` →
 `live_execute.py` (real `review → place` via the MCP relay agent `rh_mcp.py`). All
 sizing/cap/gating logic stays in Python; the agent only relays. Truth is re-read from the
@@ -129,8 +129,8 @@ broker; `data/live_state.json` holds only our stop/TP metadata. Whole-share lots
 `limit` entry + resting `stop_market` GTC; fractional → `market` + synthetic stop.
 
 **Live is double-gated:** running `run_live_tick.sh` with `LIVE_ARMED!=1` is a **dry-run**
-(real `review`, logs intended orders, places nothing); `LIVE_ARMED=1` actually places (every
-entry sized to `MAX_POSITION_USD` within the exposure/settled-cash caps). **Kill switches** (in
+(real `review`, logs intended orders, places nothing); `LIVE_ARMED=1` actually places (entries conviction-tiered at 1.0×/0.6×/0.35× of
+`MAX_POSITION_USD`, within the exposure/settled-cash caps). **Kill switches** (in
 order of preference):
 1. `launchctl unload com.agentic.trading-live.plist` — stops the live scheduler
 2. `LIVE_ARMED=0` in `.env` — arms nothing new (dry-run mode)
