@@ -40,6 +40,17 @@ ENGINE_LOG = DATA / "engine-log.jsonl"
 SCALE_BREAKEVEN = os.environ.get("SCALE_BREAKEVEN_AFTER_FIRST", "1").strip().lower() not in ("0", "false", "no", "")
 
 
+# Two-book split (strategies/two-book-v2-plan.md) — paper mirror of live_execute's book gate.
+# Keep these in sync with live_execute.books_enabled / book_arm_on.
+def books_enabled() -> bool:
+    return str(os.environ.get("BOOKS_ENABLED", "0")).strip().lower() in ("1", "true", "yes", "on")
+
+
+def book_arm_on(book: str) -> bool:
+    key = "BOOK_PEAD_ENABLED" if book == "pead" else "BOOK_DISCO_ENABLED"
+    return str(os.environ.get(key, "1")).strip().lower() in ("1", "true", "yes", "on")
+
+
 def load_json(p: Path) -> dict:
     return json.loads(p.read_text())
 
@@ -141,6 +152,19 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
             result["reject_reason"] = f"entries disabled ({context.get('stale_reason') or 'market closed/stale'})"
             return result
 
+        # Two-book gate (mirror of live_execute.execute_buy): disarm flag + ticker ownership.
+        book = str(action.get("book") or "disco")
+        result["book"] = book
+        if books_enabled():
+            if not book_arm_on(book):
+                result["reject_reason"] = f"book_disarmed: {book} entries halted (BOOK_{book.upper()}_ENABLED=0)"
+                return result
+            prior_lot = positions.get(sym)
+            if prior_lot and str(prior_lot.get("book") or "disco") != book:
+                result["reject_reason"] = (f"book_conflict: {sym} owned by "
+                                           f"{prior_lot.get('book') or 'disco'} book")
+                return result
+
         # --- marketable-limit entry (paper model of a real marketable BUY limit) ---
         # Cross the spread with a LIMIT capped at MARKETABLE_LIMIT_PCT above the touch (price
         # protection vs a runaway print), and fill at the slipped price. If the modeled fill would
@@ -214,6 +238,21 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
         # (cash + live exposure) is still needed as the denominator for the at-fill daily-loss
         # re-check below.
         equity_now = state["cash"] + cur_exposure
+        # Pead exposure ceiling (mirror of live_execute): the pead book may hold up to
+        # BOOK_PEAD_MAX_FRAC x equity; disco is bounded only by the global exposure cap above.
+        if books_enabled() and book == "pead":
+            try:
+                _frac = float(os.environ.get("BOOK_PEAD_MAX_FRAC", "0.30") or 0.30)
+            except ValueError:
+                _frac = 0.30
+            pead_max = _frac * equity_now
+            pead_expo = sum(p["qty"] * max(cand_last(context, s) or 0.0, p["entry_price"])
+                            for s, p in positions.items()
+                            if str(p.get("book") or "disco") == "pead")
+            if pead_expo + notional > pead_max + 1e-6:
+                result["reject_reason"] = (f"pead_book_ceiling: exposure {round(pead_expo, 2)} + "
+                                           f"{round(notional, 2)} > {round(pead_max, 2)}")
+                return result
         # Per-trade-loss budget: bound the dollar loss if the stop fills at stop_price. (This bounds
         # *sizing at the stop*, not realized loss — a synthetic stop can gap through; that's why
         # MAX_POSITION_USD and the EOD flatten also exist.)
@@ -268,6 +307,7 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
                           "pead_qualified": (action.get("pead_qualified")
                                              if action.get("pead_qualified") is not None
                                              else prev.get("pead_qualified")),  # P3 signal-class tag
+                          "book": str(action.get("book") or prev.get("book") or "disco"),  # two-book lot owner
                           "scaled": prev.get("scaled", [])}  # tiers already taken (preserved when averaging in)
         state["cash"] -= notional
         result.update(status="filled", qty=round(qty, 6), price=round(buy_px, 4),
@@ -285,6 +325,7 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
         return result
     held = positions[sym]["qty"]
     lot_stop_type = positions[sym].get("stop_type")  # capture before a full exit deletes the lot
+    result["book"] = str(positions[sym].get("book") or "disco")  # sells inherit the lot's book
     # Exit fill: model adverse slippage on the way OUT. A risk-rule exit (stop / EOD flatten /
     # wind-down / max-hold) is a market or stop-market order — it must complete, so no limit cap;
     # a discretionary or scale-out sell is treated as a marketable limit. order_type is recorded on
@@ -362,6 +403,7 @@ def arm_entry(action: dict, state: dict, now: datetime) -> dict:
         "dollar_amount": action.get("dollar_amount"), "qty": action.get("qty"),
         "conviction": action.get("conviction"), "hold_intent": action.get("hold_intent"),
         "thesis_type": action.get("thesis_type"), "pead_qualified": action.get("pead_qualified"),
+        "book": action.get("book") or "disco",  # the sentinel-fired buy keeps its routed book
         "reason": result["reason"],
         "armed_ts": now.isoformat(timespec="seconds"), "expires_ts": expires,
     }
@@ -514,6 +556,18 @@ def _run(context: dict, caps: dict, now: datetime, args) -> int:
             record["screen"] = decision["screen"]  # Stage-1 exits + entry candidates (audit)
         if decision.get("token_usage"):
             record["token_usage"] = decision["token_usage"]  # per-tick headless-Claude token + cost rollup
+            # DD cost ledger (v2 plan): one tiny row per tick for pnl_report's edge-vs-spend line.
+            tu = decision["token_usage"]
+            try:
+                with (DATA / "costs.jsonl").open("a") as f:
+                    f.write(json.dumps({"ts_utc": record["ts_utc"], "ts_et": record.get("ts_et"),
+                                        "mode": record["mode"],
+                                        "dd_cost_usd": round(float(tu.get("cost_usd") or 0.0), 4),
+                                        "relay_cost_usd": 0.0,
+                                        "dd_calls": int(tu.get("n_calls") or 0),
+                                        "relay_calls": 0}) + "\n")
+            except (OSError, TypeError, ValueError):
+                pass
         if decision.get("_parse_error"):
             record["parse_error"] = True
         summary = decide_summary(filled, rejected, decision, equity, day_pnl)

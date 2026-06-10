@@ -87,7 +87,9 @@ def armed_entry_actions(state: dict, context: dict, now: datetime) -> tuple[list
                      **({"dollar_amount": a["dollar_amount"]} if a.get("dollar_amount") is not None else {}),
                      **({"qty": a["qty"]} if a.get("qty") is not None else {}),
                      "conviction": a.get("conviction"), "hold_intent": a.get("hold_intent"),
-                     "thesis_type": a.get("thesis_type")})
+                     "thesis_type": a.get("thesis_type"),
+                     "pead_qualified": a.get("pead_qualified"),
+                     "book": a.get("book") or "disco"})
     return fire, drop
 
 

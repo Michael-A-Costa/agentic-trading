@@ -77,6 +77,7 @@ def record_events(context: dict, candidates: list, dd_results: list) -> int:
                 "is_real": dec == "commit",                     # agent says: a real, tradeable catalyst
                 "is_pump": dec == "reject" and (ctype in (None, "none")),  # rejected with no catalyst = pump
                 "pead_qualified": d.get("pead_qualified"),      # measured gap+vol signal met (P3 label gate)
+                "book": d.get("book"),                          # two-book cohort: pead | disco (v2 plan)
                 "catalyst_type": ctype,
                 "conviction": d.get("conviction"),
                 "reason": (d.get("reason") or "")[:200],

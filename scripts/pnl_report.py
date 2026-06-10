@@ -75,9 +75,12 @@ def fmt_usd(x: float) -> str:
     return f"{'+' if x >= 0 else '-'}${abs(x):,.2f}"
 
 
-def summarize(recs: list[dict], title: str) -> None:
+def summarize(recs: list[dict], title: str, book: str | None = None) -> None:
     sells = [res for _, res in iter_fills(recs) if res.get("side") == "sell"]
     buys = [res for _, res in iter_fills(recs) if res.get("side") == "buy"]
+    if book is not None:   # two-book split: 'pead' / 'disco' / 'untagged' (pre-split rows)
+        sells = [s for s in sells if str(s.get("book") or "untagged") == book]
+        buys = [b for b in buys if str(b.get("book") or "untagged") == book]
 
     print(f"\n{'=' * 64}\n{title}\n{'=' * 64}")
     print(f"records: {len(recs)}   buys: {len(buys)}   sells: {len(sells)}")
@@ -171,6 +174,9 @@ def main() -> int:
     ap.add_argument("--mode", help="filter engine-log records by mode: paper / live / live-dryrun / "
                     "all. Default: $TRADING_MODE when set, else all (P4: mixed stats must be labeled)")
     ap.add_argument("--by-day", action="store_true", help="one summary block per ET trading day")
+    ap.add_argument("--by-book", action="store_true",
+                    help="one summary block per virtual book (pead / disco / untagged) — "
+                         "the two-book split's per-cohort verdict (strategies/two-book-v2-plan.md)")
     args = ap.parse_args()
 
     mode = args.mode or os.environ.get("TRADING_MODE") or "all"
@@ -185,14 +191,55 @@ def main() -> int:
         days = sorted({r.get("ts_et", "")[:10] for r in recs})
         for d in days:
             summarize([r for r in recs if r.get("ts_et", "")[:10] == d], f"ET day {d}")
+    elif args.by_book:
+        books = sorted({str(res.get("book") or "untagged")
+                        for _, res in iter_fills(recs) if res.get("side") == "sell"})
+        for b in books or ["untagged"]:
+            summarize(recs, f"BOOK: {b}", book=b)
     else:
         span = f"{recs[0].get('ts_et','')[:10]} → {recs[-1].get('ts_et','')[:10]}"
         summarize(recs, f"ALL — {span}")
 
+    show_costs(args.since, mode, recs)
     state = args.state or (REPO / "data" / "live_state.json" if mode.startswith("live")
                            else DEFAULT_STATE)
     show_open(state)
     return 0
+
+
+def show_costs(since: str | None, mode: str, recs: list[dict]) -> None:
+    """Edge-vs-spend honesty line (v2 plan): gross realized P&L in the window vs LLM token cost
+    from data/costs.jsonl (one row per tick, written by both executors since 2026-06-09)."""
+    path = REPO / "data" / "costs.jsonl"
+    if not path.exists():
+        return
+    dd = relay = 0.0
+    n = 0
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if since and (r.get("ts_et") or r.get("ts_utc") or "")[:10] < since:
+            continue
+        if mode != "all" and str(r.get("mode", "")) != mode:
+            continue
+        dd += float(r.get("dd_cost_usd") or 0.0)
+        relay += float(r.get("relay_cost_usd") or 0.0)
+        n += 1
+    if not n:
+        return
+    realized = sum(float(res.get("realized_usd") or 0.0)
+                   for _, res in iter_fills(recs) if res.get("side") == "sell")
+    spend = dd + relay
+    print(f"\n{'=' * 64}\nedge vs spend (window)\n{'=' * 64}")
+    print(f"realized P&L {fmt_usd(realized)}   LLM spend -${spend:,.2f} "
+          f"(dd ${dd:,.2f} / relay ${relay:,.2f}, {n} tick rows)")
+    print(f"net of tokens: {fmt_usd(realized - spend)}"
+          + ("   ← token spend exceeds gross realized edge" if spend > realized else ""))
+    print("(cost ledger starts 2026-06-09 — earlier ticks aren't counted)")
 
 
 if __name__ == "__main__":

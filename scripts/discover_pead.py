@@ -182,6 +182,10 @@ def pead_meta(force_refresh: bool = False) -> dict[str, dict]:
                 "days_since": days_since,
                 "name": (row.get("name") or "").strip(),
                 "eps_forecast": (row.get("epsForecast") or "").strip(),
+                # mktcap feeds the two-book router (pead book = mega-cap only; v2 plan): the
+                # calendar row is the only keyless mktcap source for names the gainer screen
+                # didn't also surface.
+                "mktcap": _num(row.get("marketCap")),
             }
 
     # Write cache

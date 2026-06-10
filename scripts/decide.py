@@ -647,6 +647,29 @@ def _r1_reject(sym: str, dd: dict) -> dict | None:
             "catalysts": []}
 
 
+def route_book(res: dict, c: dict | None = None) -> str:
+    """Two-book split (strategies/two-book-v2-plan.md): label-only routing of a DD verdict.
+
+    'pead' = the measured-edge cohort: the probe-measured gap+vol signal met (pead_qualified
+    is True) AND mega-cap (mktcap >= PEAD_BOOK_MIN_MKTCAP_USD — a $30B proxy for the backtest's
+    fixed LARGE list, backtest_gap_drift.py:52). Everything else = 'disco' (free-rein
+    discretion). Unknown mktcap fails to disco — a name we can't place in the validated regime
+    must not enter the evidence cohort. The label NEVER spills: a pead commit that can't be
+    funded is skipped by the executor, never re-tagged disco.
+    """
+    if res.get("pead_qualified") is not True:
+        return "disco"
+    try:
+        floor = float(os.environ.get("PEAD_BOOK_MIN_MKTCAP_USD", "30000000000") or 3e10)
+    except ValueError:
+        floor = 3e10
+    try:
+        mktcap = float((c or {}).get("mktcap"))
+    except (TypeError, ValueError):
+        return "disco"
+    return "pead" if mktcap >= floor else "disco"
+
+
 def run_manage_dd(p: dict, regime: dict, caps: dict, portfolio: dict, dd_model: str) -> dict:
     """Tier-2: re-assess ONE held position on FRESH data + news. Returns
     {action: keep|trim|exit|add, trim_fraction, add_dollars, conviction, hold_intent, reason}.
@@ -921,6 +944,11 @@ def main() -> int:
             res = cache_hits.get(sym) or fresh_results.get(sym)
             if res is None:
                 continue
+            # Two-book label (Phase 0, measurement-only): every verdict — commit AND reject — gets
+            # a book so the forward ledger can split the pead cohort from free-rein discretion.
+            # setdefault: a verdict cached earlier today keeps the book it was routed to at DD time.
+            if res.get("decision") in ("commit", "reject"):
+                res.setdefault("book", route_book(res, c))
             # Cache commits and rejects (each reused under its asymmetric trigger at read time); never
             # cache an error — a transient model/timeout failure must be retried, not frozen.
             if not res.get("cached") and res.get("decision") in ("commit", "reject"):
@@ -958,6 +986,7 @@ def main() -> int:
                        "hold_intent": res.get("hold_intent"),   #   so the Tier-1 risk monitor can reason
                        "thesis_type": res.get("catalyst_type"),
                        "pead_qualified": res.get("pead_qualified"),  # measured-signal flag -> trade log (P3)
+                       "book": res.get("book", "disco"),        # two-book split: pead | disco (v2 plan)
                        "reason": f"[{tag}] {res.get('reason', '')}"}
                 # Optional level-triggered entry: if the DD returned an entry_trigger, ARM it for the
                 # sentinel to fire on the cross instead of buying now (LLM arms, fast loop fires). No
@@ -1064,6 +1093,7 @@ def main() -> int:
                                             "conviction": res.get("conviction"),
                                             "hold_intent": res.get("hold_intent"),
                                             "thesis_type": p.get("thesis_type"),
+                                            "book": p.get("book") or "disco",  # add-on inherits the lot's book
                                             "reason": f"[manage/add] {res.get('reason', '')}"})
                     # "keep" -> no action (the cache ts is still bumped so it coasts for its TTL)
                 save_manage_cache(mcache)

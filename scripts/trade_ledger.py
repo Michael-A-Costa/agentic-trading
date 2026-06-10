@@ -38,7 +38,8 @@ def fmt_usd(x: float) -> str:
     return f"{'+' if x >= 0 else '-'}${abs(x):,.2f}"
 
 
-def load_rows(path: Path, since: str | None, symbol: str | None, mode: str | None) -> list[dict]:
+def load_rows(path: Path, since: str | None, symbol: str | None, mode: str | None,
+              book: str | None = None) -> list[dict]:
     if not path.exists():
         raise SystemExit(f"no trade ledger at {path} — no executed trades recorded yet.")
     rows = []
@@ -56,6 +57,8 @@ def load_rows(path: Path, since: str | None, symbol: str | None, mode: str | Non
             continue
         if mode and mode != "all" and str(r.get("mode", "")) != mode:
             continue
+        if book and str(r.get("book") or "untagged") != book:
+            continue   # two-book filter: pead / disco / untagged (pre-split rows)
         rows.append(r)
     return _dedupe_order_lifecycle(rows)
 
@@ -213,6 +216,8 @@ def main() -> int:
                     "$TRADING_MODE when set (so a live shell reads live truth), else all")
     ap.add_argument("--blotter", action="store_true", help="show only the chronological blotter")
     ap.add_argument("--round-trips", action="store_true", help="show only the round-trips")
+    ap.add_argument("--book", help="filter by virtual book: pead / disco / untagged "
+                    "(two-book split, strategies/two-book-v2-plan.md)")
     args = ap.parse_args()
 
     # Mixed paper+live stats masquerading as truth is how the win-rate question went unanswerable
@@ -220,7 +225,9 @@ def main() -> int:
     mode = args.mode or os.environ.get("TRADING_MODE") or "all"
     print(f"MODE: {mode}" + ("  (paper + live MIXED — pass --mode live for live truth)"
                              if mode == "all" else ""))
-    rows = load_rows(args.ledger, args.since, args.symbol, mode)
+    if args.book:
+        print(f"BOOK: {args.book}")
+    rows = load_rows(args.ledger, args.since, args.symbol, mode, args.book)
     if not rows:
         print("no trades in window.")
         return 0

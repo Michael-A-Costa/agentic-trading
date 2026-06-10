@@ -81,6 +81,73 @@ def gfv_guard_on() -> bool:
     return str(os.environ.get("CASH_SETTLEMENT_GUARD", "1")).strip().lower() in ("1", "true", "yes", "on")
 
 
+# ---------------------------------------------------------------------------
+# two-book split (strategies/two-book-v2-plan.md): shared capital pool, ceilings + priority.
+# 'pead' = measured-edge cohort (qualified gap+vol on a mega-cap); 'disco' = free-rein discretion.
+# BOOKS_ENABLED=0 -> tagging only (Phase 0), no cap behavior changes.
+# ---------------------------------------------------------------------------
+def books_enabled() -> bool:
+    return str(os.environ.get("BOOKS_ENABLED", "0")).strip().lower() in ("1", "true", "yes", "on")
+
+
+def book_of(lot: dict | None) -> str:
+    """A lot's owning book; pre-split lots default to disco (they were free-rein entries)."""
+    return str((lot or {}).get("book") or "disco")
+
+
+def book_arm_on(book: str) -> bool:
+    """Per-book disarm flag: halts that book's NEW entries only (exits/stops keep running)."""
+    key = "BOOK_PEAD_ENABLED" if book == "pead" else "BOOK_DISCO_ENABLED"
+    return str(os.environ.get(key, "1")).strip().lower() in ("1", "true", "yes", "on")
+
+
+def book_exposure(book: str, state: dict, broker: dict) -> float:
+    """Market value of the open lots tagged with this book (broker qty + live marks where known)."""
+    total = 0.0
+    for sym, lot in (state.get("lots") or {}).items():
+        if book_of(lot) != book:
+            continue
+        bq = (broker.get("positions") or {}).get(sym, {}).get("qty")
+        qty = bq if bq is not None else (_f(lot.get("qty"), 0.0) or 0.0)
+        px = ((broker.get("quotes") or {}).get(sym) or {}).get("last") or _f(lot.get("entry_price"), 0.0) or 0.0
+        total += qty * px
+    return total
+
+
+def book_net_pnl(book: str, state: dict, broker: dict) -> float:
+    """Cumulative net P&L of one virtual book: realized (book-tagged live sell rows in
+    data/trades.jsonl) + unrealized on its open lots. Pre-split rows carry no book tag and count
+    for neither — each book's tripwire clock starts when tagging began (2026-06-09)."""
+    realized = 0.0
+    try:
+        for line in trade_log.TRADES_LOG.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if not str(r.get("mode", "")).startswith("live") or r.get("book") != book:
+                continue
+            # Exact realized (paper-style fills) when present; otherwise the flagged estimate
+            # (live placed sells / external stop-outs price at the sell-ref or stop level).
+            val = r.get("realized_usd", r.get("realized_est_usd"))
+            if val is not None:
+                realized += float(val)
+    except OSError:
+        pass
+    unreal = 0.0
+    for sym, lot in (state.get("lots") or {}).items():
+        if book_of(lot) != book:
+            continue
+        entry = _f(lot.get("entry_price"))
+        qty = _f(lot.get("qty"), 0.0) or 0.0
+        last = ((broker.get("quotes") or {}).get(sym) or {}).get("last")
+        if entry and last and qty:
+            unreal += (float(last) - entry) * qty
+    return realized + unreal
+
+
 def next_settle_date(et_today: str) -> str:
     """T+1 BUSINESS day from an ET date 'YYYY-MM-DD' (US equities settle T+1 since 2024-05-28).
     Skips weekends; does NOT account for market holidays (a holiday makes the guard slightly less
@@ -585,9 +652,20 @@ def reconcile(state: dict, broker: dict, log: list) -> None:
                 log.append({"event": "closed_confirmed", "symbol": sym,
                             "order_id": stale.get("closing_order_id")})
             else:
+                # Estimate the realized P&L at the stop level (the broker fill price isn't in the
+                # snapshot): an ESTIMATE, flagged as such — it feeds the per-book tripwire, never
+                # a P&L claim. Without it, stop-outs while asleep (the most common loss path)
+                # would be invisible to the book ledger.
+                _entry, _qty = _f(stale.get("entry_price")), _f(stale.get("qty"), 0.0) or 0.0
+                _stoppx = _f(stale.get("stop_price"))
+                _rest = (round((_stoppx - _entry) * _qty, 2)
+                         if (_entry and _stoppx and _qty) else None)
                 log.append({"event": "closed_external", "symbol": sym,
                             "note": "position gone from broker — resting stop fired or sold while engine asleep",
-                            "had_stop": stale.get("resting_stop_order_id")})
+                            "had_stop": stale.get("resting_stop_order_id"),
+                            "book": book_of(stale), "qty": _qty or None,
+                            "entry_price": _entry, "stop_price": _stoppx,
+                            "realized_est_usd": _rest})
 
 
 def execute_sell(sym: str, action: dict, state: dict, broker: dict, caps: dict, log: list) -> dict:
@@ -599,6 +677,7 @@ def execute_sell(sym: str, action: dict, state: dict, broker: dict, caps: dict, 
         res["reject_reason"] = "no broker position to sell"
         return res
     lot = lots.get(sym, {})
+    res["book"] = book_of(lot)   # sells inherit the lot's book -> realized P&L lands on it
     held = broker["positions"][sym]["qty"]
     qty = float(action["qty"]) if action.get("qty") is not None else held
     qty = min(qty, held)
@@ -648,6 +727,13 @@ def execute_sell(sym: str, action: dict, state: dict, broker: dict, caps: dict, 
                         "order_id": roid, "result": None if roid else rearm})
         return res
     res.update(status="placed", ref_id=ref_id, order_id=order_id, order=placed)
+    # Estimated realized P&L at the sell-ref price (the live fill isn't known at place time):
+    # flagged an ESTIMATE — feeds the per-book ledger/tripwire, never a P&L claim.
+    _entry = _f(lot.get("entry_price"))
+    _qd = broker["quotes"].get(sym, {})
+    _px = _qd.get("bid") or _qd.get("last") or _qd.get("ask")
+    if _entry and _px:
+        res["realized_est_usd"] = round((float(_px) - _entry) * float(qty), 2)
     # Mark the lot as engine-closed so reconcile can tell THIS sell (already in the trade history)
     # from a genuinely external closure (resting stop fired / sold outside the engine) — only the
     # latter gets booked as a new trade row when the position disappears (P6, no double-count).
@@ -751,9 +837,22 @@ def execute_buy(sym: str, action: dict, state: dict, broker: dict, caps: dict,
     res = {"symbol": sym, "side": "buy", "reason": action.get("reason", ""), "status": "skipped"}
     # carry the DD's metadata so the trade history records WHAT KIND of bet this was (P3:
     # pead_qualified = met the measured gap+vol signal vs free-rein discretion)
-    for k in ("pead_qualified", "conviction", "hold_intent", "thesis_type"):
+    for k in ("pead_qualified", "conviction", "hold_intent", "thesis_type", "book"):
         if action.get(k) is not None:
             res[k] = action[k]
+    book = str(action.get("book") or "disco")
+    if books_enabled():
+        if not book_arm_on(book):
+            res["reject_reason"] = f"book_disarmed: {book} entries halted (BOOK_{book.upper()}_ENABLED=0)"
+            return res
+        # Ticker ownership: a symbol held by one book can't be entered/scaled by the other.
+        # The label never spills (v2 plan) — a cross-book add is skipped, not re-tagged.
+        prior = lots.get(sym)
+        if prior and book_of(prior) != book:
+            res["reject_reason"] = f"book_conflict: {sym} owned by {book_of(prior)} book"
+            log.append({"event": "book_conflict", "symbol": sym,
+                        "lot_book": book_of(prior), "action_book": book})
+            return res
     quote = broker["quotes"].get(sym, {})
     dollar = action.get("dollar_amount")
     if dollar is None:
@@ -763,6 +862,17 @@ def execute_buy(sym: str, action: dict, state: dict, broker: dict, caps: dict,
     if not plan.get("ok"):
         res["reject_reason"] = plan.get("reject_reason")
         return res
+    # Pead exposure ceiling (BOOK_PEAD_MAX_FRAC x equity, resolved into caps by main): the pead
+    # book may hold up to its ceiling and reserves nothing while idle — disco is bounded only by
+    # the global exposure cap below.
+    if books_enabled() and book == "pead":
+        pead_max = _f(caps.get("BOOK_PEAD_MAX_USD"), 0.0) or 0.0
+        if pead_max > 0:
+            pexpo = book_exposure("pead", state, broker)
+            if pexpo + plan["notional"] > pead_max + 1e-6:
+                res.update(reject_reason=(f"pead_book_ceiling: exposure {round(pexpo, 2)} + "
+                                          f"{plan['notional']} > {pead_max}"), plan=plan)
+                return res
     existing_val = (broker["positions"].get(sym, {}).get("qty", 0.0)
                     * (quote.get("last") or quote.get("ask") or 0.0))
     ok, reason = check_entry_caps(plan, existing_val=existing_val, exposure=exposure,
@@ -821,7 +931,8 @@ def execute_buy(sym: str, action: dict, state: dict, broker: dict, caps: dict,
                  # DD metadata on the lot: the Tier-1 risk monitor reasons over conviction/hold_intent,
                  # and pead_qualified ties the eventual round-trip back to the measured signal (P3).
                  "conviction": action.get("conviction"), "hold_intent": action.get("hold_intent"),
-                 "thesis_type": action.get("thesis_type"), "pead_qualified": action.get("pead_qualified")}
+                 "thesis_type": action.get("thesis_type"), "pead_qualified": action.get("pead_qualified"),
+                 "book": str(action.get("book") or lots.get(sym, {}).get("book") or "disco")}
     res.update(status="placed", ref_id=ref_id, order_id=order_id, order=placed)
     log.append({"event": "buy_placed", "symbol": sym, "spec": spec, "ref_id": ref_id,
                 "order_id": order_id, "plan": plan, "order": placed})
@@ -1014,6 +1125,32 @@ def main() -> int:
                         "owner review required (docs/remediation-plan-2026-06-09.md P8)"})
             print(f"[live_execute] TRIPWIRE: equity {equity} <= {trip_base}*(1-{trip_pct}%) — "
                   f"halting new entries (exits still active). Owner review required.", file=sys.stderr)
+        # --- Two-book split (v2 plan): pead ceiling + per-book P&L tripwires ---
+        # Capital is ONE shared pool: disco deploys to the global exposure cap; pead is bounded by
+        # its own ceiling (BOOK_PEAD_MAX_FRAC x equity) and gets first claim on settled cash below.
+        # A book trips when its cumulative net P&L falls below -BOOK_TRIPWIRE_PCT% of its ceiling
+        # share of the live baseline — that book's NEW entries halt; the other book and all exits
+        # keep running. Like the global tripwire, never resets without owner review (re-arm via
+        # BOOK_*_ENABLED after review).
+        books_on = books_enabled()
+        book_frac = _f(os.environ.get("BOOK_PEAD_MAX_FRAC"), 0.30) or 0.30
+        book_tripped: dict = {}
+        if books_on:
+            caps["BOOK_PEAD_MAX_USD"] = round(book_frac * equity, 2)
+            btrip_pct = _f(os.environ.get("BOOK_TRIPWIRE_PCT"), 10.0) or 10.0
+            if trip_base > 0 and btrip_pct > 0:
+                for bname, share in (("pead", book_frac), ("disco", 1.0 - book_frac)):
+                    bpnl = book_net_pnl(bname, state, broker)
+                    if bpnl <= -(btrip_pct / 100.0) * share * trip_base:
+                        book_tripped[bname] = round(bpnl, 2)
+                        log.append({"event": "book_tripwire_halt", "book": bname,
+                                    "book_pnl": round(bpnl, 2), "baseline": trip_base,
+                                    "share": share, "pct": btrip_pct,
+                                    "note": f"{bname} book cumulative P&L tripwire — that book's "
+                                            "new entries halted (strategies/two-book-v2-plan.md)"})
+                        print(f"[live_execute] BOOK-TRIPWIRE: {bname} pnl {round(bpnl, 2)} <= "
+                              f"-{btrip_pct}% of {share:.0%} x {trip_base} — {bname} entries halted.",
+                              file=sys.stderr)
         # Running tallies so multiple buys in ONE tick respect the caps CUMULATIVELY: a placed buy
         # consumes buying power, adds exposure, and may open a new position slot. Without this each
         # buy checks against the pre-tick snapshot and N buys could collectively breach the caps.
@@ -1039,6 +1176,12 @@ def main() -> int:
             if not context.get("allow_entries", False):
                 results.append({"symbol": a.get("symbol"), "side": "buy", "status": "skipped",
                                 "reject_reason": "entries disabled (market closed/stale)"})
+                continue
+            if books_on and str(a.get("book") or "disco") in book_tripped:
+                abook = str(a.get("book") or "disco")
+                results.append({"symbol": sym, "side": "buy", "status": "skipped", "book": abook,
+                                "reject_reason": f"book_tripwire_halt: {abook} cumulative pnl "
+                                                 f"{book_tripped[abook]}"})
                 continue
             # Level-armed entry: the LLM wants to enter on a price trigger, not now. In PAPER the
             # sentinel fires these on the cross; in LIVE the sentinel is a no-op, so evaluate the
@@ -1068,6 +1211,23 @@ def main() -> int:
         ceil = float(caps.get("MAX_POSITION_USD", 0) or 0) or 1.0
         exp_headroom = max(0.0, float(caps.get("MAX_TOTAL_EXPOSURE_USD", 0.0)) - exposure)
         headroom_slots = int(min(settled_bp, exp_headroom) // ceil)
+        if books_on and ready:
+            # Pead first claim (v2 plan): pead-routed entries go ahead of disco in the slot queue,
+            # so when both want the last settled dollar the measured-edge trade wins. Pead's COUNT
+            # is additionally bounded by its own remaining ceiling, so parallel pead buys can't
+            # collectively breach BOOK_PEAD_MAX_USD (execute_buy still re-checks exactly).
+            pead_ready = [t for t in ready if str(t[1].get("book") or "disco") == "pead"]
+            disco_ready = [t for t in ready if str(t[1].get("book") or "disco") != "pead"]
+            if pead_ready:
+                pead_room = max(0.0, float(caps.get("BOOK_PEAD_MAX_USD", 0.0)) -
+                                book_exposure("pead", state, broker))
+                pead_slots = int(pead_room // ceil)
+                for psym, _ in pead_ready[pead_slots:]:
+                    results.append({"symbol": psym, "side": "buy", "status": "skipped",
+                                    "book": "pead",
+                                    "reject_reason": f"pead_book_ceiling (room={pead_room:.2f})"})
+                pead_ready = pead_ready[:pead_slots]
+            ready = pead_ready + disco_ready
         slots = max(0, min(max_entries, headroom_slots, len(ready)))
         if ready and headroom_slots == 0:
             binding = "settled_bp" if settled_bp <= exp_headroom else "exposure"
@@ -1085,7 +1245,16 @@ def main() -> int:
                 file=sys.stderr,
             )
         for sym, a in ready[slots:]:
+            abook = str(a.get("book") or "disco")
+            if books_on and abook == "pead":
+                # Count how often a QUALIFIED pead commit goes unfunded because disco has the
+                # account deployed (v2 plan: the event still feeds the evidence ledger; if this
+                # is frequent AND the pead cohort shows lift, enable PEAD_SEASON_RESERVE_PCT).
+                log.append({"event": "pead_unfunded", "symbol": sym,
+                            "settled_bp": round(settled_bp, 2),
+                            "note": "qualified pead commit deferred — no settled-cash slot"})
             results.append({"symbol": sym, "side": "buy", "status": "skipped",
+                            **({"book": abook} if books_on else {}),
                             "reject_reason": f"deferred — 0 slots (settled_bp={settled_bp:.2f} < MAX_POSITION_USD={ceil:.2f})"})
 
         # Run the slot entries' review+place relays in PARALLEL (independent I/O-bound cold-start
@@ -1162,6 +1331,18 @@ def main() -> int:
     if dd_calls or relay_calls:
         print(f"TICK COST: ${dd_cost + relay_cost:.4f} over {dd_calls + relay_calls} call(s) "
               f"(dd ${dd_cost:.4f} · relay ${relay_cost:.4f})")
+    # DD cost ledger (v2 plan): one tiny row per tick so pnl_report can print gross-edge-vs-
+    # token-spend without re-scanning the fat engine log. Best-effort, never breaks a tick.
+    if dd_calls or relay_calls:
+        try:
+            with (DATA / "costs.jsonl").open("a") as f:
+                f.write(json.dumps({"ts_utc": record["ts_utc"], "ts_et": record.get("ts_et"),
+                                    "mode": mode_tag,
+                                    "dd_cost_usd": round(dd_cost, 4),
+                                    "relay_cost_usd": round(relay_cost, 4),
+                                    "dd_calls": dd_calls, "relay_calls": relay_calls}) + "\n")
+        except OSError:
+            pass
     return 0
 
 

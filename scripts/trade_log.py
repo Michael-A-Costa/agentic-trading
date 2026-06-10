@@ -107,7 +107,7 @@ def fill_to_trade(res: dict, *, ts_utc: str, ts_et: str | None, mode: str) -> di
     }
     # carry the fields that exist on each shape; omit the rest to keep rows tight
     for k in ("ref_price", "notional", "order_type", "stop_type", "slippage_bps",
-              "order_id", "ref_id"):
+              "order_id", "ref_id", "book"):
         if res.get(k) is not None:
             row[k] = res[k]
     if side == "buy":
@@ -120,6 +120,8 @@ def fill_to_trade(res: dict, *, ts_utc: str, ts_et: str | None, mode: str) -> di
     else:  # sell
         if res.get("realized_usd") is not None:
             row["realized_usd"] = res["realized_usd"]
+        if res.get("realized_est_usd") is not None:
+            row["realized_est_usd"] = res["realized_est_usd"]  # flagged estimate (live place-time)
         if res.get("scale_tiers") is not None:
             row["scale_tiers"] = res["scale_tiers"]
         row["exit_type"] = classify_exit(res.get("reason", ""))
@@ -154,6 +156,8 @@ def _blotter_line(row: dict) -> str:
             extra.append(str(row["stop_type"]))
         if row.get("pead_qualified") is True:
             extra.append("PEAD✓")
+        if row.get("book"):
+            extra.append(f"book:{row['book']}")
     else:
         if row.get("realized_usd") is not None:
             extra.append(_fmt_usd(float(row["realized_usd"])))
@@ -222,8 +226,11 @@ def record_reconcile_events(events: list[dict], *, ts_utc: str, ts_et: str | Non
         elif kind == "closed_external":
             rows.append({"v": SCHEMA_VERSION, "ts_utc": ts_utc, "ts_et": ts_et, "mode": mode,
                          "symbol": sym, "side": "sell", "status": "filled",
-                         "qty": None, "price": None,
+                         "qty": ev.get("qty"), "price": None,
                          "reason": ev.get("note", "position closed at broker while engine asleep"),
+                         **({"book": ev["book"]} if ev.get("book") else {}),
+                         **({"realized_est_usd": ev["realized_est_usd"]}
+                            if ev.get("realized_est_usd") is not None else {}),
                          "exit_type": "stop"})
     if rows:
         try:

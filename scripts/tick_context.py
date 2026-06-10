@@ -254,6 +254,20 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
             pead_meta = discover_pead.pead_meta()
         except Exception as e:
             sys.stderr.write(f"[tick] pead discovery failed: {e}\n")
+    # Market caps for the two-book router (v2 plan): the PEAD calendar rows and the gainer-screen
+    # detail cache are the only keyless mktcap sources. Names in neither map stay unknown — the
+    # router fails them to the disco book (never into the evidence cohort on a guess).
+    mktcap_by_sym: dict[str, float] = {}
+    try:
+        _dcache = json.loads((TICK / "discovery_latest.json").read_text())
+        for _d in _dcache.get("detail") or []:
+            if _d.get("symbol") and _d.get("mktcap") is not None:
+                mktcap_by_sym[str(_d["symbol"]).upper()] = _d["mktcap"]
+    except (OSError, ValueError):
+        pass
+    for _s, _m in pead_meta.items():
+        if _m.get("mktcap") is not None:
+            mktcap_by_sym.setdefault(_s, _m["mktcap"])
     # Armed entries must always get a fresh quote so the sentinel can test their trigger.
     armed_syms = list((state.get("armed_entries") or {}).keys())
     # PEAD candidates lead (freshest catalyst signal), then momentum movers, then pins/fallback.
@@ -313,6 +327,7 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
             # OG DD + intraday structure for the Tier-1 hold-risk monitor (hold_risk.py):
             "conviction": p.get("conviction"), "hold_intent": p.get("hold_intent"),
             "thesis_type": p.get("thesis_type"),
+            "book": p.get("book") or "disco",   # two-book split: lot ownership (v2 plan)
             "range_pos": mc.range_position(q), "intraday_pct": mc.intraday_pct(q),
         })
 
@@ -351,6 +366,8 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
             entry["earnings_date"] = pm["earnings_date"]
             entry["earnings_time"] = pm["time"].replace("time-", "")
             entry["days_since_earnings"] = pm["days_since"]
+        if mktcap_by_sym.get(sym) is not None:
+            entry["mktcap"] = mktcap_by_sym[sym]   # two-book router input (pead = mega-cap only)
         cand.append(entry)
 
     sod_equity = state.get("start_of_day_equity") or equity
@@ -524,6 +541,9 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
                     | {s.strip().upper() for s in env("NON_TRADABLE_SYMBOLS", "").split(",") if s.strip()})
     armed_set = set((state.get("armed_entries") or {}).keys())  # already have a pending trigger -> don't re-DD
     entry_candidates = []
+    pead_neg_dropped: list[str] = []
+    pead_direction = env("PEAD_DIRECTION", "up").strip().lower()
+    discovered_set = {str(s).upper() for s in discovered}
     if allow_entries and not hostile:
         movers = []
         for c in cand:
@@ -535,6 +555,20 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
                 continue
             if c.get("date") and c["date"] != today:
                 continue  # this symbol's own quote is stale — fail closed, skip it
+            # PEAD direction pre-filter (v2 plan Phase 0): a long-only cash account can never
+            # trade a negative earnings gap, so a fresh (day-0/1) reporter whose gap is DOWN is
+            # dropped BEFORE it consumes a DD slot. Only the fresh-gap window is testable from
+            # today's quote (open vs prev close; intraday move as fallback); older reporters pass
+            # (their gap day already screened them). A name the gainer screen surfaced on its own
+            # merits keeps its slot — it's a mover regardless of the earnings gap's sign.
+            if (pead_direction == "up" and c.get("catalyst") == "earnings"
+                    and (c.get("days_since_earnings") if c.get("days_since_earnings") is not None else 99) <= 1
+                    and sym not in discovered_set):
+                _o, _pc = q.get("open"), q.get("prev_day_close")
+                _move = ((_o / _pc - 1) * 100 if (_o and _pc) else c.get("intraday_pct"))
+                if _move is not None and _move < 0:
+                    pead_neg_dropped.append(sym)
+                    continue
             # Whole-share-only: skip names where even 1 share exceeds the per-name cap.
             # Buying exactly 1 share is the executor's fallback when the conviction budget
             # is short of a share; if that 1 share itself exceeds the cap, it can never fill.
@@ -562,6 +596,7 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
         #  is in its drift window; decide.py still verifies the measured gap+vol signal.)
         entry_candidates = [{"symbol": c["symbol"], "intraday_pct": c.get("intraday_pct"),
                              "range_pos": c.get("range_pos"), "last": c.get("last"),
+                             **({"mktcap": c["mktcap"]} if c.get("mktcap") is not None else {}),
                              **({"catalyst": c["catalyst"],
                                  "earnings_date": c["earnings_date"],
                                  "earnings_time": c.get("earnings_time"),
@@ -571,7 +606,8 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
                             for c in movers]
     screen = {"exits": exits, "entry_candidates": entry_candidates,
               "hostile_regime": hostile, "downtrend_pead_only": downtrend_pead_only,
-              "cooling": sorted(cooling)}
+              "cooling": sorted(cooling),
+              **({"pead_negative_gap_dropped": pead_neg_dropped} if pead_neg_dropped else {})}
 
     # --- GATE decision (deterministic; the wrapper branches on this) ---
     gate, reason = "TRADE", ""

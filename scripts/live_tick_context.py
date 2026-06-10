@@ -74,6 +74,7 @@ def load_live_state() -> dict:
             "hold_intent": lot.get("hold_intent"),
             "thesis_type": lot.get("thesis_type"),
             "pead_qualified": lot.get("pead_qualified"),
+            "book": lot.get("book") or "disco",  # two-book split: lot ownership (v2 plan)
         }
     return {
         "cash": cash, "positions": positions, "realized_total": 0.0,

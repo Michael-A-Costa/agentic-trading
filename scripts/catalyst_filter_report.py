@@ -93,7 +93,7 @@ def main() -> int:
     # Resolve each event's forward drift from its symbol's daily history (cached per day).
     bars_cache: dict[str, list] = {}
     buckets: dict[str, list] = {"ALL": [], "REAL": [], "PUMP": [], "OTHER": [],
-                                "QPEAD": [], "FREE": []}
+                                "QPEAD": [], "FREE": [], "PBOOK": [], "DBOOK": []}
     resolved = pending = 0
     for e in events:
         sym, ref = e.get("symbol"), e.get("ref_price")
@@ -112,6 +112,12 @@ def main() -> int:
             # P3 split: commits that met the MEASURED gap+vol signal vs free-rein discretion.
             # (pead_qualified is logged from 2026-06-09; older rows lack it and land in FREE.)
             buckets["QPEAD" if e.get("pead_qualified") else "FREE"].append(d)
+            # Two-book split (v2 plan): routed book = qualified signal AND mega-cap. Only rows
+            # tagged since book routing began (2026-06-09) count — untagged rows count for neither.
+            if e.get("book") == "pead":
+                buckets["PBOOK"].append(d)
+            elif e.get("book") == "disco":
+                buckets["DBOOK"].append(d)
         elif e.get("is_pump"):
             buckets["PUMP"].append(d)
         else:
@@ -126,9 +132,10 @@ def main() -> int:
     print(f"{'bucket':<22}{'n':>5}{'median':>10}{'mean':>10}{'win%':>8}")
     labels = {"ALL": "ALL (gap alone)", "REAL": "REAL (agent commit)",
               "QPEAD": "  - qualified PEAD", "FREE": "  - free-rein",
+              "PBOOK": "  - book:pead", "DBOOK": "  - book:disco",
               "PUMP": "PUMP (reject/none)", "OTHER": "OTHER (reject/risk)"}
     st = {k: _stats(v) for k, v in buckets.items()}
-    for k in ("ALL", "REAL", "QPEAD", "FREE", "PUMP", "OTHER"):
+    for k in ("ALL", "REAL", "QPEAD", "FREE", "PBOOK", "DBOOK", "PUMP", "OTHER"):
         s = st[k]
         if s["n"] == 0:
             print(f"{labels[k]:<22}{0:>5}{'--':>10}{'--':>10}{'--':>8}")
@@ -147,6 +154,10 @@ def main() -> int:
         if qp["n"] >= 3 and fr["n"] >= 3:
             print(f"      QPEAD median - FREE median: {(qp['median']-fr['median'])*100:+.2f}%   "
                   "(measured signal vs pure discretion)")
+        pb = st["PBOOK"]
+        if pb["n"] >= 3:
+            print(f"      PEAD-BOOK median - ALL    : {(pb['median']-allb['median'])*100:+.2f}%   "
+                  "(the pead book's gate verdict: signal + mega-cap, routed since 2026-06-09)")
         verdict = ("the filter ADDS value (REAL drifts above the unconditional gap)"
                    if lift_vs_all > 0 else "NO lift yet — REAL is not beating the average gap event")
         print(f"VERDICT: {verdict}")
