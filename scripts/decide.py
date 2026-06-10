@@ -737,11 +737,12 @@ def main() -> int:
                 **({"scale_tiers": e["scale_tiers"]} if e.get("scale_tiers") else {})}
                for e in exits if e.get("symbol")]
 
-    # --- Stage 2: deep DD + commit, with a per-symbol ONCE-A-DAY cache (re-DD only on a real move) ---
+    # --- Stage 2: deep DD + commit, with a per-symbol INDEFINITE cache (re-DD only on a real move) ---
     # A DD is a ~85s Sonnet+web-research call — the tick's dominant token/latency cost. Dynamic
     # discovery keeps surfacing the SAME top movers every 5-min tick, so a short rolling TTL re-burned
     # that call many times a day on names whose thesis hadn't changed. Policy: one fresh DD per name
-    # per ET calendar day (commit AND reject), reused all day, UNLESS the setup materially changes.
+    # (commit AND reject), reused INDEFINITELY across days, UNTIL the setup materially changes — there is
+    # no calendar expiry. (DD_CACHE_INDEFINITE=0 restores the old once-per-ET-day scoping.)
     # The invalidation trigger is ASYMMETRIC by verdict, because the two verdicts go stale differently:
     #   * COMMIT  -> re-DD on a move in EITHER direction past DD_CACHE_DRIFT_PCT. A committed bullish
     #               thesis is broken by a drop AND blown by a run-up (entering late = chasing).
@@ -751,12 +752,19 @@ def main() -> int:
     #               action — the market revealing it, which is exactly what this gap-drift strategy
     #               trades. A downside continuation only CONFIRMS the reject, so we don't re-burn on it.
     # Execution still re-checks fresh price + caps + allow_entries in apply_decision, so reusing a
-    # day-old commit never trades on a stale price. Errors are never cached (retry next tick).
-    # DD_CACHE_TTL_MIN (default 0 = day-scoped) adds an optional sub-day rolling cap; set any trigger
-    # %% to 0 to disable it.
+    # days-old commit never trades on a stale price. Errors are never cached (retry next tick).
+    # DD_CACHE_TTL_MIN (default 0 = no rolling cap) adds an optional rolling-age cap on top; set any
+    # trigger %% to 0 to disable it.
     dd_results = []
     cache = load_cache()
     today_et = datetime.now(ET).strftime("%Y-%m-%d")   # cache keyed to the ET trading day
+    # INDEFINITE cache (default): a verdict is reused ACROSS days, expiring ONLY when the price-movement
+    # trigger below fires (commit = move either way past DD_CACHE_DRIFT_PCT; reject = upside breakout) —
+    # not on a calendar rollover. A thesis whose price hasn't moved hasn't changed, so re-DDing it daily
+    # just re-burned a ~85s Sonnet+web call for the same answer. Set DD_CACHE_INDEFINITE=0 to restore the
+    # old once-a-day scoping. The drift trigger now measures from the ORIGINAL DD price however old, so a
+    # name that has run/dropped meaningfully since its verdict still re-DDs on the next tick it resurfaces.
+    indefinite = os.environ.get("DD_CACHE_INDEFINITE", "1").strip().lower() not in ("0", "false", "no", "")
     rolling_ttl = int(os.environ.get("DD_CACHE_TTL_MIN", "0")) * 60   # 0 = no sub-day cap (once/day)
     # A cached COMMIT is re-DD'd mid-day if the live price has moved more than this % (either way)
     # since the DD — the "significant price movement" that invalidates a same-day entry thesis.
@@ -771,11 +779,16 @@ def main() -> int:
     # Prune dead entries so the file doesn't grow every session: verdicts stamped for a prior ET day,
     # plus legacy entries (no "day" stamp) past the 24h fallback. Both can no longer ever be a cache
     # hit, so dropping them is loss-free and keeps each tick's read+rewrite of the blob small.
-    stale_keys = [k for k, e in cache.items()
-                  if (e.get("day") not in (None, today_et))
-                  or (e.get("day") is None and now - e.get("ts", 0) >= 86400)]
-    for k in stale_keys:
-        cache.pop(k, None)
+    # In INDEFINITE mode there is no day-based expiry, so day-pruning is skipped — verdicts persist until
+    # a price move overturns them (or they're overwritten by a fresh DD on the same name).
+    if indefinite:
+        stale_keys = []
+    else:
+        stale_keys = [k for k, e in cache.items()
+                      if (e.get("day") not in (None, today_et))
+                      or (e.get("day") is None and now - e.get("ts", 0) >= 86400)]
+        for k in stale_keys:
+            cache.pop(k, None)
     cache_dirty = bool(stale_keys)
     # Async mode: fold any FINISHED background DD verdicts into the cache BEFORE serving cache hits,
     # so a name dispatched a prior tick is acted on the moment its worker lands (decide is the sole
@@ -832,10 +845,12 @@ def main() -> int:
             if cached:
                 cdec = (cached.get("result") or {}).get("decision")
                 age = now - cached.get("ts", 0)
-                # Same-day reuse (fall back to ts age for pre-existing entries without a "day" stamp);
-                # an optional rolling_ttl can further cap reuse to sub-day if set.
+                # Reuse window: INDEFINITE (default) reuses across days — expiry is the price-movement
+                # trigger below, not the calendar. With DD_CACHE_INDEFINITE=0, fall back to same-ET-day
+                # scoping (ts age for pre-existing entries without a "day" stamp). An optional rolling_ttl
+                # can further cap reuse to sub-day if set, in either mode.
                 cday = cached.get("day")
-                same_day = (cday == today_et) if cday else (age < 86400)
+                same_day = True if indefinite else ((cday == today_et) if cday else (age < 86400))
                 within_rolling = rolling_ttl <= 0 or age < rolling_ttl
                 # Asymmetric re-DD trigger (see policy comment above): commit = move either way;
                 # reject = upside breakout only (price OR range_pos). move_pct is signed: + is up.
@@ -909,7 +924,8 @@ def main() -> int:
             # Cache commits and rejects (each reused under its asymmetric trigger at read time); never
             # cache an error — a transient model/timeout failure must be retried, not frozen.
             if not res.get("cached") and res.get("decision") in ("commit", "reject"):
-                cache[sym] = {"ts": now, "day": today_et,          # ET day -> once-a-day reuse
+                cache[sym] = {"ts": now, "day": today_et,          # stamped for age/scoping (reuse is
+                                                                   #   indefinite unless DD_CACHE_INDEFINITE=0)
                               "ref_price": c.get("last"),           # price at DD time (drift trigger)
                               "ref_range_pos": c.get("range_pos"),  # range pos at DD time (reject breakout trigger)
                               "result": {k: v for k, v in res.items() if k != "dd_elapsed_s"}}
