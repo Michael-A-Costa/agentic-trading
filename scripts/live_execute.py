@@ -933,7 +933,8 @@ def execute_buy(sym: str, action: dict, state: dict, broker: dict, caps: dict,
                  "conviction": action.get("conviction"), "hold_intent": action.get("hold_intent"),
                  "thesis_type": action.get("thesis_type"), "pead_qualified": action.get("pead_qualified"),
                  "book": str(action.get("book") or lots.get(sym, {}).get("book") or "disco")}
-    res.update(status="placed", ref_id=ref_id, order_id=order_id, order=placed)
+    res.update(status="placed", ref_id=ref_id, order_id=order_id, order=placed,
+               qty=plan["qty"], price=_f(plan.get("limit_price")))
     log.append({"event": "buy_placed", "symbol": sym, "spec": spec, "ref_id": ref_id,
                 "order_id": order_id, "plan": plan, "order": placed})
     # Force a protective stop on this entry IN THIS TICK (confirm fill -> arm resting stop_market), so
@@ -1319,7 +1320,19 @@ def main() -> int:
     if skip_groups:
         parts = [f"{v}×{k}" for k, v in skip_groups.items()]
         skip_detail = f" [{'; '.join(parts)}]"
-    print(f"[{record['ts_et']}] {mode_tag.upper()} {note} — {placed} placed, {record['n_skipped']} "
+    # Name what was placed (side/qty/symbol@price) so the summary says what the orders actually did.
+    placed_parts = []
+    for r in results:
+        if r.get("status") in ("placed", "filled"):
+            side = str(r.get("side", "?")).upper()
+            qty = r.get("qty")
+            px = r.get("price")
+            qty_s = (f"{qty:g}" if isinstance(qty, (int, float)) else str(qty)) if qty is not None else "?"
+            px_s = f"@{px:g}" if isinstance(px, (int, float)) else ""
+            tag = "" if r.get("status") == "filled" else "~"  # ~ = placed, not yet confirmed filled
+            placed_parts.append(f"{tag}{side} {qty_s} {r.get('symbol', '?')}{px_s}")
+    placed_detail = f" [{'; '.join(placed_parts)}]" if placed_parts else ""
+    print(f"[{record['ts_et']}] {mode_tag.upper()} {note} — {placed} placed{placed_detail}, {record['n_skipped']} "
           f"skipped{skip_detail} | equity={equity} day_pnl={day_pnl} bp={broker['buying_power']}{gfv}")
     rtu = record["relay_token_usage"]
     if rtu.get("n_calls"):

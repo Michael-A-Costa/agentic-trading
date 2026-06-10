@@ -191,6 +191,22 @@ def _try_direct(fn, label: str):
         return None
 
 
+def _summ(spec: dict | None) -> str:
+    """Compact human-readable order summary for log lines, e.g. 'BUY 5 ALHC limit@18.42 gfd' or
+    'SELL 5 ALHC stop_market@16.30 gtc'. Reads only the MCP spec, so it always reflects exactly what
+    was sent (intent); the broker-confirmed fill/id/state is logged downstream by live_execute."""
+    if not isinstance(spec, dict):
+        return str(spec)
+    side = str(spec.get("side", "?")).upper()
+    qty = spec.get("quantity", "?")
+    sym = spec.get("symbol", "?")
+    otype = spec.get("type", "?")
+    px = spec.get("limit_price") or spec.get("stop_price")
+    px_part = f"@{px}" if px else ""
+    tif = spec.get("time_in_force", "")
+    return f"{side} {qty} {sym} {otype}{px_part} {tif}".strip()
+
+
 def quotes(symbols: list[str]) -> dict | None:
     """Fresh live quotes for a symbol list — get_equity_quotes ONLY (no portfolio/positions/orders).
     Used to size entries whose symbols aren't in the pre-decision broker snapshot (which only quotes
@@ -217,7 +233,7 @@ def review(spec: dict) -> dict | None:
     alerts) — Python decides if any alert is blocking. The place tool is NOT in this toolset, so a
     review call can never accidentally execute."""
     acct = account()
-    direct = _try_direct(lambda: rh_direct.review(acct, spec), f"review:{spec.get('symbol', '?')}")
+    direct = _try_direct(lambda: rh_direct.review(acct, spec), f"review {_summ(spec)}")
     if direct is not None:
         return direct
     params = {"account_number": acct, **spec}
@@ -240,7 +256,7 @@ def place(spec: dict, ref_id: str) -> dict | None:
     deterministic). On ANY direct failure we fall back to the relay below, re-sending the SAME ref_id —
     so the broker's idempotency prevents a double-place even if direct failed AFTER the order landed."""
     acct = account()
-    direct = _try_direct(lambda: rh_direct.place(acct, spec, ref_id), f"place:{spec.get('symbol', '?')}")
+    direct = _try_direct(lambda: rh_direct.place(acct, spec, ref_id), f"place {_summ(spec)}")
     if direct is not None:
         return direct
     params = {"account_number": acct, "ref_id": ref_id, **spec}
