@@ -505,9 +505,13 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
     posture = regime.get("posture")
     _green, _total = regime.get("breadth_green"), regime.get("breadth_total")
     _vix = regime.get("vix_proxy_move_pct")
-    acute = bool(posture == "risk_off" and _total and _green is not None and _green <= 1
+    # REGIME_ENTRY_GATE=0 lifts the regime-based entry gate entirely (owner override): no acute
+    # entries-off, no downtrend PEAD-only suppression — entries are free-rein in ANY posture. The HARD
+    # safety layer (caps, stops, daily-loss breaker, tripwire) is unaffected; only the regime read is.
+    regime_gate = os.environ.get("REGIME_ENTRY_GATE", "1").strip().lower() not in ("0", "false", "no", "")
+    acute = bool(regime_gate and posture == "risk_off" and _total and _green is not None and _green <= 1
                  and _vix is not None and _vix > 3)
-    downtrend_pead_only = bool(posture == "risk_off" and not acute)
+    downtrend_pead_only = bool(regime_gate and posture == "risk_off" and not acute)
     hostile = acute
     held = {p["symbol"] for p in positions}
     # A quote is only a LIVE signal during regular hours AND when it carries today's date. Don't hang
