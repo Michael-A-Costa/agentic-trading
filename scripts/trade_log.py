@@ -114,7 +114,7 @@ def fill_to_trade(res: dict, *, ts_utc: str, ts_et: str | None, mode: str) -> di
         for k in ("stop_price", "take_profit_price",
                   # DD metadata (P3): pead_qualified ties the trade to the measured gap+vol signal
                   # (vs free-rein discretion) so win-rate can be split by signal class later.
-                  "pead_qualified", "conviction", "hold_intent", "thesis_type"):
+                  "pead_qualified", "washout_reversal", "conviction", "hold_intent", "thesis_type"):
             if res.get(k) is not None:
                 row[k] = res[k]
     else:  # sell
@@ -156,6 +156,8 @@ def _blotter_line(row: dict) -> str:
             extra.append(str(row["stop_type"]))
         if row.get("pead_qualified") is True:
             extra.append("PEAD✓")
+        if row.get("washout_reversal") is True:
+            extra.append("washout")
         if row.get("book"):
             extra.append(f"book:{row['book']}")
     else:

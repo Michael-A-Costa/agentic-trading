@@ -302,6 +302,13 @@ def probe(sym: str) -> dict:
         _gap_thr, _vol_min = 5.0, 2.0
     out["pead_qualified"] = (None if (gap is None or rv is None)
                              else bool(gap >= _gap_thr and rv >= _vol_min))
+    # --- washout-reversal label (2026-06-11 cohort backtest, exit-strategy-findings addendum) ---
+    # Big gap DOWN whose close recovers to the top of the day's range on heavy volume (the UNFI
+    # shape). Measured: NO validated edge — negative on mega-caps under every exit tested, weak and
+    # harvest-only on midcaps. Label-only, mirrors pead_qualified so the forward ledger can slice
+    # the disco book by entry shape; the commit prompt leans against it (H3), code never gates on it.
+    out["washout_reversal"] = (None if (gap is None or rv is None or range_pos is None)
+                               else bool(gap <= -7.0 and range_pos >= 0.7 and rv >= _vol_min))
     return out
 
 

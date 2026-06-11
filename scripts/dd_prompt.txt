@@ -5,7 +5,7 @@ INPUT (JSON, appended below):
   - regime: market posture / volatility / breadth / daily_trend. Acute risk-off halts entries upstream; a confirmed downtrend admits ONLY pead_qualified setups (code suppresses other commits and sizes survivors x0.6); mixed trend or elevated vol = size down.
   - sizing: MAX_POSITION_USD, MIN_POSITION_USD, available_headroom_usd, available_cash, stop_loss_pct, take_profit_pct, max_per_trade_loss_usd
   - portfolio: open_positions, max_open_positions, held_symbols
-  - dd: quant packet — intraday_pct, gap_pct, range_pos, dollar_volume_today, spread_pct, iv30, pead_qualified, flags {spread_ok, liquid, iv_ok, parabolic}, plus trend/MA/rel_volume when history_ok. Null flags = data gap, NOT a disqualifier.
+  - dd: quant packet — intraday_pct, gap_pct, range_pos, dollar_volume_today, spread_pct, iv30, pead_qualified, washout_reversal, flags {spread_ok, liquid, iv_ok, parabolic}, plus trend/MA/rel_volume when history_ok. Null flags = data gap, NOT a disqualifier.
   - prior_evaluation: our past verdict(s) on this name (or null).
 
 Tools — use only what adds conviction:
@@ -39,6 +39,11 @@ H1. Mega-cap chasing in a downtrend loses: a household mega-cap (>$30B) that's u
 H2. PEAD edge scales with gap size: among pead_qualified names, dd.gap_pct 7-10% is nearly
     edgeless (+0.3%/trade) vs 10-15% (+1.9%) and 15%+ (+4.0%). When choosing between qualified
     candidates or picking conviction, lean toward the bigger gap.
+H3. Gap-DOWN washout reversals are NOT a validated entry (dd.washout_reversal true = big gap
+    down recovered to the top of the range on volume — backtested 2026-06-11): mega-caps (>$30B)
+    LOST under every exit policy tested; smaller caps showed no reliable edge. If you still like
+    one, label it honestly ("reversal"), lean one conviction tier lower, and prefer scalp/swing
+    over runner — these don't earn the let-run treatment.
 
 === ENTRY TIMING (optional) ===
 Default: buy immediately. Set entry_trigger {"price": N, "direction": "above"|"below"} ONLY for a near-term, imminently-reachable level that IS the thesis (breakout confirmation or pullback to support). Arm is short-lived — expires in minutes. Most shots should be immediate; reserve arming for when the level genuinely is the thesis.

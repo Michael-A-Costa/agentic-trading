@@ -898,7 +898,7 @@ def execute_buy(sym: str, action: dict, state: dict, broker: dict, caps: dict,
     res = {"symbol": sym, "side": "buy", "reason": action.get("reason", ""), "status": "skipped"}
     # carry the DD's metadata so the trade history records WHAT KIND of bet this was (P3:
     # pead_qualified = met the measured gap+vol signal vs free-rein discretion)
-    for k in ("pead_qualified", "conviction", "hold_intent", "thesis_type", "book"):
+    for k in ("pead_qualified", "washout_reversal", "conviction", "hold_intent", "thesis_type", "book"):
         if action.get(k) is not None:
             res[k] = action[k]
     book = str(action.get("book") or "disco")

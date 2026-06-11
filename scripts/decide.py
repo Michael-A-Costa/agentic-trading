@@ -476,6 +476,7 @@ def run_dd(c: dict, regime: dict, caps: dict, portfolio: dict, dd_model: str) ->
             "catalysts": commit.get("catalysts", []), "risks": commit.get("risks", []),
             "next_earnings_date": commit.get("next_earnings_date"),
             "pead_qualified": dd.get("pead_qualified"),          # measured gap+vol signal met (label gate, P3)
+            "washout_reversal": dd.get("washout_reversal"),      # gap-down recovery shape (label-only)
             "never_buy": bool(commit.get("never_buy")),          # structural disqualifier -> exclude
             "never_buy_reason": commit.get("never_buy_reason")}
 
@@ -618,6 +619,7 @@ def run_dd_batch(fresh_jobs: list[tuple[str, dict]], regime: dict, caps: dict,
             "catalysts": commit.get("catalysts", []), "risks": commit.get("risks", []),
             "next_earnings_date": commit.get("next_earnings_date"),
             "pead_qualified": probed.get(sym, {}).get("pead_qualified"),  # label gate (P3)
+            "washout_reversal": probed.get(sym, {}).get("washout_reversal"),  # shape label
             "never_buy": bool(commit.get("never_buy")),
             "never_buy_reason": commit.get("never_buy_reason"),
         }
@@ -1000,6 +1002,7 @@ def main() -> int:
                        "hold_intent": res.get("hold_intent"),   #   so the Tier-1 risk monitor can reason
                        "thesis_type": res.get("catalyst_type"),
                        "pead_qualified": res.get("pead_qualified"),  # measured-signal flag -> trade log (P3)
+                       "washout_reversal": res.get("washout_reversal"),  # shape label -> trade log
                        "book": res.get("book", "disco"),        # two-book split: pead | disco (v2 plan)
                        "reason": f"[{tag}] {res.get('reason', '')}"}
                 # Optional level-triggered entry: if the DD returned an entry_trigger, ARM it for the

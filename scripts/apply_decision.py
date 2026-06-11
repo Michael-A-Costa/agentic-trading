@@ -314,6 +314,9 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
                           "pead_qualified": (action.get("pead_qualified")
                                              if action.get("pead_qualified") is not None
                                              else prev.get("pead_qualified")),  # P3 signal-class tag
+                          "washout_reversal": (action.get("washout_reversal")
+                                               if action.get("washout_reversal") is not None
+                                               else prev.get("washout_reversal")),  # shape label
                           "book": lot_book,  # two-book lot owner (also picked the TP overlay above)
                           "scaled": prev.get("scaled", [])}  # tiers already taken (preserved when averaging in)
         state["cash"] -= notional
@@ -410,6 +413,7 @@ def arm_entry(action: dict, state: dict, now: datetime) -> dict:
         "dollar_amount": action.get("dollar_amount"), "qty": action.get("qty"),
         "conviction": action.get("conviction"), "hold_intent": action.get("hold_intent"),
         "thesis_type": action.get("thesis_type"), "pead_qualified": action.get("pead_qualified"),
+        "washout_reversal": action.get("washout_reversal"),  # shape label rides the armed entry
         "book": action.get("book") or "disco",  # the sentinel-fired buy keeps its routed book
         "reason": result["reason"],
         "armed_ts": now.isoformat(timespec="seconds"), "expires_ts": expires,
