@@ -150,3 +150,56 @@ tier ladders}; entries PEAD (LARGE+MIDCAP) and movers (MIDCAP); plus hold {5,8,1
 entry grid, costs to 40bps/leg, whole-share lots at $310, SPY-regime splits, year-by-year
 stability, and capital-constrained portfolio sims at 2/6 slots. Harness fixes that made the
 numbers trustworthy: entry dedupe, paired bootstrap CIs, give-back peak fix, split-half validation.
+
+---
+
+## 5. Addendum — 2026-06-11 follow-up tests
+
+### A1. Fine TP curve: 11–13 is a dead zone, not a compromise.
+Ran the missing TP rungs (9, 11, 13, 14) through the same harness (stop12/sc8/be12, MOV-M).
+The median cliff sits exactly at 10→11 (+9.70% → +3.45%): the typical mover tops out just above
++10%, so TP10 is the last rung the majority actually fills. TP11 is strictly worse than TP10
+(mean +0.82% vs +0.87%, median collapsed, same port 7.0x); TP12's +0.04% mean edge is noise
+(SE ±0.5%). The dial has two local optima — **TP10** (median/win%) and **TP14–15**
+(mean/compounding, port 9.4–9.6x) — and nothing useful between them. Sharpe is flat (0.075–0.085)
+across the whole family; the differentiators are shape metrics and slot velocity (4.9d → 7.0d).
+
+### A2. trail12@12 is a near-miss salvage rung — include it on the TP15 dial only.
+With be12 in place, a 12%-wide trail activated at +12 only exceeds breakeven once peak > 13.6%
+(peak × 0.88 > entry), and TP15 fires at +15 — so its entire jurisdiction is trades peaking in
+(13.6%, 15.0%) that then retrace. Measured: exactly 47/1840 trades (2.6%), hybrid better on 46/47
+(mean on those −0.04% → +0.25%). Paired bootstrap on all trades straddles zero (+0.008%/trade,
+CI [−0.011, +0.020]) — per-trade invisible — but the config is **weakly dominant** (floored by
+be12, capped by TP15, can't lose in daily bars): it wins at every K 4–30 and in all 23
+leave-one-year-out jackknives (+4.2–4.8% terminal at K=6). Caveats: ~2 binding trades/yr, and
+intraday whipsaw (a trail 1.4pts under the TP) will eat part of it — live magnitude plausibly
+half. **Under TP10 it binds on 0/1840 trades (TP fires before activation) — geometrically
+irrelevant to the current paper config.** If the dial ever moves to DISCO_TAKE_PROFIT_PCT=15,
+add DISCO_TRAIL_STOP_PCT=12 / DISCO_TRAIL_ACTIVATE_PCT=12 with it.
+
+### A3. Gate-flip grandfathering: flipping DISCO_EXITS_LIVE=1 harvests instantly.
+Any live disco lot already past +10% gets sold on the first tick after the flip — not gradually.
+The flip is cheapest when few lots sit above target; check the blotter before arming. (Owner
+decision 2026-06-11: existing live lots stay on let-run until the paper gate clears — live runs
+ONE strategy at a time so the by-book comparison stays clean; no manual mid-flight harvests.)
+
+### A4. Rollout step 2 is answered: capital BINDS live.
+Engine log shows 243 entry-deferral events; recent ticks defer on "no settled cash (need $58–177 >
+$4 left)". The slot-velocity premise of the TP recommendation is confirmed by live telemetry, not
+just the sim. T+1 settlement (cash account) is the binding channel, as F5 predicted.
+
+### A5. Washout-reversal entries (the UNFI shape) backtested — no validated edge; new H3 + label.
+First-ever cohort for gap-DOWN + recover-to-top-of-range + heavy-volume entries (UNFI 6/9 was one:
+gap −18.8%, range-pos 0.982, 9× vol). Strict shape (gap ≤ −10, rpos ≥ .8, vol ≥ 3x): LARGE mean
+−1.7 to −2.1% under EVERY exit (n=23); MIDCAP median −3.4 to −6.7%, win 32–47% (n=38). Loose
+(gap ≤ −7, rpos ≥ .7, vol ≥ 2x, n=105 MIDCAP): suggestively positive but let-run is the WORST
+policy (+0.81%) and the TP family the best (TP15 +2.17%, TP10 +1.12% med +9.7%) — even this
+shape's defenders shouldn't let it run. Conditional check on UNFI's actual spot (+12.8%, peak
++14.3%): movers that closed ≥ +12.8% mid-hold go on to mean +1.13% / median −0.40% / 31% full
+give-back under let-run — hold-vs-sell is a per-trade wash; binding capital is what tips it.
+Implemented (label-only, no behavior change): `dd_probe.washout_reversal` (gap ≤ −7 + rpos ≥ 0.7 +
+vol ≥ 2x), plumbed through decide → lot/trade-log/catalyst-ledger like pead_qualified, and DD
+prompt heuristic **H3** (not a validated entry; reject-or-downsize, never runner). Note: tagging
+audit confirmed `route_book` works as designed — CBRL was the only pead_qualified=True verdict and
+was correctly routed disco by the $30B floor; the pead book is empty for lack of qualifying
+mega-cap gap-ups, not a routing bug.
