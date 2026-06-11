@@ -203,3 +203,21 @@ prompt heuristic **H3** (not a validated entry; reject-or-downsize, never runner
 audit confirmed `route_book` works as designed — CBRL was the only pead_qualified=True verdict and
 was correctly routed disco by the $30B floor; the pead book is empty for lack of qualifying
 mega-cap gap-ups, not a routing bug.
+
+### A6. FLIPPED LIVE — 2026-06-11, paper gate waived deliberately.
+`DISCO_EXITS_LIVE=1` (owner decision, same day as A1–A5). Rationale for waiving the ≥30-paper-
+round-trip gate: (a) paper can't model T+1 settlement, which is the velocity mechanism the TP
+exists to exploit — the gate couldn't validate the thing it gated; (b) n=30 has a ±9pt SE on
+win% — catastrophe detection only, and the disarm tripwire (BOOK_DISCO_ENABLED=0 on the
+pre-committed criteria) already covers catastrophe; (c) paper exercises `apply_decision.py`, not
+the gated `live_execute.lot_take_profit_pct()` path — unit tests cover that, paper doesn't;
+(d) TP10 is a pure exit *tightening* — stops/softcut/be/sizing unchanged, so the worst case is
+foregone upside, not new loss exposure. Known first act: UNFI (+12.8%, past the $49.34 TP)
+harvests on the first market-hours tick — accepted as the policy acting, superseding the 6/10
+"hold UNFI" call.
+**Validation continues on live fills** via `scripts/exit_counterfactual.py` (NEW): let-run
+replay (the pre-flip schedule, from .env) on the identical entries/fill prices from
+data/trades.jsonl — a paired comparison with no venue/cadence/sizing confounds, strictly better
+than the paper-vs-live read. Judge after ~30 live disco round-trips: if the mean delta
+(actual − let-run) is negative net of the velocity benefit (deferral telemetry), revisit the
+dial; tripwire criteria unchanged.

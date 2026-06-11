@@ -123,6 +123,7 @@ python3 scripts/trade_ledger.py --mode live # blotter + round-trips, LIVE truth 
 python3 scripts/trade_ledger.py --symbol NVDA   # one name's whole life
 python3 scripts/trade_ledger.py --round-trips --since 2026-06-04  # closed trips: hold time, P&L, P&L%
 python3 scripts/pnl_report.py --mode paper  # realized P&L + exit-type breakdown (off the engine log)
+python3 scripts/exit_counterfactual.py      # let-run replay on ACTUAL fills vs what the policy did
 cat data/journal/trades-$(date +%F).md      # today's blotter at a glance
 ```
 
