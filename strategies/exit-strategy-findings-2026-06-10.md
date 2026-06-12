@@ -508,4 +508,26 @@ daily-bar mirage (a 3% trail can't be seen at daily resolution), whereas be5's n
 breakeven stop sits far below price, cannot whipsaw on the upside). So: ship be5 blind (done), earn
 trail3@8 at the tape checkpoint, then run BOTH (floor + profit-lock), not one-or-the-other.
 
-This does NOT touch the §A12/§A13 disco-trail checkpoint work — those remain frozen pending the tape.
+### A15. OWNER SHIPPED trail3@8 LIVE — the profit-follow layer, with the be5+1% floor as the net (2026-06-12).
+Same day, owner: "try out the trailing stop update as well, following the stock up as it increases."
+So the §A13.2 trail3@8 that A14 said to "earn at the tape checkpoint" was instead shipped LIVE now —
+the owner's reasoning being that the be5+1% floor caps the downside (worst case a whipsaw exits at
++1%, still green), minutely sentinel + 4-min ticks make it cheap to revert, and the upside (banking
+runners) is wanted. Dials (all live `.env`, no code change — these are gitignored config):
+- `TRAIL_STOP_PCT=3` (was 15), `TRAIL_ACTIVATE_PCT=8` (was 20) — base/pead trail.
+- `DISCO_TRAIL_ACTIVATE_PCT=8` (was 10) — disco trail arms at +8 (width stays 3%; harvest tier stays
+  `10:0.75`). So a disco lot now: +5% floor → +8% trail-follow (whole lot) → +10% harvest 75% →
+  remnant rides the 3% trail.
+Grandfather re-checked via `trail_stop_price` on fresh marks: 0 immediate sells (lots in +5–8% sit on
+the floor; CAVA/UEC ≥+8% already trailed). **Two consequences to watch:**
+1. **Daily-bar-optimistic** (the A12/A13 caveat is now live, not theoretical): a 3% trail will trip on
+   intraday wicks and exit some runners early. The floor means those exits are still green. Watch
+   whether realized give-back-protection beats the early-exit cost; widen (5–8%) if it over-trims.
+2. **Partially preempts the §A12 remnant experiment.** A sharp +8→reverse now exits the whole lot on
+   the trail BEFORE the +10 harvest fires → fewer remnants scored by `exit_counterfactual.py --remnant`.
+   The pre-registered remnant-WIDTH test (flat3 vs variants) is unaffected for the harvests that DO
+   fire (post-+10 remnant still trails 3%), but the sample will accrue slower. Not a contamination,
+   a throughput cost — noted so the 30-RT checkpoint timing isn't mis-read as "stalled."
+The §A13.1 verdict (be5 costs mean) and §A13.2 (trail3@8 is the daily-bar mirage) still stand as
+research truth; A15 records that the owner chose to run them live anyway, floor-protected, ahead of
+the tape — a deliberate, reversible experiment, not a refutation of the backtest.
