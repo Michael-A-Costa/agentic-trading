@@ -548,3 +548,14 @@ mirroring T+1 settlement) — says removing the harvest is a **~22% terminal-equ
 accounting for a cash account — the harvest's edge is the recycled 75%, which only `port_pr` credits.
 So trail and harvest are COMPLEMENTARY, not redundant: trail = follow-up/give-back protection, harvest =
 guaranteed +10% bank + capital recycling (which the trail can't do, and which binds per A4). Harvest STAYS.
+
+**A15c — harvest-fraction sweep (50→90%), INCONCLUSIVE, stay at 75%.** Owner asked about lowering the
+harvest %. Swept tiers [(10,f)] for f∈{.50..1.0} (be5 floor + tr3@8, MOV-M, port_pr): face-value says
+harvest LESS — 50-65% → 4.29x vs 75% → 3.79x, per-trade mean flat (+0.50/.51). NOT actioned, three
+reasons: (1) the bigger-remnant edge is bought on the daily-bar trail's optimism — live whipsaw makes the
+remnant capture LESS, pushing the optimum back up toward locking at +10%; this sweep measures the trail's
+inflation, not the fraction. (2) Sharp 65→70% cliff (4.27→3.92) is a partial-release slot-packing
+discretization artifact, not a smooth economic curve. (3) Contradicts A9 (75>50 under be12/act10) →
+config-fragile. VERDICT: the harvest fraction is COUPLED to trail-survival — can't tune it ahead of the
+§A12 tape. If the tape shows the 3% trail holds intraday, ~60% (let more ride) becomes a candidate; if it
+whipsaws (likely), keep 75%+. Prove the trail first, then tune the fraction. No dial change.
