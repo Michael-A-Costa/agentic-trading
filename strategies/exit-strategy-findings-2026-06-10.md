@@ -221,3 +221,137 @@ data/trades.jsonl — a paired comparison with no venue/cadence/sizing confounds
 than the paper-vs-live read. Judge after ~30 live disco round-trips: if the mean delta
 (actual − let-run) is negative net of the velocity benefit (deferral telemetry), revisit the
 dial; tripwire criteria unchanged.
+
+### A7. Runner-regret follow-up (VELO 6/11): two untested exit families measured.
+Trigger: VELO harvested at +15.1% (gap through the +10 TP) and kept running. Reality check first:
+TP15 would have sold the *same tick* (fill 26.1254 ≥ 26.105); only trail/let-run schedules would
+still hold it. Two families the 101k grid never covered, run through the same harness
+(stop12/sc8/be12, MOV-M n=1840, split-half checked):
+
+**(a) Tight trail at the TP level instead of a TP** ("ratchet the stop to just under price at
++10"): the grid's narrowest trail was 8% and was never activated at 10. Measured: tr2@10 mean
++0.84% (vs TP10 +0.87%), **port 8.70x vs 7.01x under the same whole-slot accounting** — an
+accounting-robust improvement — but median collapses +9.70% → +2.22% (the trail arms end-of-day
+in daily bars; overnight gap-downs eat the lock). Wider trails are strictly worse (tr8@10: 2.26x).
+Live behavior would differ in both directions: 5-min re-arm + resting GTC stop ≈ intraday lock at
+peak×0.98 (better than the sim), but overnight gaps remain (the "no downside" intuition is wrong
+precisely there). Honest read: ties TP10 on mean, beats it on compounding, loses the median/
+consistency profile that motivated TP10.
+
+**(b) Moonshot-remnant ladder** (sell 75% at +10, remnant rides be12-floored): the tier grid
+only ever tested 50% fractions. Measured: mean **+1.04%** (beats TP10 on BOTH split halves:
+A +0.73 vs +0.60, B +1.41 vs +1.19), win 56%, give-back 16%, median +4.86% — TP10's consistency
+with let-run's mean. Portfolio: 2.10x under whole-slot accounting BUT **12.58x under
+partial-release accounting** (each sold fraction frees its capital on its fill date — the model
+that matches live, which sizes from settled cash, not slots; verified: single-leg configs produce
+identical numbers under both accountings). **This partially overturns F2**: "scale-outs are
+dominated at the account level" was an artifact of whole-slot accounting; live frees 75% of the
+cash at the tier fill. Adding the A2 salvage rung to the remnant (75%@10 + tr15@12): mean +0.95%,
+port_pr 11.09x. Caveats: partial-release sim is new (one consistency check, no jackknife yet);
+T+1 and intraday whipsaw unmodeled as ever (F5).
+
+**Candidate dial if runner-regret is binding:** `DISCO_SCALE_OUT_TIERS=10:0.75` + remnant on
+be12 floor (+ optional `DISCO_TRAIL_STOP_PCT=15 / DISCO_TRAIL_ACTIVATE_PCT=12`). Requires
+plumbing the per-book overlay for tiers/trail (same pattern as `DISCO_TAKE_PROFIT_PCT`;
+tick_context parses only the global `SCALE_OUT_TIERS` today). Not flipped — owner decision;
+n=1 regret is not a tripwire, and the A6 counterfactual adjudication (30 round-trips) stands.
+Repro: `python3 scripts/backtest_remnant.py` (tight-trail family: same harness, trail 2–8 @ act 10).
+
+### A8. Intraday-only (flat by close) tested — it forfeits the edge. Overnight IS the edge.
+Owner question 6/11: avoid overnight gap risk by going intraday-only. Measured on MOV-M (n=1840,
+daily-bar decomposition of every held day into close→open and open→close legs):
+- The 15-day drift splits **+1.99% overnight / +1.66% intraday** — cutting overnight exposure
+  forfeits 55% of the gross edge up front.
+- The intraday remainder is not harvestable: day-1 intraday-only (buy next open, TP10/stop8,
+  flat at close) earns **+0.03% mean, median −0.22%, win 48%** — zero after costs (matches the
+  2026-06 backtest_signal verdict: the entry is anti-predictive at the 1-day horizon). Tighter
+  intraday brackets are worse (TP5/stop3: −0.33%). Re-buying daily to collect the +0.11%/day
+  intraday legs costs 30bps/day in round-trip fees — deeply negative.
+- Case in point: VELO entered 22.70 intraday 6/10, closed that day 22.68 (−0.1%). **The entire
+  +15.1% realized came from the overnight gap into 6/11.** Flat-by-close scratches the trade.
+Overnight gap risk is the *price* of the multi-day drift edge, not a removable defect; the
+protections are sizing (conviction tiers), stop12, and the daily-loss breaker — not flattening.
+
+### A9. FLIPPED LIVE — 2026-06-11: disco moonshot-remnant ladder replaces the TP10 full exit.
+Owner decision (same day as A7/A8, prompted by the VELO regret): disco lots now harvest **75% at
++10** and let the **25% remnant ride a 3% trail from peak** (activated at +10), floored by be12,
+capped by the global TP40. Per-trade the width barely matters — remnant trails 2–5% are a
+statistical tie (mean +0.85–0.86%, identical median/win/give-back; port differences within noise)
+— so the width is set from VELO's tape, on the CORRECT window (owner correction, same day: the
+first calibration used the −3.9% open shakeout, which happens *below* +10 where the remnant trail
+doesn't exist yet). Post-activation, VELO's pullbacks were ~2.5%: a 2% trail stops out on the
+first wiggle (would have exited VELO at +19% — fine, but the moonshot ends), 3% rides it (locked
++17.8% at last check), 5% locks less (+15.4%). **Width = 3** ("just under current price" without
+dying to hourly noise). Known bias: daily bars understate intraday whipsaw, so live 3% will exit
+remnants somewhat earlier than the sim shows — acceptable, the remnant is profit-locking by design.
+Looser (8%+) remains out: port_x collapses to 4.4x. Ladder economics vs TP10 unchanged: port ~9x
+vs 7.0x, win 56%, give-back 15%.
+
+Implementation (all suites green, 171 assertions / 41 tests):
+- `tick_context.py`: `scale_out_tiers(env_key)` parameterized; `DISCO_SCALE_OUT_TIERS` ladder
+  selected per-book in the exit screen (same live-gate as the TP overlay); `DISCO_TRAIL_*` in caps.
+- `live_execute.py`: `trail_stop_price` is book-aware (disco rides the tight rung once
+  `DISCO_EXITS_LIVE=1`); `execute_sell` partial-tier bookkeeping (marks `scaled`, remembers
+  `init_qty`, ratchets to breakeven after the first trim, flags the remnant synthetic until
+  reconcile re-arms the resting stop at the new qty) + a fix: `closing_order_id` is now only set
+  on FULL closes, so a remnant's later stop-out books correctly as an external closure.
+- Whole-share lots floor the trim (4sh → sell 3 keep 1); a 1-share lot degrades to a full TP at
+  the tier. Paper has no trail mechanics, so the paper remnant rides be12-floor only — which is
+  itself the best per-trade config (A7); live fidelity gap noted.
+- `.env`: `DISCO_TAKE_PROFIT_PCT=0`, `DISCO_SCALE_OUT_TIERS=10:0.75`, `DISCO_TRAIL_STOP_PCT=3`,
+  `DISCO_TRAIL_ACTIVATE_PCT=10`. Grandfathering checked at flip time: no live disco lot above
+  +6.6%, so no instant trims and the TP retarget (+10 → +40 cap) lands before anyone reaches
+  the tier. 1-share lots (SJM/ELF/BKH/NWE) will full-exit at +10 by design.
+
+**Pre-committed restraint:** this supersedes the TP10 dial *once*; no further exit-dial changes
+until ~30 live disco round-trips are scored by `exit_counterfactual.py` (now the paired judge of
+ladder-vs-let-run on identical entries). Tripwire criteria unchanged (`BOOK_DISCO_ENABLED=0`).
+
+### A10. Sentinel tier trims (1-min harvest latency) + a dead-sentinel bug found and fixed.
+Owner-approved follow-up to the cadence question (the answer to which was: do NOT front-load
+opening ticks — entries gain nothing (A8), downside is already broker-side, and faster ticks
+would sample the trail's high-water tighter exactly when whipsaw peaks, shaking out the remnant
+the ladder exists to keep). The one channel where speed purely helps is the tier trim — an
+upside trigger only the engine can see — so `live_sentinel.py` now watches the scale-out tier on
+ALL lots every minute (`_tier_breach`, same double-read confirm) and fires the trim through the
+unit-tested `live_execute.execute_sell` partial path, with the lot's `scaled` marker as the
+natural no-refire guard and `trade_log.record_fills` booking the row (a trim never makes the
+position disappear, so reconcile's closed-external path can't book it).
+
+**Bug found during the work: the live sentinel's breach detection had NEVER fired.** `_breach`
+read `q.get("last")` but `dd_probe.cboe_quote` returns raw Cboe keys (`current_price`) — the
+price was always None, so every synthetic-stop/TP breach was silently invisible since the
+sentinel was built. No realized harm (all current lots are whole-share with resting broker stops;
+the synthetic layer never had to catch anything), but a fractional lot would have been naked
+between planner ticks. Fixed via `_quote_last()` (reads `current_price`, falls back to `last`),
+regression-tested in the new `test_live_sentinel.py` (the quote-key regression, tier
+fire/no-refire/gating, pead non-interference). Dry-run verified against live state.
+
+**OCO question (owner, same day): can the tier rest broker-side next to the stop?** No —
+Robinhood confirms it does not offer OCO/bracket orders (the MCP exposes only
+market/limit/stop_market/stop_limit), and unlinked stacked sells conflict on shares
+(`shares_available_for_sells` — the ALOY stranded-limit failure mode). Splitting (stop on the
+remnant, limit on the harvest shares) leaves 75% of the position with no downside protection —
+rejected per F3. The asymmetry stands: stop broker-side (gaps kill), harvest engine-side.
+**Revisit trigger: if the Robinhood MCP ever adds OCO/bracket order types, move the tier to a
+true resting limit.**
+
+**Second sentinel data-quality fix (same session): detection now runs on REAL-TIME quotes.**
+`dd_probe.cboe_quote` serves the ~15-min-DELAYED Cboe CDN feed unless the planner's quote cache
+is <3 min old — so the sentinel's "1-min latency" was fictional on its old data path. It now
+batch-fetches the broker's own real-time marks via `rh_direct.quotes` (~0.3s, $0, no LLM, one
+call per pass) with per-symbol Cboe as fallback only. Verified live: 0.28s for the batch. Net
+effect of A10: tier detection latency went from ~5 min on possibly-15-min-stale data to ~1 min
+on real-time data — functionally equivalent to a resting limit at the tier, minus only the
+sub-minute spike-and-retrace, while the full position keeps its resting stop.
+
+**RH-everywhere audit (owner directive, same day): every PRICE a live decision reads is now
+real-time RH.** Planner sweep (QUOTES_PREFER_RH=1, pre-existing), sentinel (this session), broker
+truth (always), and now the DD probe: `dd_probe._rh_live_quote` overlays real-time
+last/bid/ask/prev_close (via `mc.fetch_robinhood_direct`) on the delayed Cboe quote, so spread /
+extension / "not yet extended" / intraday-% judgments see the live tape; sources telemetry gains
+`rh_live`. Deliberately still keyless (no RH equivalent exists in the MCP): Cboe STRUCTURE fields
+(volume, open/high/low, iv30 — confirmation signals where 15-min delay is tolerable), daily
+HISTORY bars (no RH history endpoint; daily granularity), and the Nasdaq movers SCREENER
+(no RH screener; it only nominates candidates — everything price-sensitive downstream re-checks
+on RH). Yahoo/Stooq remain deep fallbacks only, never primary in live.

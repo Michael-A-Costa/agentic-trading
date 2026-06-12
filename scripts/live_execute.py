@@ -454,6 +454,13 @@ def trail_stop_price(lot: dict, caps: dict, last: float | None) -> tuple[float |
         hw = last
     gain_pct = (hw / entry - 1.0) * 100.0
     trail = caps.get("TRAIL_STOP_PCT", 0.0) or 0.0
+    trail_act = caps.get("TRAIL_ACTIVATE_PCT", 0.0) or 0.0
+    # Per-book trail overlay (two-book v2.1 / findings A7-A9): a disco lot rides its own (tighter)
+    # trail rung — the moonshot-remnant lock — once the live gate is on. pead keeps the global rungs.
+    disco_trail = caps.get("DISCO_TRAIL_STOP_PCT", 0.0) or 0.0
+    if disco_trail > 0 and caps.get("DISCO_EXITS_LIVE") and book_of(lot) == "disco":
+        trail = disco_trail
+        trail_act = caps.get("DISCO_TRAIL_ACTIVATE_PCT", 0.0) or 0.0
     be_at = caps.get("TRAIL_BREAKEVEN_AT_PCT", 0.0) or 0.0
     if trail <= 0 and be_at <= 0:
         return None, hw  # both rungs off — leave the fixed STOP_LOSS_PCT stop as-is
@@ -466,7 +473,7 @@ def trail_stop_price(lot: dict, caps: dict, last: float | None) -> tuple[float |
         candidates.append(entry)
     #  rung 2 — continuous trail: once up TRAIL_ACTIVATE_PCT, ride TRAIL_STOP_PCT below the high-water
     #  mark, scaling UP with every new high.
-    if trail > 0 and gain_pct >= (caps.get("TRAIL_ACTIVATE_PCT", 0.0) or 0.0):
+    if trail > 0 and gain_pct >= trail_act:
         candidates.append(hw * (1 - trail / 100.0))
     if not candidates:
         return None, hw  # neither rung engaged yet
@@ -742,6 +749,10 @@ def execute_sell(sym: str, action: dict, state: dict, broker: dict, caps: dict, 
     held = broker["positions"][sym]["qty"]
     qty = float(action["qty"]) if action.get("qty") is not None else held
     qty = min(qty, held)
+    if action.get("scale_tiers") and float(held) == math.floor(float(held)):
+        # Whole-share lot: trim whole shares only. A trim that rounds below 1 share sells the whole
+        # lot instead — a 1-share lot can't keep a remnant, so the tier degrades to a full take-profit.
+        qty = float(math.floor(qty)) or held
     if qty <= 0:
         res["reject_reason"] = "non-positive sell qty"
         return res
@@ -795,12 +806,34 @@ def execute_sell(sym: str, action: dict, state: dict, broker: dict, caps: dict, 
     _px = _qd.get("bid") or _qd.get("last") or _qd.get("ask")
     if _entry and _px:
         res["realized_est_usd"] = round((float(_px) - _entry) * float(qty), 2)
-    # Mark the lot as engine-closed so reconcile can tell THIS sell (already in the trade history)
-    # from a genuinely external closure (resting stop fired / sold outside the engine) — only the
-    # latter gets booked as a new trade row when the position disappears (P6, no double-count).
-    lot["closing_order_id"] = order_id
+    if qty >= held - 1e-9:
+        # Mark the lot as engine-closed so reconcile can tell THIS sell (already in the trade history)
+        # from a genuinely external closure (resting stop fired / sold outside the engine) — only the
+        # latter gets booked as a new trade row when the position disappears (P6, no double-count).
+        lot["closing_order_id"] = order_id
+    else:
+        # PARTIAL (scale-out): the lot lives on at the remnant qty — do NOT mark it engine-closed,
+        # or a later stop-out of the remnant would be mis-read as this sell completing. Mark the
+        # tiers taken so the screen won't re-trim them next tick, remember the scale base, and
+        # ratchet the synthetic stop to breakeven after the FIRST trim (mirrors apply_decision /
+        # SCALE_BREAKEVEN_AFTER_FIRST). The resting stop was cancelled above for the sell; until
+        # next tick's reconcile re-arms it at the remnant qty, the synthetic stop_price + the 1-min
+        # sentinel cover the remnant (stop_type flags that state).
+        taken = lot.get("scaled") or []
+        lot.setdefault("init_qty", float(held))
+        lot["scaled"] = taken + [t for t in (action.get("scale_tiers") or []) if t not in taken]
+        lot["qty"] = round(float(held) - qty, 6)
+        lot["stop_type"] = "synthetic"
+        scale_be = os.environ.get("SCALE_BREAKEVEN_AFTER_FIRST", "1").strip().lower() \
+            not in ("0", "false", "no", "")
+        if not taken and scale_be and _f(lot.get("entry_price")):
+            be = round(float(lot["entry_price"]), 4)
+            if (_f(lot.get("stop_price")) or 0.0) < be:
+                lot["stop_price"] = be
     log.append({"event": "sell_placed", "symbol": sym, "spec": spec, "ref_id": ref_id,
-                "order_id": order_id, "order": placed})
+                "order_id": order_id, "order": placed,
+                **({"scale_tiers": action["scale_tiers"], "remnant_qty": lot.get("qty")}
+                   if action.get("scale_tiers") and qty < held else {})})
     return res
 
 

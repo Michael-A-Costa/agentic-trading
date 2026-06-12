@@ -732,6 +732,124 @@ def test_lot_take_profit_pct_per_book_overlay():
                                                                {"TAKE_PROFIT_PCT": 40.0}) == 40.0)
 
 
+def test_trail_per_book_overlay():
+    """A7/A9 moonshot-remnant lock: a disco lot rides DISCO_TRAIL_STOP_PCT@DISCO_TRAIL_ACTIVATE_PCT
+    once DISCO_EXITS_LIVE=1; pead lots (and gated live) keep the global TRAIL_* rungs."""
+    armed = {"STOP_LOSS_PCT": 12.0, "TRAIL_STOP_PCT": 15.0, "TRAIL_ACTIVATE_PCT": 20.0,
+             "TRAIL_MIN_STEP_PCT": 0.0, "DISCO_TRAIL_STOP_PCT": 5.0,
+             "DISCO_TRAIL_ACTIVATE_PCT": 10.0, "DISCO_EXITS_LIVE": 1}
+    gated = {**armed, "DISCO_EXITS_LIVE": 0}
+    disco = {"book": "disco", "entry_price": 100.0, "stop_price": 88.0, "high_water": 100.0}
+    pead = {"book": "pead", "entry_price": 100.0, "stop_price": 88.0, "high_water": 100.0}
+    # +12%: disco's tight trail is active (>=10) -> 112*0.95; pead's global rung (act 20) is not
+    ns, hw = le.trail_stop_price(dict(disco), armed, 112.0)
+    check("disco armed trails 5% from peak at +12", ns == 106.4 and hw == 112.0, (ns, hw))
+    ns, _ = le.trail_stop_price(dict(pead), armed, 112.0)
+    check("pead keeps global trail (inactive at +12)", ns is None, ns)
+    ns, _ = le.trail_stop_price(dict(disco), gated, 112.0)
+    check("live gated -> disco keeps global trail", ns is None, ns)
+    ns, _ = le.trail_stop_price({**disco, "book": None}, armed, 112.0)
+    check("unlabeled lot defaults to disco", ns == 106.4, ns)
+    # pead global rung still works when it activates
+    ns, _ = le.trail_stop_price(dict(pead), armed, 125.0)
+    check("pead global trail at +25 -> 125*0.85", ns == 106.25, ns)
+
+
+def test_execute_sell_partial_scale_out():
+    """A scale-out trim sells the tier qty as a price-protected limit, marks the tiers taken,
+    keeps the remnant lot (NOT engine-closed), ratchets the synthetic stop to breakeven after the
+    first trim, and flags stop_type=synthetic until reconcile re-arms the resting stop."""
+    import types
+    calls = {"cancel": [], "place": []}
+    fake = types.ModuleType("rh_mcp")
+    fake.cancel = lambda oid: (calls["cancel"].append(oid), {"errors": {}})[1]
+    fake.place = lambda spec, ref_id: (calls["place"].append(spec),
+                                       {"order": {"data": {"id": "t1"}}, "errors": {}})[1]
+    saved = sys.modules.get("rh_mcp")
+    sys.modules["rh_mcp"] = fake
+    os.environ["LIVE_ARMED"] = "1"
+    try:
+        state = {"lots": {"VELO": {"qty": 4, "entry_price": 100.0, "stop_price": 88.0,
+                                   "resting_stop_order_id": "stop1", "stop_type": "resting",
+                                   "book": "disco"}}}
+        broker = {"positions": {"VELO": {"qty": 4.0, "avg_cost": 100.0}},
+                  "quotes": {"VELO": {"bid": 111.9, "last": 112.0, "ask": 112.1}}}
+        action = {"reason": "scale-out 75% at +12% (tier +10%)", "qty": 3.0, "scale_tiers": [10.0]}
+        res = le.execute_sell("VELO", action, state, broker, CAPS, log := [])
+        lot = state["lots"]["VELO"]
+        check("trim cancelled the resting stop", "stop1" in calls["cancel"], calls)
+        check("trim placed a LIMIT sell of 3", len(calls["place"]) == 1
+              and calls["place"][0]["type"] == "limit" and calls["place"][0]["quantity"] == "3", calls)
+        check("trim is not urgent", res.get("urgent") is False, res)
+        check("tier marked taken", lot.get("scaled") == [10.0], lot)
+        check("scale base remembered", lot.get("init_qty") == 4.0, lot)
+        check("remnant qty tracked", lot.get("qty") == 1.0, lot)
+        check("remnant NOT engine-closed", not lot.get("closing_order_id"), lot)
+        check("first trim ratchets stop to breakeven", lot.get("stop_price") == 100.0, lot)
+        check("remnant covered synthetically until re-arm",
+              lot.get("stop_type") == "synthetic" and lot.get("resting_stop_order_id") is None, lot)
+    finally:
+        os.environ.pop("LIVE_ARMED", None)
+        if saved is not None:
+            sys.modules["rh_mcp"] = saved
+        else:
+            sys.modules.pop("rh_mcp", None)
+
+
+def test_execute_sell_tier_whole_share_rounding():
+    """Whole-share lots trim whole shares (floor); a trim that rounds below 1 share sells the whole
+    lot instead — the tier degrades to a full take-profit on a 1-share lot."""
+    import types
+    calls = {"place": []}
+    fake = types.ModuleType("rh_mcp")
+    fake.cancel = lambda oid: {"errors": {}}
+    fake.place = lambda spec, ref_id: (calls["place"].append(spec),
+                                       {"order": {"data": {"id": "t2"}}, "errors": {}})[1]
+    saved = sys.modules.get("rh_mcp")
+    sys.modules["rh_mcp"] = fake
+    os.environ["LIVE_ARMED"] = "1"
+    try:
+        # 5-share lot, 75% tier -> 3.75 floors to 3, remnant 2
+        state = {"lots": {"AAA": {"qty": 5, "entry_price": 100.0, "stop_price": 88.0,
+                                  "stop_type": "synthetic", "book": "disco"}}}
+        broker = {"positions": {"AAA": {"qty": 5.0, "avg_cost": 100.0}},
+                  "quotes": {"AAA": {"bid": 111.9, "last": 112.0, "ask": 112.1}}}
+        le.execute_sell("AAA", {"reason": "scale-out", "qty": 3.75, "scale_tiers": [10.0]},
+                        state, broker, CAPS, [])
+        check("fractional tier qty floored to whole", calls["place"][-1]["quantity"] == "3", calls)
+        check("remnant after floor", state["lots"]["AAA"]["qty"] == 2.0, state["lots"]["AAA"])
+        # 1-share lot: 0.75 rounds below 1 -> sells the whole share (full close semantics)
+        state2 = {"lots": {"BBB": {"qty": 1, "entry_price": 100.0, "stop_price": 88.0,
+                                   "stop_type": "synthetic", "book": "disco"}}}
+        broker2 = {"positions": {"BBB": {"qty": 1.0, "avg_cost": 100.0}},
+                   "quotes": {"BBB": {"bid": 111.9, "last": 112.0, "ask": 112.1}}}
+        le.execute_sell("BBB", {"reason": "scale-out", "qty": 0.75, "scale_tiers": [10.0]},
+                        state2, broker2, CAPS, [])
+        lot2 = state2["lots"]["BBB"]
+        check("sub-share trim sells the whole lot", calls["place"][-1]["quantity"] == "1", calls)
+        check("full-lot tier IS engine-closed", lot2.get("closing_order_id") == "t2", lot2)
+        check("full-lot tier leaves no scaled marker", not lot2.get("scaled"), lot2)
+    finally:
+        os.environ.pop("LIVE_ARMED", None)
+        if saved is not None:
+            sys.modules["rh_mcp"] = saved
+        else:
+            sys.modules.pop("rh_mcp", None)
+
+
+def test_disco_scale_out_tiers_parse():
+    """tick_context.scale_out_tiers reads the per-book ladder from its own env key."""
+    import tick_context as tc
+    os.environ["DISCO_SCALE_OUT_TIERS"] = "10:0.75"
+    os.environ["SCALE_OUT_TIERS"] = ""
+    try:
+        check("disco ladder parses", tc.scale_out_tiers("DISCO_SCALE_OUT_TIERS") == [(10.0, 0.75)])
+        check("global ladder independent", tc.scale_out_tiers() == [])
+    finally:
+        os.environ.pop("DISCO_SCALE_OUT_TIERS", None)
+        os.environ.pop("SCALE_OUT_TIERS", None)
+
+
 def test_live_snapshot_shared_cash_parse():
     """Regression for the breaker bug: cash (full NAV leg) and buying_power (spendable) are DISTINCT on
     a cash account, and the executor + gate now parse them from the ONE shared module so they can't
@@ -779,6 +897,8 @@ if __name__ == "__main__":
              test_execute_buy_arms_stop_in_tick, test_execute_buy_rereads_fill_then_arms,
              test_execute_buy_unfilled_stays_pending, test_execute_buy_synthetic_when_stop_arm_fails,
              test_lot_take_profit_pct_per_book_overlay,
+             test_trail_per_book_overlay, test_execute_sell_partial_scale_out,
+             test_execute_sell_tier_whole_share_rounding, test_disco_scale_out_tiers_parse,
              test_live_snapshot_shared_cash_parse]
     for fn in tests:
         fn()

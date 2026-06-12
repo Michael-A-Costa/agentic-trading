@@ -46,15 +46,16 @@ def envf(key: str, default: float) -> float:
         return default
 
 
-def scale_out_tiers() -> list[tuple[float, float]]:
-    """Parse SCALE_OUT_TIERS ("gain%:fracOfInitQty, ...") into sorted (gain, frac) pairs.
+def scale_out_tiers(env_key: str = "SCALE_OUT_TIERS") -> list[tuple[float, float]]:
+    """Parse a tier ladder env var ("gain%:fracOfInitQty, ...") into sorted (gain, frac) pairs.
 
     e.g. "5:0.33,8:0.33" -> [(5.0, 0.33), (8.0, 0.33)]: at +5% sell a third of the original
     position, at +8% sell another third, leaving a third to ride to the take-profit. Empty/off
     returns []. Fractions are of the position's qty AT ENTRY (init_qty), so "a third then a third"
-    means exact thirds, not thirds-of-the-remainder.
+    means exact thirds, not thirds-of-the-remainder. env_key selects the ladder: the global
+    SCALE_OUT_TIERS, or the per-book DISCO_SCALE_OUT_TIERS overlay (two-book v2.1).
     """
-    raw = (os.environ.get("SCALE_OUT_TIERS", "") or "").strip()
+    raw = (os.environ.get(env_key, "") or "").strip()
     tiers: list[tuple[float, float]] = []
     for part in raw.split(","):
         part = part.strip()
@@ -149,6 +150,13 @@ def _build_caps(equity: float, sod_equity: float) -> dict:
         # round-trips per the two-book disarm rule).
         "DISCO_EXITS_LIVE": 1 if str(os.environ.get("DISCO_EXITS_LIVE", "0")).strip().lower()
                             not in ("0", "false", "no", "") else 0,
+        # Per-book trail overlay (findings A7/A9, 2026-06-11): once the moonshot-remnant ladder
+        # (DISCO_SCALE_OUT_TIERS) trims a disco lot, the remnant rides a TIGHTER trail than pead's
+        # let-run rungs — width calibrated on the VELO 6/11 tape (5% survives the shakeout; the
+        # MOV-M harness puts tr5@10 at the robustness peak across both portfolio accountings).
+        # 0/unset = disco uses the global TRAIL_* rungs.
+        "DISCO_TRAIL_STOP_PCT": envf("DISCO_TRAIL_STOP_PCT", 0.0),
+        "DISCO_TRAIL_ACTIVATE_PCT": envf("DISCO_TRAIL_ACTIVATE_PCT", 0.0),
         "TRAIL_STOP_PCT": envf("TRAIL_STOP_PCT", 0.0),
         "TRAIL_ACTIVATE_PCT": envf("TRAIL_ACTIVATE_PCT", 0.0),
         "TRAIL_BREAKEVEN_AT_PCT": envf("TRAIL_BREAKEVEN_AT_PCT", 0.0),
@@ -398,7 +406,8 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
     # take_profit_price set at entry, already book-aware; this covers legacy lots without one).
     # Paper applies the disco override immediately; live only once DISCO_EXITS_LIVE=1.
     disco_tp = caps.get("DISCO_TAKE_PROFIT_PCT", 0.0) or 0.0
-    disco_tp_on = disco_tp > 0 and (mode != "live" or bool(caps.get("DISCO_EXITS_LIVE")))
+    disco_exits_on = mode != "live" or bool(caps.get("DISCO_EXITS_LIVE"))
+    disco_tp_on = disco_tp > 0 and disco_exits_on
     # FREE-REIN trader (owner mandate 2026-06-05): NO mechanical entry signal — the agent picks.
     # The deterministic layer only gathers the day's tradable movers + enforces the risk seatbelts
     # (stops, caps, daily breaker); Stage-2 (the agent) decides what's worth a shot and for how long.
@@ -412,6 +421,9 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
     max_hold_days = caps["MAX_HOLD_DAYS"]              # time-exit after N calendar days (~drift window) — the core exit
     stall_band_pct = envf("STALL_BAND_PCT", 2.0)       # max |pnl%| for max-hold-MIN to fire (only if MAX_HOLD_MIN>0)
     tiers = scale_out_tiers()                          # partial profit-take ladder (gain% -> fraction of entry qty); [] = off
+    # Per-book ladder (findings A7/A9): disco lots harvest most of the position at the tier and let
+    # the remnant ride (the moonshot ticket). Same live-arming gate as the disco TP overlay.
+    disco_tiers = scale_out_tiers("DISCO_SCALE_OUT_TIERS") if disco_exits_on else []
     # Tier-1 hold-risk monitor (hold_risk.py): a cheap per-tick protective SELL of a DETERIORATING
     # loser — tighter than the hard stop, gated so it doesn't whipsaw a noisy-but-fine position. The
     # hard STOP_LOSS_PCT stop stays the backstop under it. HOLD_RISK_SELL=0 disables the auto-sell
@@ -485,9 +497,13 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
                     reason = f"max-hold {age_days}d >= {int(max_hold_days)}d (drift window elapsed)"
             except (ValueError, TypeError):
                 pass
+        # Per-book ladder selection: a disco lot uses the DISCO_SCALE_OUT_TIERS overlay when set
+        # (the A7/A9 moonshot-remnant harvest); everything else keeps the global ladder.
+        eff_tiers = (disco_tiers if (disco_tiers and str(p.get("book") or "disco") == "disco")
+                     else tiers)
         if reason:
             exits.append({"symbol": p["symbol"], "reason": reason})
-        elif tiers and pp is not None and pp > 0:
+        elif eff_tiers and pp is not None and pp > 0:
             # Scale-out ladder: no full-exit rule fired, so check the partial profit-take tiers.
             # Sell a fraction of the ENTRY qty for every tier the gain has cleared but we haven't
             # taken yet (collapsing a multi-tier gap-up into one slice so we don't miss a tier that
@@ -495,7 +511,7 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
             # tiers taken and ratchets the stop to breakeven after the first trim.
             already = p.get("scaled") or []
             base = p.get("init_qty") or p.get("qty") or 0.0
-            due = [(g, f) for (g, f) in tiers if pp >= g and g not in already]
+            due = [(g, f) for (g, f) in eff_tiers if pp >= g and g not in already]
             qty_out = round(base * sum(f for _, f in due), 6)
             if due and qty_out > 0:
                 gains = [g for g, _ in due]
@@ -701,8 +717,13 @@ def main(state: dict | None = None, mode: str = "paper") -> int:
     }
 
     TICK.mkdir(parents=True, exist_ok=True)
-    (TICK / "context_latest.json").write_text(json.dumps(context, indent=2))
-    (TICK / "packet_latest.json").write_text(json.dumps(packet))
+    # Atomic (temp + os.replace) so a concurrent reader — the sentinel, or the open-DD sweep
+    # capturing entry_candidates — can't see a half-written file if a tick rewrites it mid-read.
+    for name, blob in (("context_latest.json", json.dumps(context, indent=2)),
+                       ("packet_latest.json", json.dumps(packet))):
+        tmp = (TICK / name).with_suffix(".json.tmp")
+        tmp.write_text(blob)
+        os.replace(tmp, TICK / name)
 
     print(f"GATE={context['gate']}" + (f":{context['gate_reason']}" if context['gate_reason'] else ""))
     return 0

@@ -187,19 +187,41 @@ def cboe_quote(sym: str) -> dict:
         return {}
 
 
+def _rh_live_quote(sym: str) -> dict:
+    """REAL-TIME last/bid/ask/prev_close from the broker's own marks (rh_direct, ~0.3s, $0,
+    no LLM), in the shared Cboe-shaped keys. {} when unavailable — the caller stays on the
+    delayed Cboe fields. Why: the Cboe CDN quote is ~15-min DELAYED, and the DD's price-driven
+    judgments (spread, extension, 'not yet extended', intraday %) were being made on it; entry
+    decisions should see the live tape (owner directive 2026-06-11). Structure fields RH lacks
+    (volume / open / high / low / iv30) still come from Cboe."""
+    try:
+        if not str(os.environ.get("QUOTES_PREFER_RH", "0")).strip().lower() in ("1", "true", "yes"):
+            return {}
+        return mc.fetch_robinhood_direct([sym]).get(sym.upper()) or {}
+    except Exception:  # noqa: BLE001 — any failure just means the delayed-Cboe fallback
+        return {}
+
+
 def probe(sym: str) -> dict:
     sym = sym.upper()
     hist, hist_src = load_history(sym)
     cb = cboe_quote(sym)
+    rh = _rh_live_quote(sym)
+    if rh:
+        # Overlay ONLY the real-time price fields; never clobber Cboe's structure fields
+        # (volume/open/high/low/iv30) with RH's Nones.
+        cb = {**cb, **{k: v for k, v in rh.items() if v is not None and k in
+                       ("current_price", "bid", "ask", "prev_day_close", "price_change_percent")}}
     closes = hist.get("closes") or []
     vols = hist.get("volumes") or []
 
     # history_ok drives the rubric: when false, daily trend/volume flags are null (unknown), NOT
     # false — a data blackout must never read as 'weak momentum'. Cboe intraday is the primary source.
-    out: dict = {"symbol": sym, "sources": {"history": hist_src or False, "cboe_quote": bool(cb)},
+    out: dict = {"symbol": sym, "sources": {"history": hist_src or False, "cboe_quote": bool(cb),
+                                            "rh_live": bool(rh)},
                  "history_ok": bool(closes)}
 
-    # --- live quote / liquidity / gap / intraday structure (Cboe — keyless, always-on) ---
+    # --- live quote: price fields REAL-TIME via RH overlay when available, structure via Cboe ---
     last = mc._fnum(cb.get("current_price")) or (closes[-1] if closes else None)
     bid, ask = mc._fnum(cb.get("bid")), mc._fnum(cb.get("ask"))
     prev_close = mc._fnum(cb.get("prev_day_close"))
