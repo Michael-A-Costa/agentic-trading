@@ -28,10 +28,11 @@ through the Robinhood trading MCP, driven by Claude Code.
 ## Layout
 
 ```
-strategies/   # signals, position sizing, risk rules
-scripts/      # tick engine, research / data-pull, backtests
+strategies/   # signals, position sizing, risk rules, exit/backtest playbooks
+scripts/      # tick engine, research / data-pull, backtests, trade ledger + P&L
 data/         # cached market + account data, run logs (gitignored)
 docs/         # methodology + architecture notes
+research/     # landscape + signal-backtest writeups
 .claude/      # Claude Code skills + local settings
 .mcp.json     # Robinhood trading MCP registration
 CLAUDE.md     # operating guide + trading safety rules for Claude Code
@@ -55,10 +56,18 @@ mode flag to flip by accident:
 - **Paper** (default, simulated fills): `run_paper_tick.sh` every 15 min + `run_paper_sentinel.sh`
   every 1 min. Flow: market regime → `tick_context.py` (screen + gate) → `decide.py` (deep DD) →
   `apply_decision.py` (simulated fill).
-- **Live** (real orders): `run_live_tick.sh` + `run_live_sentinel.sh`. Flow: precheck →
-  `broker_snapshot.py` → `live_tick_context.py` → `decide.py` → `live_execute.py`
+- **Live** (real orders): `run_live_tick.sh` every 5 min + `run_live_sentinel.sh` every 1 min.
+  Flow: precheck → `broker_snapshot.py` → `live_tick_context.py` → `decide.py` → `live_execute.py`
   (`review → place` via the MCP). **Live is double-gated:** it only places when `LIVE_ARMED=1`;
   otherwise it dry-runs (real review, places nothing).
+
+The book is split two ways (`strategies/two-book-v2-plan.md`): **pead** — a measured mega-cap
+post-earnings drift sleeve that lets winners run — and **disco** — discretionary catalyst names
+the agent picks with free rein. Downside protection (catastrophe stop, soft-cut, breakeven rung)
+is **global** to both; profit-harvest is **per-book** (disco runs a tighter take-profit + remnant
+trail via the `DISCO_*` knobs, pead keeps the globals). Every fill — paper or live — is journaled
+by `trade_log.py`; read it back with `scripts/trade_ledger.py` (round-trips) and
+`scripts/pnl_report.py` (realized P&L + exit-type breakdown).
 
 ## Safety
 
