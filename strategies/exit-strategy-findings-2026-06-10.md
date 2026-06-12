@@ -478,3 +478,34 @@ with flat3; if flat3 survives intraday, the whole-lot tight-early trail earns it
 tape test. Do NOT adopt trail3@act8 (or any tight-early trail) off the daily grid. be5/low-breakeven
 is settled (rejected, §A13.1) — no checkpoint needed. Repro: `backtest_trail_activate_grid.py`,
 `backtest_exit_policy.py` (be-rungs + giveback rows).
+
+### A14. OWNER OVERRIDE — be5 shipped LIVE despite A13.1 (2026-06-12, capital-preservation mandate).
+Same day, owner directed: "if we're ever up 5% on a trade, raise the stop to breakeven — I just
+don't want to lose money." This deliberately overrides A13.1's rejection (be5 costs ~0.5%/trade
+mean): the account's standing objective is now capital preservation over expectancy, owner's call,
+not to be relitigated (cf. §A6, the earlier deliberate gate-waiver). Shipped, NOT paper-staged
+(owner accepts the EV cost; minutely sentinel + 4-min ticks make it cheap to revert):
+- **`TRAIL_BREAKEVEN_AT_PCT=5`** (was 12), both books. Grandfathering checked at flip (§A3): 7 live
+  lots had peak ≥+5%, all above entry → stops lifted to breakeven next tick, zero immediate sells.
+- **Cooldown carve-out** (owner: "don't exclude stocks we broke even on if they turn back up"): a
+  breakeven-or-better exit no longer starts the re-entry cooldown — only a realized LOSS does.
+  `apply_decision.py` gates on `realized < 0`; `live_execute.py` reconcile gates on `stop_price <
+  entry` (fill price unknown on that path). Tests added (suite 176/43).
+- **Breakeven destination cushioned (owner, same day): `TRAIL_BREAKEVEN_OFFSET_PCT=1.0`** — the rung
+  now lifts to `entry × 1.01`, not entry flat. "+1%, a good compromise": covers the ~0.3% round-trip
+  cost (a stop-out is now TRULY no-loss, not a fee-sized loss) and locks ~+0.7% net. New live-only knob
+  threaded through `tick_context._build_caps` → `live_execute.trail_stop_price`; backtest parity via
+  `pol["be_off"]` in `backtest_exit_policy.simulate`. Must stay < `TRAIL_BREAKEVEN_AT_PCT`. Grandfather
+  re-checked: all 7 peak-≥5% lots still above `entry×1.01` → no immediate sells. Tests: `test_breakeven_offset_lifts_above_entry` (suite 179/44).
+
+**be5 and trail3@8 COMPOSE — they are not alternatives (the upgrade path).** The breakeven rung and the
+trail rung stack (`live_execute.trail_stop_price` takes the highest engaged stop). So be5 (+offset) is the
+trustworthy no-loss FLOOR shipped now; the §A13.2 disco `trail3@8` profit-lock layers ON TOP later, IF the
+§A12 intraday tape confirms a tight trail survives at the 30-RT checkpoint. Head-to-head on daily bars
+(stop12/tp40, 15bps): be5 = LARGE +0.96%/−0.30%/46%, disco +0.32%/−0.30%/25%; trail3@8 = LARGE
++0.80%/+1.98%/57%, disco +0.78%/+3.42%/57% — trail3@8 wins the BACKTEST (esp. disco) but is exactly the
+daily-bar mirage (a 3% trail can't be seen at daily resolution), whereas be5's number is HONEST (a
+breakeven stop sits far below price, cannot whipsaw on the upside). So: ship be5 blind (done), earn
+trail3@8 at the tape checkpoint, then run BOTH (floor + profit-lock), not one-or-the-other.
+
+This does NOT touch the §A12/§A13 disco-trail checkpoint work — those remain frozen pending the tape.

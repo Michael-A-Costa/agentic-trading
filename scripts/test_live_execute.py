@@ -192,6 +192,30 @@ def test_reconcile_pending_not_booked_closed():
     check("no cooldown for unfilled entry", "PEND" not in (state.get("last_exit") or {}))
 
 
+def test_reconcile_losing_exit_stamps_cooldown():
+    # OWNER RULE 2026-06-12: a LOSING exit (stop resting BELOW entry = the catastrophe floor) cools
+    # the name down as before.
+    state = {"lots": {"LOSS": {"qty": 4, "entry_price": 50.0, "stop_price": 44.0,
+                               "resting_stop_order_id": "s1"}}, "_caps": {}}
+    le.reconcile(state, {"positions": {}, "orders": [], "quotes": {}}, log := [])
+    check("losing exit booked closed", any(e["event"] == "closed_external" for e in log))
+    check("losing exit stamps cooldown", "LOSS" in (state.get("last_exit") or {}))
+
+
+def test_reconcile_breakeven_exit_skips_cooldown():
+    # OWNER RULE 2026-06-12: a BREAKEVEN-or-better exit (stop resting AT/ABOVE entry — be5 lifted it,
+    # or a green trail/TP) is not a whipsaw loss, so it does NOT cool the name down — the stock is
+    # instantly re-buyable if it turns back up. Lot still booked as a real closure.
+    state = {"lots": {"FLAT": {"qty": 4, "entry_price": 50.0, "stop_price": 50.0,
+                               "resting_stop_order_id": "s1"},
+                      "GREEN": {"qty": 4, "entry_price": 50.0, "stop_price": 53.0,
+                                "resting_stop_order_id": "s2"}}, "_caps": {}}
+    le.reconcile(state, {"positions": {}, "orders": [], "quotes": {}}, log := [])
+    check("breakeven exit still booked closed", sum(e["event"] == "closed_external" for e in log) == 2)
+    check("breakeven (stop==entry) skips cooldown", "FLAT" not in (state.get("last_exit") or {}))
+    check("green (stop>entry) skips cooldown", "GREEN" not in (state.get("last_exit") or {}))
+
+
 def test_reconcile_adoption_distinct_costs():
     """Adopting two never-tracked broker positions derives each lot's stop/TP from ITS OWN avg
     cost. A copy/aliasing bug in the adoption path would hand adopted lots identical risk levels —
@@ -265,6 +289,23 @@ def test_breakeven_rung_lifts_to_entry():
     lot["stop_price"], lot["high_water"] = ns, hw
     ns, _ = le.trail_stop_price(lot, caps, 105.0)            # pullback: holds at breakeven
     check("breakeven holds on pullback", ns is None, ns)
+
+
+def test_breakeven_offset_lifts_above_entry():
+    # OWNER RULE 2026-06-12: TRAIL_BREAKEVEN_OFFSET_PCT lifts the rung to entry x (1+off%) — a TRUE
+    # no-loss floor (+1% covers round-trip cost + locks a small gain), not entry exactly.
+    caps = {"STOP_LOSS_PCT": 12.0, "TRAIL_BREAKEVEN_AT_PCT": 5.0,
+            "TRAIL_BREAKEVEN_OFFSET_PCT": 1.0, "TRAIL_MIN_STEP_PCT": 0.0}
+    lot = {"entry_price": 100.0, "stop_price": 88.0, "high_water": 100.0}
+    ns, _ = le.trail_stop_price(lot, caps, 104.0)            # +4% < 5% -> not yet
+    check("offset rung not engaged below trigger", ns is None, ns)
+    ns, hw = le.trail_stop_price(lot, caps, 106.0)           # +6% -> lift to entry*1.01 = 101.0
+    check("offset lifts stop to entry+1%", ns == 101.0 and hw == 106.0, (ns, hw))
+    # offset=0 keeps the literal-breakeven behavior (regression guard for the default).
+    caps0 = {**caps, "TRAIL_BREAKEVEN_OFFSET_PCT": 0.0}
+    lot0 = {"entry_price": 100.0, "stop_price": 88.0, "high_water": 100.0}
+    ns0, _ = le.trail_stop_price(lot0, caps0, 106.0)
+    check("offset 0 lifts to entry exactly", ns0 == 100.0, ns0)
 
 
 def test_breakeven_and_trail_compose():
@@ -881,9 +922,11 @@ if __name__ == "__main__":
              test_buying_power_fallback_to_cash, test_order_obj_and_place_failure,
              test_reconcile_books_close, test_reconcile_adopted_close_also_booked,
              test_reconcile_pending_not_booked_closed,
+             test_reconcile_losing_exit_stamps_cooldown, test_reconcile_breakeven_exit_skips_cooldown,
              test_trail_off_by_default, test_trail_ratchets_up_and_never_down,
              test_trail_min_step_guard, test_trail_floored_at_initial_stop,
-             test_breakeven_rung_lifts_to_entry, test_breakeven_and_trail_compose,
+             test_breakeven_rung_lifts_to_entry, test_breakeven_offset_lifts_above_entry,
+             test_breakeven_and_trail_compose,
              test_next_settle_date_skips_weekends, test_settled_buying_power_is_broker_bp_not_double_counted,
              test_settled_guard_off_returns_raw_bp,
              test_pack_entries_uses_leftover_cash_for_smaller_buys,

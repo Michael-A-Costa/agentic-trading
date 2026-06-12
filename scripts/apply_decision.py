@@ -93,7 +93,7 @@ def decide_summary(filled: list, rejected: list, decision: dict, equity, day_pnl
       - nothing happened and no candidates -> the screen rationale
     """
     parts = [f"{r['side'].upper()} {r.get('qty', '?')} {r['symbol']} @ {r.get('price', '?')}"
-             f" — {str(r.get('reason', ''))[:60]}" for r in filled]
+             f" — {' '.join(str(r.get('reason', '')).split())}" for r in filled]
     # A post-commit cap rejection is its own important 'why': the LLM wanted in, a guardrail blocked it.
     rej = [f"{r['symbol']} {r['side']} REJECTED: {r.get('reject_reason')}" for r in rejected]
     if parts or rej:
@@ -104,9 +104,9 @@ def decide_summary(filled: list, rejected: list, decision: dict, equity, day_pnl
     dd = decision.get("dd") or []
     if dd:
         why = " ; ".join(f"{d.get('symbol')} {(d.get('decision') or '?').upper()}: "
-                         f"{(d.get('reason') or d.get('error') or '').strip()[:90]}" for d in dd)
+                         f"{' '.join((d.get('reason') or d.get('error') or '').split())}" for d in dd)
         return f"HOLD — 0 of {len(dd)} candidate(s) committed: {why}"
-    return f"HOLD ({decision.get('rationale', 'no action')[:80]})"
+    return f"HOLD ({' '.join(str(decision.get('rationale', 'no action')).split())})"
 
 
 def cand_last(context: dict, sym: str) -> float | None:
@@ -365,9 +365,13 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
     scale_tiers = action.get("scale_tiers")
     if remaining <= 1e-9:
         del positions[sym]
-        # Full exit: start the re-entry cooldown (anti-whipsaw). A partial scale-out does NOT —
-        # the name is still held, and cooldown only governs re-ENTERING a name we've fully left.
-        state.setdefault("last_exit", {})[sym] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        # Full exit: start the re-entry cooldown (anti-whipsaw) ONLY on a LOSING exit. A partial
+        # scale-out does NOT — the name is still held, and cooldown only governs re-ENTERING a name
+        # we've fully left. OWNER RULE 2026-06-12: a breakeven-or-better exit is not a whipsaw loss,
+        # so it does NOT cool the name down — if a stock we scratched at +0% turns back up and
+        # re-qualifies, we're free to re-enter immediately. Only a realized LOSS earns the cooldown.
+        if realized < 0:
+            state.setdefault("last_exit", {})[sym] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     else:
         positions[sym]["qty"] = remaining
         if scale_tiers:

@@ -462,15 +462,17 @@ def trail_stop_price(lot: dict, caps: dict, last: float | None) -> tuple[float |
         trail = disco_trail
         trail_act = caps.get("DISCO_TRAIL_ACTIVATE_PCT", 0.0) or 0.0
     be_at = caps.get("TRAIL_BREAKEVEN_AT_PCT", 0.0) or 0.0
+    be_off = caps.get("TRAIL_BREAKEVEN_OFFSET_PCT", 0.0) or 0.0  # lift to entry x (1+be_off%), not entry flat
     if trail <= 0 and be_at <= 0:
         return None, hw  # both rungs off — leave the fixed STOP_LOSS_PCT stop as-is
 
     # A stop SCHEDULE (ratchet-only), composed of independent rungs; take the highest that's engaged:
     candidates = []
-    #  rung 1 — breakeven: once up TRAIL_BREAKEVEN_AT_PCT, lift the stop to entry ("no give-back to a
-    #  loss"). One-time; cannot whipsaw on the upside (it sits far below price).
+    #  rung 1 — breakeven: once up TRAIL_BREAKEVEN_AT_PCT, lift the stop to entry x (1 + be_off%) — a
+    #  TRUE no-loss floor (the offset covers round-trip cost + a small locked gain; owner 2026-06-12).
+    #  One-time; cannot whipsaw on the upside (it sits well below price as long as be_off < be_at).
     if be_at > 0 and gain_pct >= be_at:
-        candidates.append(entry)
+        candidates.append(entry * (1 + be_off / 100.0))
     #  rung 2 — continuous trail: once up TRAIL_ACTIVATE_PCT, ride TRAIL_STOP_PCT below the high-water
     #  mark, scaling UP with every new high.
     if trail > 0 and gain_pct >= trail_act:
@@ -713,7 +715,15 @@ def reconcile(state: dict, broker: dict, log: list) -> None:
                 else:
                     log.append({"event": "entry_unfilled", "symbol": sym, "order_id": eoid})
                 continue
-            state.setdefault("last_exit", {})[sym] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            # Re-entry cooldown (anti-whipsaw) — OWNER RULE 2026-06-12: only a LOSING exit cools a
+            # name down. The broker fill price isn't in the snapshot, so use the lot's last stop as
+            # the proxy (same estimate as realized_est_usd below): a stop resting AT or ABOVE entry
+            # means it left via the breakeven rung (be5) or a green trail/TP — not a loss — so we do
+            # NOT stamp a cooldown, and the name is instantly re-buyable if it turns back up. A stop
+            # below entry (the -12% catastrophe floor) is a real loss → cooldown. Unknown → cooldown.
+            _en, _sp = _f(stale.get("entry_price")), _f(stale.get("stop_price"))
+            if _en is None or _sp is None or _sp < _en - 1e-9:
+                state.setdefault("last_exit", {})[sym] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             if stale.get("closing_order_id"):
                 # engine-initiated exit completing — the sell is already in the trade history from
                 # the placing tick, so just confirm it (no second trade row; P6 no-double-count).

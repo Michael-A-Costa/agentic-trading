@@ -160,6 +160,7 @@ def _build_caps(equity: float, sod_equity: float) -> dict:
         "TRAIL_STOP_PCT": envf("TRAIL_STOP_PCT", 0.0),
         "TRAIL_ACTIVATE_PCT": envf("TRAIL_ACTIVATE_PCT", 0.0),
         "TRAIL_BREAKEVEN_AT_PCT": envf("TRAIL_BREAKEVEN_AT_PCT", 0.0),
+        "TRAIL_BREAKEVEN_OFFSET_PCT": envf("TRAIL_BREAKEVEN_OFFSET_PCT", 0.0),
         "TRAIL_MIN_STEP_PCT": envf("TRAIL_MIN_STEP_PCT", 0.5),
         "SIGNAL_THRESHOLD_PCT": envf("SIGNAL_THRESHOLD_PCT", 2.0),
         "GAP_THRESHOLD_PCT": envf("GAP_THRESHOLD_PCT", 7.0),

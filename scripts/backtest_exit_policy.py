@@ -98,7 +98,7 @@ def simulate(bars, i, entry, hold, pol):
         gain = (hw / entry - 1) * 100.0
         cands = [floor]
         if be is not None and be > 0 and gain >= be:
-            cands.append(entry)
+            cands.append(entry * (1 + pol.get("be_off", 0.0) / 100.0))  # be_off: lift above entry (live parity)
         if trail > 0 and gain >= act:
             cands.append(hw * (1 - trail / 100.0))
         nxt = max(cands)
