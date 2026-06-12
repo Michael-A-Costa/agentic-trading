@@ -423,3 +423,58 @@ the append-only ledger is never edited) carries ENTRY-TIME vol from probe caches
 before each fill (CAVA 13:30 ET vs 13:46 entry; UEC 09:35 vs 09:37) and ALOY's 130% from the buy
 thesis itself. The replay falls back to it, so the one wicked remnant — the motivating data
 point — stays scorable on the vscale variants.
+
+### A13. Breakeven-trigger + full trail×activate grid (2026-06-12, owner "+5% → breakeven" question, NO dial change).
+Owner asked: once a lot is up +5–6%, lift the stop to breakeven / start trailing — "I don't want a
++6% win to drop to a −8% loss" (motivating live lot: HROW, disco, +6.4% @ 39.68 sitting on its
+−12% hard stop, entry 37.30). Two sweeps run through `backtest_exit_policy.py` (curated be-rungs
+kept in the file) and a new exhaustive grid, `backtest_trail_activate_grid.py`. Daily Cboe bars
+(the §A12 caveat applies and is the crux below). All numbers net 15bps/leg, hold 15d.
+
+**1. Breakeven-trigger sweep (be5/be6/be8/be12 on the live config) — a low breakeven is the WORST rung.**
+The cost scales smoothly with how early it triggers; the earlier the trigger, the more winners it
+amputates to scratches (win% collapse is the tell):
+
+| rung | LARGE/pead mean·med·win | movers/disco mean·med·win |
+|---|---|---|
+| current (be12, **already live**) | +1.42% · +0.80% · 52% | +0.79% · −0.30% · 38% |
+| be8  | +1.24% · +0.11% · 50% | +0.76% · −0.30% · 33% |
+| be6  | +1.22% · −0.30% · 48% | +0.42% · −0.30% · 28% |
+| **be5 (owner idea)** | **+0.96% · −0.30% · 46%** | **+0.32% · −0.30% · 25%** |
+
+Verdict: be5 is dominated (costliest mean AND weakest protection — the wall sits at entry, ~5–6%
+below current price, easily tagged). A breakeven ratchet must trigger HIGH (≥12); `be12` is ~free
+on LARGE and is already live, applying to BOTH books (`live_execute.py:464`). So HROW is not naked
+— its protection arms at +10% (disco ladder harvest) / +12% (be12), it just hadn't earned them at
++6.4%.
+
+**2. Full trail×activate grid (288 combos: trail∈{3..20} × activate∈{5..20}, stop12/tp40/be12 fixed).**
+Clean mean↔median diagonal on both books: **wide trail / late activation → max mean** (SE corner,
+≈ today's let-run-ish behavior); **tight / early → max median & win%** (NW corner).
+- **LARGE/pead — no free lunch.** trail3@act7 lifts median +0.80%→+2.13% but costs mean +1.42%→+0.82%
+  (≈ −0.6%/trade). Monotonic, real, paid.
+- **MIDCAP/disco — an APPARENT free lunch.** `trail3@act8` = mean **+0.78%** (≈ current +0.79%) with
+  median **+3.42%** (vs current −0.30%). Same growth, give-back transformed. `trail4@act8` ≈ same.
+
+**THE CATCH (why this is a hypothesis, not a recommendation):** the trail3 row is exactly where
+daily bars lie most. A 3% trail only fires when a *daily low* prints 3% below the running peak —
+daily bars are blind to the intraday wick that would trip it repeatedly live (the ALOY shape, A11).
+So the disco "free lunch" is plausibly a daily-bar mirage, and it's the SAME 3%-width question §A12
+is already collecting 1-min tape to answer — this session just adds the *activation* axis to it.
+
+**3. Live counterfactual run (6/12) — 0 scored, as expected.** `exit_counterfactual.py --book disco`:
+9 disco round-trips, 8 PARTIAL (opened <2d ago, replay still running), 0 scored. `--remnant`: 3
+harvests (ALOY no tape; CAVA/UEC gappy) — all fired at the 9:30 ET open, BEFORE the A12 tape was
+enabled (~10:20 ET, owner turned on sentinel market-tracking mid-session; commit `9bd2434` @ 10:26
+ET). **Diagnosed: cold-start, NOT a bug** — sentinel tapes every 60s/all held lots/live-hours, so
+coverage is automatic from the next open. The 6/12 harvests are PRE-TAPE → **excluded from the
+§A12/§A9 30-round-trip count.** Faint hint only: flat2 already shows "too tight" (clipped UEC at
++11.22% where 3%+ rode to +13.34%); 3%+ indistinguishable on the short tape. Keep flat3.
+
+**→ CHECK AT THE 30-ROUND-TRIP CHECKPOINT (§A9/§A12 binding decision):** when the tape has ~30
+scored disco harvests, the §A12 remnant-width decision (flat3 vs variants) is the linchpin for BOTH
+questions — if tight trails get whipsawed intraday, the disco trail3@act8 "free lunch" (§A13.2) dies
+with flat3; if flat3 survives intraday, the whole-lot tight-early trail earns its own pre-registered
+tape test. Do NOT adopt trail3@act8 (or any tight-early trail) off the daily grid. be5/low-breakeven
+is settled (rejected, §A13.1) — no checkpoint needed. Repro: `backtest_trail_activate_grid.py`,
+`backtest_exit_policy.py` (be-rungs + giveback rows).

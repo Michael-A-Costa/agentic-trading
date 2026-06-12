@@ -154,6 +154,16 @@ def main() -> int:
         # softcutN = exit at the close of a down day N% underwater; crit65 = exit at the close once
         # 65% of the way down to the catastrophe stop (~-7.8% with stop12).
         ("LIVE cfg (stop12 tp40 tr15a20)", {"stop": 12, "tp": 40, "trail": 15, "activate": 20}),
+        ("LIVE + be5  (owner idea)",       {"stop": 12, "tp": 40, "trail": 15, "activate": 20, "be": 5}),
+        ("LIVE + be6",                     {"stop": 12, "tp": 40, "trail": 15, "activate": 20, "be": 6}),
+        ("LIVE + be8",                     {"stop": 12, "tp": 40, "trail": 15, "activate": 20, "be": 8}),
+        ("LIVE + be12",                    {"stop": 12, "tp": 40, "trail": 15, "activate": 20, "be": 12}),
+        # giveback-cap: ratchet a stop up once GREEN (+6%), but to a small-loss floor (trail), not entry.
+        ("giveback trail15 @act6",         {"stop": 12, "tp": 40, "trail": 15, "activate": 6}),
+        ("giveback trail10 @act6",         {"stop": 12, "tp": 40, "trail": 10, "activate": 6}),
+        ("giveback trail8  @act6",         {"stop": 12, "tp": 40, "trail": 8,  "activate": 6}),
+        ("giveback trail10 @act6 + be12",  {"stop": 12, "tp": 40, "trail": 10, "activate": 6, "be": 12}),
+        ("LIVE + be10",                    {"stop": 12, "tp": 40, "trail": 15, "activate": 20, "be": 10}),
         ("LIVE + softcut4",                {"stop": 12, "tp": 40, "trail": 15, "activate": 20, "softcut": 4}),
         ("LIVE + softcut6",                {"stop": 12, "tp": 40, "trail": 15, "activate": 20, "softcut": 6}),
         ("LIVE + softcut8",                {"stop": 12, "tp": 40, "trail": 15, "activate": 20, "softcut": 8}),
