@@ -126,6 +126,10 @@ def fill_to_trade(res: dict, *, ts_utc: str, ts_et: str | None, mode: str) -> di
             row["realized_est_usd"] = res["realized_est_usd"]  # flagged estimate (live place-time)
         if res.get("scale_tiers") is not None:
             row["scale_tiers"] = res["scale_tiers"]
+        # manage-DD A/B attribution (which model produced this trim/exit) -> exit_counterfactual split
+        for k in ("manage_arm", "manage_model"):
+            if res.get(k) is not None:
+                row[k] = res[k]
         row["exit_type"] = classify_exit(res.get("reason", ""))
     return row
 

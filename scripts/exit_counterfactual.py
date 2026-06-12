@@ -107,7 +107,10 @@ def round_trips_with_meta(rows: list[dict]) -> list[dict]:
             trips.append({"symbol": sym, "qty": take, "entry_price": lot[1],
                           "entry_date": lot[2], "book": lot[3],
                           "exit_price": float(price), "exit_date": date,
-                          "exit_type": r.get("exit_type", "other")})
+                          "exit_type": r.get("exit_type", "other"),
+                          # manage-DD A/B arm that produced this exit (None for stop/EOD/TP exits)
+                          "manage_arm": r.get("manage_arm"),
+                          "manage_model": r.get("manage_model")})
             lot[0] -= take
             remaining -= take
             if lot[0] <= 1e-9:
@@ -341,6 +344,15 @@ def main() -> int:
     agg("ALL COMPLETE", complete)
     for book in sorted({r["book"] for r in complete}):
         agg(f"book={book}", [r for r in complete if r["book"] == book])
+    # manage-DD A/B split: compare realized exits of round-trips a manage model trimmed/exited.
+    # Only round-trips whose exit was manage-driven carry an arm; stop/EOD/TP exits are untagged.
+    manage_trips = [r for r in complete if r.get("manage_arm")]
+    if manage_trips:
+        print("\n--- manage-DD A/B (manage-driven exits only) ---")
+        for arm in sorted({r["manage_arm"] for r in manage_trips}):
+            sub = [r for r in manage_trips if r["manage_arm"] == arm]
+            model = next((r.get("manage_model") for r in sub if r.get("manage_model")), "?")
+            agg(f"arm {arm} [{model}]", sub)
     if partial:
         print(f"\n{len(partial)} PARTIAL row(s) excluded from aggregates "
               f"(counterfactual still running — re-run after more sessions)")

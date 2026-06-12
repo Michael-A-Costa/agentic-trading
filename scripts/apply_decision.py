@@ -134,6 +134,9 @@ def validate_and_fill(action: dict, context: dict, state: dict, caps: dict) -> d
     side = str(action.get("side", "")).lower().strip()
     reason = str(action.get("reason", "")).strip()
     result: dict[str, object] = {"symbol": sym, "side": side, "reason": reason, "status": "rejected"}
+    for k in ("manage_arm", "manage_model"):  # A/B attribution rides action -> fill -> trade row
+        if action.get(k) is not None:
+            result[k] = action[k]
 
     if not sym or side not in ("buy", "sell"):
         result["reject_reason"] = "bad symbol/side"

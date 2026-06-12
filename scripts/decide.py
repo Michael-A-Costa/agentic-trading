@@ -15,6 +15,7 @@ gathering is scripts.
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import math
 import os
@@ -682,6 +683,25 @@ def route_book(res: dict, c: dict | None = None) -> str:
     return "pead" if mktcap >= floor else "disco"
 
 
+def manage_arm(sym: str) -> tuple[str, str]:
+    """A/B arm + model for one holding's manage-DD. Returns (arm_label, model_id).
+
+    DETERMINISTIC per symbol (sha1, not the salted built-in hash()) so a holding is managed by
+    ONE model for its WHOLE life — mixing Haiku and Sonnet across a single round-trip's manage
+    decisions would make exit_counterfactual's per-arm attribution meaningless. Default OFF
+    (MANAGE_AB_ENABLED=0) -> everything is arm A on DD_MODEL_MANAGE, i.e. no behaviour change."""
+    model_a = os.environ.get("DD_MODEL_MANAGE", "claude-haiku-4-5-20251001")
+    if os.environ.get("MANAGE_AB_ENABLED", "0") != "1":
+        return ("A", model_a)
+    model_b = os.environ.get("DD_MODEL_MANAGE_B", "claude-sonnet-4-6")
+    try:
+        split = float(os.environ.get("MANAGE_AB_SPLIT", "0.5"))
+    except ValueError:
+        split = 0.5
+    bucket = int(hashlib.sha1(sym.upper().encode()).hexdigest(), 16) % 1000
+    return ("B", model_b) if bucket < split * 1000 else ("A", model_a)
+
+
 def run_manage_dd(p: dict, regime: dict, caps: dict, portfolio: dict, dd_model: str) -> dict:
     """Tier-2: re-assess ONE held position on FRESH data + news. Returns
     {action: keep|trim|exit|add, trim_fraction, add_dollars, conviction, hold_intent, reason}.
@@ -756,8 +776,8 @@ def main() -> int:
     regime = context.get("regime", {})
     dd_model = os.environ.get("DD_MODEL", "claude-sonnet-4-6")
     # Manage DDs (keep/trim/exit on held positions) use a lighter model by default — the prompt
-    # is shorter and the decision is simpler than a fresh entry DD.
-    manage_model = os.environ.get("DD_MODEL_MANAGE", "claude-haiku-4-5-20251001")
+    # is shorter and the decision is simpler than a fresh entry DD. The per-holding model (and the
+    # optional Haiku-vs-Sonnet A/B) is resolved inside manage_arm() at dispatch time.
     max_dd = int(os.environ.get("MAX_DD_CANDIDATES", "2"))
 
     # --- Stage 1 is now DETERMINISTIC (computed in tick_context.py) — just read it ---
@@ -1089,9 +1109,10 @@ def main() -> int:
                 pm = {"cash": context["portfolio"]["cash"],
                       "exposure": context["portfolio"].get("positions_value", 0.0)}
                 mfresh = {}
+                arms = {p["symbol"]: manage_arm(p["symbol"]) for p in due_ps}  # (arm, model) per holding
                 workers = min(len(due_ps), int(os.environ.get("DD_MAX_PARALLEL", "4")))
                 with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-                    futs = {ex.submit(run_manage_dd, p, regime, caps, pm, manage_model): p["symbol"]
+                    futs = {ex.submit(run_manage_dd, p, regime, caps, pm, arms[p["symbol"]][1]): p["symbol"]
                             for p in due_ps}
                     for fut in concurrent.futures.as_completed(futs):
                         s = futs[fut]
@@ -1106,12 +1127,15 @@ def main() -> int:
                     if not res:
                         continue
                     prisk = p.get("risk") or {}
+                    arm, arm_model = arms.get(sym, ("A", None))  # A/B attribution for this exit/trim
+                    res["manage_arm"], res["manage_model"] = arm, arm_model
+                    ab = {"manage_arm": arm, "manage_model": arm_model}  # rides the action -> trade row
                     mcache[sym] = {"ts": now, "band": prisk.get("band"),
                                    "ttl_min": prisk.get("redd_ttl_min"), "result": res}
                     manage_results.append(res)
                     act = res.get("action")
                     if act == "exit":
-                        actions.append({"symbol": sym, "side": "sell",
+                        actions.append({"symbol": sym, "side": "sell", **ab,
                                         "reason": f"[manage/exit] {res.get('reason', '')}"})
                     elif act == "trim" and res.get("trim_fraction"):
                         try:
@@ -1134,7 +1158,7 @@ def main() -> int:
                                                  "legs whole-share (P2)\n")
                                 qty = 0.0
                         if qty > 0:
-                            actions.append({"symbol": sym, "side": "sell", "qty": qty,
+                            actions.append({"symbol": sym, "side": "sell", "qty": qty, **ab,
                                             "reason": f"[manage/trim {int(frac * 100)}%] {res.get('reason', '')}"})
                     elif act == "add" and res.get("add_dollars"):
                         try:

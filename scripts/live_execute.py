@@ -741,6 +741,9 @@ def execute_sell(sym: str, action: dict, state: dict, broker: dict, caps: dict, 
     import rh_mcp
     lots = state["lots"]
     res = {"symbol": sym, "side": "sell", "reason": action.get("reason", ""), "status": "skipped"}
+    for k in ("manage_arm", "manage_model"):  # A/B attribution rides action -> fill -> trade row
+        if action.get(k) is not None:
+            res[k] = action[k]
     if sym not in broker["positions"]:
         res["reject_reason"] = "no broker position to sell"
         return res
