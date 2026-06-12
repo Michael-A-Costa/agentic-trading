@@ -172,8 +172,8 @@ def _blotter_line(row: dict) -> str:
         if row.get("exit_type"):
             extra.append(EXIT_LABEL.get(row["exit_type"], row["exit_type"]))
     tag = f"  ({', '.join(extra)})" if extra else ""
-    reason = str(row.get("reason") or "").strip()
-    rtxt = f"  — {reason[:80]}" if reason else ""
+    reason = " ".join(str(row.get("reason") or "").split())  # collapse newlines -> single bullet
+    rtxt = f"  — {reason}" if reason else ""
     # placed != filled (P6): a live "placed" order is an INTENT until confirmed; "dead" never filled.
     status = str(row.get("status") or "")
     flag = {"filled": "", "placed": "  [placed — fill unconfirmed]",

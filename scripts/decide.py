@@ -390,7 +390,7 @@ def fmt_dd_line(d: dict) -> str:
         src = "fresh"
     reason = (d.get("reason") or d.get("error") or "(no reason given)").strip().replace("\n", " ")
     size = f" ${d.get('dollar_amount')} {d.get('conviction')}" if dec == "COMMIT" else ""
-    return f"  DD {sym}: {dec} [{src}]{size} — {reason[:300]}"
+    return f"  DD {sym}: {dec} [{src}]{size} — {reason}"
 
 
 def run_dd(c: dict, regime: dict, caps: dict, portfolio: dict, dd_model: str) -> dict:
@@ -1237,7 +1237,7 @@ def main() -> int:
     print(f"DD: {n_commit} commit / {n_reject} reject / {n_error} error -> {len(actions)} action(s)")
     for m in manage_results:
         print(f"  MANAGE {m.get('symbol')}: {(m.get('action') or '?').upper()} — "
-              f"{(m.get('reason') or m.get('error') or '')[:90]}")
+              f"{' '.join((m.get('reason') or m.get('error') or '').split())}")
     if manage_results:
         n_act = sum(1 for m in manage_results if m.get('action') in ('trim', 'exit', 'add'))
         print(f"MANAGE: {len(manage_results)} holding(s) re-checked, {n_act} acted")
