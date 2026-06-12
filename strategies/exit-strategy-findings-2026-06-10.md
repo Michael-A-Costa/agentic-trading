@@ -531,3 +531,20 @@ the floor; CAVA/UEC ≥+8% already trailed). **Two consequences to watch:**
 The §A13.1 verdict (be5 costs mean) and §A13.2 (trail3@8 is the daily-bar mirage) still stand as
 research truth; A15 records that the owner chose to run them live anyway, floor-protected, ahead of
 the tape — a deliberate, reversible experiment, not a refutation of the backtest.
+
+**A15b — "now that the trail follows it up, can we drop the 75% harvest?" Answered: NO, keep it.**
+Owner asked if the harvest is now redundant with the trail. Ran the head-to-head on `backtest_remnant.py`
+(MOV-M, 1840 entries, be5 floor, identical 3% trail, only varying harvest-vs-not), 6-slot sim:
+
+| config | mean | port_x | port_pr |
+|---|---|---|---|
+| HARVEST 75%@10 + tr3@8 (live) | +0.50% | 3.02x | **3.79x** |
+| WHOLE-LOT tr3@8 (no harvest)  | +0.51% | 2.96x | **2.96x** |
+
+Per-trade mean is a wash (+0.50 vs +0.51, noise). The decision is entirely capital velocity, and the
+accounting that matches the cash account — `port_pr` (each sold fraction frees its slot share that day,
+mirroring T+1 settlement) — says removing the harvest is a **~22% terminal-equity haircut (3.79x→2.96x)**.
+`port_x` (pessimistic, slot busy till last share) shows them near-tied (3.02 vs 2.96) but that's the wrong
+accounting for a cash account — the harvest's edge is the recycled 75%, which only `port_pr` credits.
+So trail and harvest are COMPLEMENTARY, not redundant: trail = follow-up/give-back protection, harvest =
+guaranteed +10% bank + capital recycling (which the trail can't do, and which binds per A4). Harvest STAYS.
