@@ -848,17 +848,36 @@ def main() -> int:
         # formula) drops below a usable lot and EVERY entry rejects on that single portfolio-wide
         # constraint — nothing to do with the name. Skip Stage-2 entirely so we don't burn N ~85s
         # Sonnet+web DD calls per tick re-rejecting the same top movers; log one "book full" line.
-        # Threshold defaults to MIN_POSITION_USD (or $25 if unset); tune via MIN_ENTRY_HEADROOM_USD.
+        # Headroom is sized off SETTLED buying power (what the executor can actually spend), NOT NAV
+        # cash: NAV can look ample while settled BP is ~0 (unsettled T+1 proceeds), which is exactly
+        # when every commit then defers "no settled cash" at execution — a full DD pass burned on names
+        # we can't buy. Paper has no settling, so settled_buying_power falls back to full cash there.
+        spendable = portfolio["cash"]
+        sbp = context["portfolio"].get("settled_buying_power")
+        if sbp is not None:
+            spendable = sbp
         headroom = max(0.0, min(caps["MAX_POSITION_USD"],
                                 caps["MAX_TOTAL_EXPOSURE_USD"] - portfolio["exposure"],
-                                portfolio["cash"]))
+                                spendable))
         min_headroom = float(os.environ.get("MIN_ENTRY_HEADROOM_USD",
                                             caps.get("MIN_POSITION_USD") or 25.0))
-        book_full = headroom < min_headroom
+        # No-deployable-cash gate (owner: "no cash -> just monitor positions, skip new DD"). The floor
+        # is the smallest entry we'd actually place — the lowest conviction tier, 0.35x MAX_POSITION_USD
+        # — so a settled balance that can't fund even a minimal bet turns the whole entry/DD pass off
+        # while the manage wave below still runs on held positions. Tunable via MIN_ENTRY_SETTLED_USD.
+        min_entry_cash = float(os.environ.get("MIN_ENTRY_SETTLED_USD")
+                               or round(float(caps["MAX_POSITION_USD"]) * 0.35, 2))
+        exp_headroom = caps["MAX_TOTAL_EXPOSURE_USD"] - portfolio["exposure"]
+        no_cash = spendable < min_entry_cash and spendable <= exp_headroom
+        book_full = headroom < min_headroom or no_cash
         if book_full:
-            book_full_note = (f"${headroom:.2f} headroom (exposure {portfolio['exposure']:.0f}"
-                              f"/{caps['MAX_TOTAL_EXPOSURE_USD']:.0f}, "
-                              f"{portfolio['open_positions']} pos) < usable lot")
+            if no_cash:
+                book_full_note = (f"${spendable:.2f} settled cash < ${min_entry_cash:.0f} min entry — "
+                                  f"no deployable cash, monitoring positions only")
+            else:
+                book_full_note = (f"${headroom:.2f} headroom (exposure {portfolio['exposure']:.0f}"
+                                  f"/{caps['MAX_TOTAL_EXPOSURE_USD']:.0f}, "
+                                  f"{portfolio['open_positions']} pos) < usable lot")
 
         # Consider EVERY candidate — serving a same-day cached verdict is free (no LLM call), so the
         # per-tick fresh-DD budget (max_dd) must NOT hide a candidate that already has a commit/reject
@@ -1129,7 +1148,7 @@ def main() -> int:
     rationale = (f"{len(exits)} rule-exit(s), {len(candidates)} screened candidate(s)"
                  + (" [acute risk-off: entries off]" if screen.get("hostile_regime") else "")
                  + (" [downtrend: PEAD-only entries, sized x0.6]" if screen.get("downtrend_pead_only") else "")
-                 + (f" [book full: {book_full_note} — entries skipped]" if book_full else "")
+                 + (f" [entries off: {book_full_note}]" if book_full else "")
                  + (" [entries gated: market closed/stale]" if not context.get("allow_entries") else ""))
     decision_out = {
         "actions": actions,
@@ -1153,7 +1172,7 @@ def main() -> int:
         print(f"screen: {len(exits)} exit(s), {len(candidates)} candidate(s): "
               + ", ".join(fmt_candidate(c) for c in candidates))
         if book_full:
-            print(f"  BOOK FULL: {book_full_note} — Stage-2 entries skipped this tick")
+            print(f"  ENTRIES OFF: {book_full_note} — Stage-2 entries skipped this tick")
     else:
         # No candidates -> say why (gate / regime / nothing cleared the bar), not just "0".
         if not context.get("allow_entries"):
@@ -1165,12 +1184,19 @@ def main() -> int:
         print(f"screen: {len(exits)} exit(s), 0 candidate(s){note}")
     for d in dd_results:
         print(fmt_dd_line(d))
-    # Cache hits are all in dd_results, so this only counts cache-MISS candidates deferred by the
-    # fresh-DD budget (book-full has its own line above and is excluded here).
+    # Cache hits are all in dd_results, so this only counts cache-MISS candidates that didn't produce
+    # a verdict THIS tick (book-full has its own line above and is excluded here). The reason differs by
+    # mode: ASYNC dispatches every miss to a background worker whose verdict lands a LATER tick (so this
+    # is normal handoff, NOT the max_dd cap throttling — that cap rarely binds once async decouples DD
+    # from tick latency); SYNC truncates the fresh batch at MAX_DD_CANDIDATES.
     not_dd = len(candidates) - len(dd_results)
     if context.get("allow_entries") and not book_full and not_dd > 0:
-        print(f"  (+{not_dd} candidate(s) deferred — MAX_DD_CANDIDATES={max_dd} caps FRESH DDs/tick; "
-              f"cached verdicts always served)")
+        if async_on:
+            print(f"  (+{not_dd} candidate(s) pending async DD — cache-misses run in detached "
+                  f"workers; verdicts act a later tick, cached verdicts always served)")
+        else:
+            print(f"  (+{not_dd} candidate(s) deferred — MAX_DD_CANDIDATES={max_dd} caps FRESH DDs/tick; "
+                  f"cached verdicts always served)")
     print(f"DD: {n_commit} commit / {n_reject} reject / {n_error} error -> {len(actions)} action(s)")
     for m in manage_results:
         print(f"  MANAGE {m.get('symbol')}: {(m.get('action') or '?').upper()} — "

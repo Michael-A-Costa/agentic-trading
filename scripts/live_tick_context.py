@@ -52,7 +52,14 @@ def load_live_state() -> dict:
     # live_execute.parse_snapshot, so the cash/equity leg can't drift between the gate and the executor
     # (that drift understated equity and tripped the daily-loss breaker). We take the FULL cash leg as
     # the NAV cash; buying_power is only for spend, enforced downstream by live_execute's settled guard.
-    cash = ls.parse_portfolio(snap)["cash"]
+    pf = ls.parse_portfolio(snap)
+    cash = pf["cash"]
+    # buying_power is the SETTLED spendable figure on a cash account (excludes unsettled T+1 proceeds).
+    # Forward it so the entry gate can size headroom off what we can ACTUALLY spend, not NAV cash — NAV
+    # can look ample while settled BP is ~0, which is exactly when every commit defers "no settled cash"
+    # at execution. live_execute's settled guard is still the hard enforcer; this just lets decide skip
+    # the DD pass when there's no deployable cash (owner: "no cash -> just monitor positions").
+    buying_power = pf.get("buying_power", cash)
 
     positions: dict[str, dict] = {}
     for sym, rp in ls.parse_positions(snap).items():
@@ -77,8 +84,12 @@ def load_live_state() -> dict:
             "book": lot.get("book") or "disco",  # two-book split: lot ownership (v2 plan)
         }
     return {
-        "cash": cash, "positions": positions, "realized_total": 0.0,
+        "cash": cash, "buying_power": buying_power, "positions": positions, "realized_total": 0.0,
         "day": lstate.get("day"), "start_of_day_equity": lstate.get("start_of_day_equity"),
+        # Post-exit re-entry cooldown (anti-whipsaw): live_execute stamps last_exit on every sell
+        # in live_state.json; forward it so the shared context builder's COOLDOWN_MIN gate fires
+        # in live mode too (without this it's always empty live-side and a just-sold name re-enters).
+        "last_exit": lstate.get("last_exit") or {},
     }
 
 

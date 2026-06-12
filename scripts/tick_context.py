@@ -675,6 +675,10 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
         "regime": regime,
         "portfolio": {
             "cash": round(state["cash"], 2),
+            # SETTLED spendable cash (live: broker buying_power, excludes unsettled T+1 proceeds).
+            # Paper has no settling, so full cash is spendable — fall back to it. The entry gate sizes
+            # headroom off this, NOT NAV cash, so DD is skipped when there's nothing to actually deploy.
+            "settled_buying_power": round(state.get("buying_power", state["cash"]), 2),
             "positions_value": round(pos_value, 2),
             "equity": equity,
             "start_of_day_equity": state["start_of_day_equity"],
