@@ -114,7 +114,9 @@ def fill_to_trade(res: dict, *, ts_utc: str, ts_et: str | None, mode: str) -> di
         for k in ("stop_price", "take_profit_price",
                   # DD metadata (P3): pead_qualified ties the trade to the measured gap+vol signal
                   # (vs free-rein discretion) so win-rate can be split by signal class later.
-                  "pead_qualified", "washout_reversal", "conviction", "hold_intent", "thesis_type"):
+                  # iv30/rvol20 are ENTRY-time vol (A12) — the trail-width sample splits on these.
+                  "pead_qualified", "washout_reversal", "conviction", "hold_intent", "thesis_type",
+                  "iv30", "rvol20"):
             if res.get(k) is not None:
                 row[k] = res[k]
     else:  # sell

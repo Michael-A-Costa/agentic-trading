@@ -931,7 +931,8 @@ def execute_buy(sym: str, action: dict, state: dict, broker: dict, caps: dict,
     res = {"symbol": sym, "side": "buy", "reason": action.get("reason", ""), "status": "skipped"}
     # carry the DD's metadata so the trade history records WHAT KIND of bet this was (P3:
     # pead_qualified = met the measured gap+vol signal vs free-rein discretion)
-    for k in ("pead_qualified", "washout_reversal", "conviction", "hold_intent", "thesis_type", "book"):
+    for k in ("pead_qualified", "washout_reversal", "conviction", "hold_intent", "thesis_type", "book",
+              "iv30", "rvol20"):  # entry-time vol (A12): the trail-width split keys on ENTRY IV
         if action.get(k) is not None:
             res[k] = action[k]
     book = str(action.get("book") or "disco")
@@ -1026,6 +1027,7 @@ def execute_buy(sym: str, action: dict, state: dict, broker: dict, caps: dict,
                  # and pead_qualified ties the eventual round-trip back to the measured signal (P3).
                  "conviction": action.get("conviction"), "hold_intent": action.get("hold_intent"),
                  "thesis_type": action.get("thesis_type"), "pead_qualified": action.get("pead_qualified"),
+                 "iv30": action.get("iv30"), "rvol20": action.get("rvol20"),  # entry-time vol (A12)
                  "book": str(action.get("book") or lots.get(sym, {}).get("book") or "disco")}
     res.update(status="placed", ref_id=ref_id, order_id=order_id, order=placed,
                qty=plan["qty"], price=_f(plan.get("limit_price")))

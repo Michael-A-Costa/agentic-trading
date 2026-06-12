@@ -477,6 +477,8 @@ def run_dd(c: dict, regime: dict, caps: dict, portfolio: dict, dd_model: str) ->
             "next_earnings_date": commit.get("next_earnings_date"),
             "pead_qualified": dd.get("pead_qualified"),          # measured gap+vol signal met (label gate, P3)
             "washout_reversal": dd.get("washout_reversal"),      # gap-down recovery shape (label-only)
+            "iv30": dd.get("iv30"),                              # ENTRY-time vol (A12): IV crushes post-
+            "rvol20": dd.get("realized_vol_20d_annual_pct"),     # catalyst, so it can't be backfilled later
             "never_buy": bool(commit.get("never_buy")),          # structural disqualifier -> exclude
             "never_buy_reason": commit.get("never_buy_reason")}
 
@@ -620,6 +622,8 @@ def run_dd_batch(fresh_jobs: list[tuple[str, dict]], regime: dict, caps: dict,
             "next_earnings_date": commit.get("next_earnings_date"),
             "pead_qualified": probed.get(sym, {}).get("pead_qualified"),  # label gate (P3)
             "washout_reversal": probed.get(sym, {}).get("washout_reversal"),  # shape label
+            "iv30": probed.get(sym, {}).get("iv30"),  # entry-time vol context (A12)
+            "rvol20": probed.get(sym, {}).get("realized_vol_20d_annual_pct"),
             "never_buy": bool(commit.get("never_buy")),
             "never_buy_reason": commit.get("never_buy_reason"),
         }

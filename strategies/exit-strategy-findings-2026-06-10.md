@@ -355,3 +355,71 @@ extension / "not yet extended" / intraday-% judgments see the live tape; sources
 HISTORY bars (no RH history endpoint; daily granularity), and the Nasdaq movers SCREENER
 (no RH screener; it only nominates candidates — everything price-sensitive downstream re-checks
 on RH). Yahoo/Stooq remain deep fallbacks only, never primary in live.
+
+### A11. First live remnants (6/12) — the high-IV remnant got wicked out; vol-scaled-trail hypothesis.
+The ladder's first three live harvests all fired at the 6/12 open (sentinel tier trim, +10 tier):
+ALOY, CAVA, UEC. The remnants then diverged, and the split tracks entry IV almost perfectly:
+
+| Sym | Entry | IV30 (buy thesis) | Remnant | Trail rungs | Outcome | Price now |
+|-----|-------|-------------------|---------|-------------|---------|-----------|
+| ALOY | 13.57 | **130%** | 2 sh | 13.57→14.65→14.96→15.17→**15.89** | **stopped out 09:50** (~3% off ~16.38 peak) | 16.33 |
+| CAVA | 81.00 | (not flagged) | 1 sh | 81→87.33→87.77 | still riding | 90.93 |
+| UEC  | 9.90  | (not flagged) | 3 sh | 9.90→10.57→10.68→10.81 | still riding | 11.22 |
+
+ALOY — the only IV30=130% small-cap — spiked to ~16.38, gave back 3% to tag $15.89, and lost the
+remnant **20 min after the trim, right before continuing to 16.33+**. CAVA/UEC ground higher
+smoothly and their remnants are intact. This is the **first live confirmation of A9's pre-stated
+bias** ("daily bars understate intraday whipsaw → live 3% exits remnants earlier than the sim")
+— and it adds a conditioning variable A9 didn't have: on a 130%-IV name a 3% trail sits *inside*
+the noise band, so the rung that's meant to ride the moonshot gets whipsawed out of it. Note the
+direction: **tightening (the 2% we rejected on 6/12) would have wicked ALOY even sooner** — the
+fix, if any, is a **vol-scaled / IV-conditioned trail** that *widens* the rung on extreme-IV
+names, not a flat retune.
+
+Caveats — do not act yet: n=1 wicked vs n=2 survived, all same-day, same open; the dollar miss on
+ALOY's remnant is tiny (~$0.40/sh × 2 ≈ $0.80 vs current) and the lot still netted ~+$10.64
+(~+11%) — the 75% harvest did its job. **This is a logged hypothesis, not a dial change.** Per
+A9's pre-committed restraint, no exit-dial move until `exit_counterfactual.py` scores ~30 live
+disco round-trips; this just flags IV30 as the variable to split that sample on when it's scored.
+
+### A12. Remnant-trail instrumentation + PRE-REGISTERED variant grid (2026-06-12, no dial change).
+The A11 validation plan as written could not have been executed: entry IV30 was never a
+structured field in `trades.jsonl` (it only appeared incidentally in free-text DD reasons, and
+post-hoc backfill reads post-crush IV — the wrong number), and `exit_counterfactual.py` replays
+daily bars, which literally cannot see the ALOY wick (peak 16.38 → tag 15.89 → resume is
+invisible at daily resolution). Three instrumentation pieces shipped — none touches a dial:
+
+1. **Entry-time vol is now recorded.** `decide.py` carries the probe's `iv30` +
+   `realized_vol_20d_annual_pct` (as `rvol20`) onto every commit action; `live_execute.py`
+   stamps them on the lot and the fill result; `trade_log.py` persists them on every buy row.
+   Pre-existing lots/rows stay vol-less (honest n/a in the replay).
+2. **The 1-min sentinel now persists its quote pass** to `data/quotes-intraday.jsonl`
+   (`{ts_utc, ts_et, quotes:{sym:last}}`, one row/min, all held lots, ~400 rows/session). It was
+   already batch-fetching real-time RH marks every minute and discarding them; the tape is the
+   only data that can replay remnant-trail variants without the daily-bar whipsaw bias (A9's
+   known bias, A11's live confirmation). Recording verified live same-session.
+3. **`exit_counterfactual.py --remnant`** replays every live disco scale-out harvest on the
+   tape under a variant grid, with breakeven floor + TP40 cap on all variants, FIFO-pairing each
+   harvest to ITS entry row for entry price + vol. Partial coverage is flagged (`TAPE GAP`), not
+   silently scored.
+
+**Pre-registered grid (frozen 2026-06-12, before any tape existed — do not extend after
+peeking):** flat2 / flat3 (live) / flat5 / flat8; vol-scaled `w = clamp(k·IV30entry/√252, 3, 8)`
+for k ∈ {1.0, 1.25, 1.5} (rvol20 fallback when IV missing); delay3@11ET (3% trail armed only
+from 11:00 ET, breakeven floor before — targets the open-cluster whipsaw, all three first
+harvests fired at the open). Rationale for vscale: in sigma units the flat 3% trail was ~0.4σ
+on ALOY (IV 130 → daily σ ≈ 8.2%) vs ~1.3σ on CAVA/UEC — the width is denominated in the wrong
+units, and the disco book *selects for* vol dispersion, so a single-tape (VELO) calibration
+can't generalize. A9's "flat 8% collapses port_x" does not indict conditional widening: the
+floor keeps normal-vol names at exactly today's 3%.
+
+**Pre-registered decision rule (binding at the A9 checkpoint, ~30 scored live disco
+round-trips):** adopt the variant that beats flat3 on mean remnant return over the tape-scored
+sample; ties, insufficient tape coverage, or no winner → keep flat3. No interim dial moves;
+tripwire (`BOOK_DISCO_ENABLED=0`) unchanged.
+
+Addendum: the three pre-A12 entries are recoverable — `data/entry_vol_backfill.json` (sidecar;
+the append-only ledger is never edited) carries ENTRY-TIME vol from probe caches written minutes
+before each fill (CAVA 13:30 ET vs 13:46 entry; UEC 09:35 vs 09:37) and ALOY's 130% from the buy
+thesis itself. The replay falls back to it, so the one wicked remnant — the motivating data
+point — stays scorable on the vscale variants.

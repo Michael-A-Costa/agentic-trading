@@ -47,6 +47,7 @@ REPO = Path(__file__).resolve().parent.parent
 STATE = REPO / "data" / "live_state.json"
 LOCK = REPO / "data" / ".tick.lock"
 ENGINE_LOG = REPO / "data" / "engine-log.jsonl"
+QUOTE_TAPE = REPO / "data" / "quotes-intraday.jsonl"
 ET = ZoneInfo("America/New_York")
 
 FORCE_TICK_MINUTES_ET = {(9, 32), (9, 35), (9, 39)}
@@ -249,6 +250,17 @@ def main() -> int:
     _QUOTES.clear()
     _QUOTES.update({s: q for s, q in _fetch_rh_quotes(sorted(state.get("lots") or {})).items()
                     if q.get("last") is not None})  # a price-less entry must fall through to Cboe
+    # Persist this pass's real-time marks (A12): the 1-min tape is the only data that can replay
+    # remnant-trail variants honestly — daily bars can't see the ALOY-style intraday wick. One
+    # row per pass, all held lots; consumed by exit_counterfactual.py --remnant.
+    if _QUOTES:
+        try:
+            with QUOTE_TAPE.open("a") as f:
+                f.write(json.dumps({"ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                    "ts_et": now_et.isoformat(timespec="seconds"),
+                                    "quotes": {s: q["last"] for s, q in _QUOTES.items()}}) + "\n")
+        except OSError:
+            pass
     breaches = []  # (sym, reason, last, qty)
     trims = []     # (sym, reason, last, qty_out, gains, quote)
     for sym, lot in (state.get("lots") or {}).items():
