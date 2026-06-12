@@ -113,12 +113,14 @@ def count_in_flight(now: float) -> int:
     return n
 
 
-def ingest_dd_jobs(cache: dict, today_et: str, now: float) -> int:
+def ingest_dd_jobs(cache: dict, today_et: str, now: float) -> set[str]:
     """Fold FINISHED background verdicts into the cache (commit/reject only — an error worker is
-    dropped so it retries) and reap dead 'running' markers. Returns how many verdicts were ingested."""
+    dropped so it retries) and reap dead 'running' markers. Returns the SET of symbols whose verdicts
+    were folded in THIS tick — the entry pass treats those as freshly-produced (ts==now) and is allowed
+    to BUY on them, while an older cached commit is re-DD'd before any buy (see the cache-read loop)."""
     if not DD_JOBS.exists():
-        return 0
-    n = 0
+        return set()
+    ingested: set[str] = set()
     for f in DD_JOBS.glob("*.json"):
         try:
             job = json.loads(f.read_text())
@@ -145,7 +147,7 @@ def ingest_dd_jobs(cache: dict, today_et: str, now: float) -> int:
                               reason=res.get("reason", ""), catalysts=res.get("catalysts"),
                               risks=res.get("risks"), next_earnings_date=res.get("next_earnings_date"),
                               never_buy=bool(res.get("never_buy")), never_buy_reason=res.get("never_buy_reason"))
-                n += 1
+                ingested.add(sym)
             try:
                 f.unlink()  # consumed (or a dropped error) — clear it either way
             except OSError:
@@ -155,7 +157,7 @@ def ingest_dd_jobs(cache: dict, today_et: str, now: float) -> int:
                 f.unlink()  # worker died -> reap so the symbol can be re-dispatched
             except OSError:
                 pass
-    return n
+    return ingested
 
 
 def dispatch_dd(sym: str, c: dict, now: float) -> bool:
@@ -830,7 +832,8 @@ def main() -> int:
     # so a name dispatched a prior tick is acted on the moment its worker lands (decide is the sole
     # cache writer; workers only touch their own job file).
     async_on = _async_on()
-    if async_on and ingest_dd_jobs(cache, today_et, now):
+    ingested_now = ingest_dd_jobs(cache, today_et, now) if async_on else set()
+    if ingested_now:
         cache_dirty = True
     book_full = False
     entry_did_fresh = False   # did the entry pass run any FRESH (uncached) DDs this tick? (gates the manage wave)
@@ -924,7 +927,17 @@ def main() -> int:
                     broke_range = bool(ref_rp is not None and cur_rp is not None
                                        and cur_rp >= reject_redd_range and cur_rp > ref_rp)
                     stale = broke_up or broke_range
-                if cdec in ("commit", "reject") and same_day and within_rolling and not stale:
+                servable = cdec in ("commit", "reject") and same_day and within_rolling and not stale
+                # Re-DD before BUYING a committed name: only act on a commit verdict that was produced
+                # THIS tick (freshly ingested from its async worker, so sym in ingested_now). A commit
+                # that's been SITTING in the cache — e.g. parked while we waited for settled cash — is
+                # NOT bought on the stale thesis; it falls through to a fresh re-DD and the buy waits for
+                # the new verdict. Rejects are still served from cache (no money at risk, nothing to
+                # re-confirm). In sync mode ingested_now is empty, so every cached commit re-DDs inline
+                # this tick and buys on the fresh result.
+                if servable and cdec == "commit" and sym not in ingested_now:
+                    servable = False
+                if servable:
                     res = {**cached["result"], "cached": True, "cached_age_min": int(age / 60)}
             if res is not None:
                 cache_hits[sym] = res
