@@ -1401,6 +1401,11 @@ def main() -> int:
     # engine slept (resting stop fired). Without these the blotter shows phantom buys as real.
     trade_log.record_reconcile_events(log, ts_utc=record["ts_utc"], ts_et=record.get("ts_et"),
                                       mode=mode_tag)
+    # Protective-stop ratchets (adjusted sell thresholds: breakeven rung + trailing rung) are order
+    # replacements, not fills, so they never reach trades.jsonl. Mirror them to their own history
+    # (data/stops.jsonl + daily stops-<ET>.md) for a greppable per-name stop schedule.
+    trade_log.record_stop_adjustments(log, ts_utc=record["ts_utc"], ts_et=record.get("ts_et"),
+                                      mode=mode_tag)
 
     placed = record["n_placed"]
     note = "DRY-RUN" if is_dryrun else "ARMED"

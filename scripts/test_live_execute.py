@@ -916,6 +916,40 @@ def test_live_snapshot_shared_cash_parse():
     check("cash falls back to buying_power when absent", port2["cash"] == 500.0 and port2["buying_power"] == 500.0, port2)
 
 
+def test_record_stop_adjustments_filters_and_writes():
+    import json
+    import tempfile
+    import trade_log
+    saved = (trade_log.STOPS_LOG, trade_log.JOURNAL_DIR)
+    with tempfile.TemporaryDirectory() as tmp:
+        trade_log.STOPS_LOG = Path(tmp) / "stops.jsonl"
+        trade_log.JOURNAL_DIR = Path(tmp) / "journal"
+        try:
+            log = [
+                {"event": "trail_rearm", "symbol": "abc", "from": 92.0, "to": 104.5,
+                 "order_id": "s2", "ref_id": "r1"},
+                {"event": "trail_rearm_dryrun", "symbol": "DEF", "from": 50.0, "to": 55.0,
+                 "high_water": 58.0},
+                {"event": "trail_rearm_failed", "symbol": "GHI", "from": 10.0, "to": 11.0,
+                 "fallback": "synthetic"},
+                {"event": "sell_placed", "symbol": "XYZ"},   # not a stop event -> skipped
+                {"event": "arm_stop", "symbol": "JKL"},      # initial arm, not a ratchet -> skipped
+            ]
+            rows = trade_log.record_stop_adjustments(log, ts_utc="2026-06-12T14:00:00Z",
+                                                     ts_et="2026-06-12T10:00:00", mode="live")
+            check("only the three trail_* events are recorded", len(rows) == 3, rows)
+            check("symbol is upper-cased", rows[0]["symbol"] == "ABC", rows[0])
+            check("outcome maps applied", rows[0]["outcome"] == "applied", rows[0])
+            check("outcome maps dryrun", rows[1]["outcome"] == "dryrun", rows[1])
+            check("outcome maps failed", rows[2]["outcome"] == "failed", rows[2])
+            written = [json.loads(x) for x in trade_log.STOPS_LOG.read_text().splitlines()]
+            check("jsonl has the three rows", len(written) == 3, written)
+            blotter = (trade_log.JOURNAL_DIR / "stops-2026-06-12.md").read_text()
+            check("blotter shows the ratchet move", "ABC 92.0 → 104.5" in blotter, blotter)
+        finally:
+            trade_log.STOPS_LOG, trade_log.JOURNAL_DIR = saved
+
+
 if __name__ == "__main__":
     tests = [test_whole_share_entry, test_rounds_up_to_one_share, test_one_share_over_cap_rejects,
              test_cap_rejects, test_sell_specs, test_review_gating, test_snapshot_parse_real_shapes,
@@ -942,7 +976,8 @@ if __name__ == "__main__":
              test_lot_take_profit_pct_per_book_overlay,
              test_trail_per_book_overlay, test_execute_sell_partial_scale_out,
              test_execute_sell_tier_whole_share_rounding, test_disco_scale_out_tiers_parse,
-             test_live_snapshot_shared_cash_parse]
+             test_live_snapshot_shared_cash_parse,
+             test_record_stop_adjustments_filters_and_writes]
     for fn in tests:
         fn()
     print(f"OK — {_passed} assertions passed across {len(tests)} tests")

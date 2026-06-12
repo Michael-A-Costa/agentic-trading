@@ -26,9 +26,23 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 DATA = REPO / "data"
 TRADES_LOG = DATA / "trades.jsonl"
+STOPS_LOG = DATA / "stops.jsonl"
 JOURNAL_DIR = DATA / "journal"
 
 SCHEMA_VERSION = 1
+
+# live_execute.reconcile() trail-ratchet events that ADJUST a lot's protective stop level (the
+# breakeven rung + the trailing rung lifting the stop toward the high-water mark). These are order
+# *replacements*, not fills, so they never reach trades.jsonl — record_stop_adjustments() mirrors
+# them into their own history (data/stops.jsonl). Maps each engine event -> a coarse outcome.
+STOP_EVENTS = {
+    "trail_rearm":         "applied",    # resting broker stop cancelled + replaced higher (live)
+    "trail_rearm_dryrun":  "dryrun",     # would re-arm if LIVE_ARMED — logged, placed nothing
+    "trail_synthetic":     "synthetic",  # fractional/synthetic lot ratcheted in place (no broker order)
+    "trail_rearm_failed":  "failed",     # place of the higher stop failed -> degraded to synthetic
+    "trail_cancel_failed": "failed",     # cancel of the old stop failed -> kept old (still protected)
+    "trail_dup_cancel":    "dup_swept",  # duplicate resting stop swept after a re-arm
+}
 
 # A trade is recorded only when it was actually executed: a paper "filled" or a live "placed".
 # dry-run / skipped / failed orders stay in engine-log.jsonl (intent), not in the trade history.
@@ -181,24 +195,58 @@ def _blotter_line(row: dict) -> str:
     return f"- `{t}` **{side}** {qty} {row.get('symbol')} {px}{tag}{flag}{rtxt}"
 
 
-def _append_blotter(rows: list[dict]) -> None:
-    """Append bullets to the per-ET-day markdown blotter (one file per trading day)."""
+def _append_day_md(rows: list[dict], *, prefix: str, header: str, line_fn) -> None:
+    """Append `line_fn(row)` bullets to a per-ET-day markdown file `<prefix>-<day>.md`, writing
+    `header` once when the day's file is first created. Shared by the trade blotter and the
+    stop-adjustment log so both bucket-by-day identically."""
     by_day: dict[str, list[dict]] = {}
     for r in rows:
         day = (r.get("ts_et") or r.get("ts_utc") or "unknown")[:10]
         by_day.setdefault(day, []).append(r)
     JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
     for day, day_rows in by_day.items():
-        path = JOURNAL_DIR / f"trades-{day}.md"
+        path = JOURNAL_DIR / f"{prefix}-{day}.md"
         new = not path.exists()
         with path.open("a") as f:
             if new:
-                f.write(f"# Trade blotter — {day}\n\n"
-                        "Auto-written per fill by `trade_log.py`. One bullet = one executed trade "
-                        "(paper fill or live placed order). See `data/trades.jsonl` for the "
-                        "machine-readable rows and `scripts/trade_ledger.py` for round-trips.\n\n")
+                f.write(header.format(day=day))
             for r in day_rows:
-                f.write(_blotter_line(r) + "\n")
+                f.write(line_fn(r) + "\n")
+
+
+def _append_blotter(rows: list[dict]) -> None:
+    """Append bullets to the per-ET-day trade blotter (one file per trading day)."""
+    _append_day_md(rows, prefix="trades", line_fn=_blotter_line,
+                   header="# Trade blotter — {day}\n\n"
+                          "Auto-written per fill by `trade_log.py`. One bullet = one executed trade "
+                          "(paper fill or live placed order). See `data/trades.jsonl` for the "
+                          "machine-readable rows and `scripts/trade_ledger.py` for round-trips.\n\n")
+
+
+def _stop_blotter_line(row: dict) -> str:
+    """One human-readable markdown bullet for a stop-adjustment row."""
+    t = (row.get("ts_et") or row.get("ts_utc") or "")[11:19]  # HH:MM:SS
+    frm, to = row.get("from"), row.get("to")
+    move = f"{frm} → {to}" if frm is not None else f"→ {to}"
+    extra = []
+    if row.get("high_water") is not None:
+        extra.append(f"hw {row['high_water']}")
+    if row.get("kept_stop") is not None:
+        extra.append(f"kept {row['kept_stop']}")
+    if row.get("fallback"):
+        extra.append(f"fallback:{row['fallback']}")
+    tag = f"  ({', '.join(extra)})" if extra else ""
+    return f"- `{t}` **STOP {str(row.get('outcome', '')).upper()}** {row.get('symbol')} {move}{tag}"
+
+
+def _append_stop_blotter(rows: list[dict]) -> None:
+    """Append bullets to the per-ET-day stop-adjustment log (one file per trading day)."""
+    _append_day_md(rows, prefix="stops", line_fn=_stop_blotter_line,
+                   header="# Stop-adjustment log — {day}\n\n"
+                          "Auto-written per protective-stop ratchet by `trade_log.py`. One bullet = "
+                          "one threshold move (breakeven rung / trailing rung). These are order "
+                          "*replacements*, not fills — see `data/trades.jsonl` for fills. "
+                          "Machine-readable rows: `data/stops.jsonl`.\n\n")
 
 
 def record_reconcile_events(events: list[dict], *, ts_utc: str, ts_et: str | None,
@@ -244,6 +292,44 @@ def record_reconcile_events(events: list[dict], *, ts_utc: str, ts_et: str | Non
         try:
             _append_jsonl(TRADES_LOG, rows)
             _append_blotter(rows)
+        except OSError:
+            pass
+    return rows
+
+
+def record_stop_adjustments(events: list[dict], *, ts_utc: str, ts_et: str | None,
+                            mode: str) -> list[dict]:
+    """Book protective-stop ratchets (adjusted sell thresholds) into a dedicated history.
+
+    live_execute.reconcile() raises a lot's stop toward its high-water mark as price runs (the
+    breakeven rung + the trailing rung). Those moves are order *replacements*, not fills, so they
+    never reach trades.jsonl. This mirrors the relevant `trail_*` engine events out of the fat
+    per-tick engine-log.jsonl into their own append-only file so a name's whole stop schedule is
+    greppable:  `grep NVDA data/stops.jsonl`. Two artifacts, same shape as the trade history:
+        data/stops.jsonl              one JSON row per stop adjustment (machine/queries)
+        data/journal/stops-<ET>.md    human-readable daily list (skim it)
+    Best-effort like record_fills — never crash a tick."""
+    rows: list[dict] = []
+    for ev in (events or []):
+        outcome = STOP_EVENTS.get(ev.get("event") or "")
+        if outcome is None:
+            continue
+        sym = str(ev.get("symbol", "")).upper()
+        if not sym:
+            continue
+        row: dict[str, object] = {
+            "v": SCHEMA_VERSION, "ts_utc": ts_utc, "ts_et": ts_et, "mode": mode,
+            "symbol": sym, "event": ev.get("event"), "outcome": outcome,
+        }
+        # carry the fields that exist on each event shape; omit the rest to keep rows tight
+        for k in ("from", "to", "high_water", "order_id", "ref_id", "kept_stop", "fallback"):
+            if ev.get(k) is not None:
+                row[k] = ev[k]
+        rows.append(row)
+    if rows:
+        try:
+            _append_jsonl(STOPS_LOG, rows)
+            _append_stop_blotter(rows)
         except OSError:
             pass
     return rows
