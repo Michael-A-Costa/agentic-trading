@@ -559,3 +559,33 @@ discretization artifact, not a smooth economic curve. (3) Contradicts A9 (75>50 
 config-fragile. VERDICT: the harvest fraction is COUPLED to trail-survival — can't tune it ahead of the
 §A12 tape. If the tape shows the 3% trail holds intraday, ~60% (let more ride) becomes a candidate; if it
 whipsaws (likely), keep 75%+. Prove the trail first, then tune the fraction. No dial change.
+
+### A16. Stop-price QUANTIZATION hygiene — helper built + replay wired, INCONCLUSIVE (2026-06-13/14, NO dial change).
+Prompted by a fintwit review (L2WTrades / thedelost: "your stop gets hit because it's the most
+predictable price"). Confirmed our resting stops are **%-off-entry, never chart-derived**, so we're
+already immune to the worst form (stops parked at a visible swing low / MA — a chartist can't infer
+our level from the tape). Two small **residual** exposures live at the cent-quantization step that
+`live_execute` does via `round()` / `f"{:.2f}"` (sites: `_arm_entry_stop` L1043, reconcile L644,
+`trail_stop_price` L483-484):
+1. `round()` can nudge a SELL-stop UP (toward price) by ≤0.5¢ → slightly tighter risk than intended.
+2. `round()` occasionally lands the stop EXACTLY on a whole-/half-dollar MAGNET ($50.00, $49.50) —
+   the liquidity pool where wicks gravitate and crowd-stops cluster.
+
+**Candidate fix (pure, strictly risk-LOOSENING, ≤ a few cents):** floor-not-round, then step a few
+cents BELOW the nearest magnet, `min()`-clamped so it can only ever LOWER a sell-stop. Built as a
+pure helper + replay diagnostic in **`scripts/stop_hygiene.py`** (`--selfcheck` proves the invariants
+deterministically — PASSED; `--replay` scores arm A `round` vs arm B `floor+nudge` on real fills + the
+1-min sentinel tape). NOT wired into `live_execute`.
+
+**Replay result (2026-06-14): INCONCLUSIVE.** 36 closed round-trips but only **13 whole-share** (the
+fix only touches whole-share *broker* stops; fractional lots use synthetic stops) — **<30 bar**.
+6/13 stops *did* land in the magnet band (effect is real, not hypothetical), but **0 trigger-differences**
+over the available tape: the 1-min tape is ~1 session (6/12, 20 syms) and these are *catastrophe* stops
+8% below entry that nothing approached. The case this actually bites — a **ratcheted trail stop riding
+close under a runner near a round number** — needs multi-session tape we don't have. Per
+cent-precision-compounds / exit-policy-tuning, **fix stays unshipped** (logic proven correct, benefit
+unproven on this sample). **→ CHECK AT THE §A9/§A12 30-RT CHECKPOINT (~2026-06-26):** re-run
+`python3 scripts/stop_hygiene.py --replay`; if trail-stop trigger-differences show positive avoided-loss
+out-of-sample, wire `q_floor_nudge` into `live_execute` behind an OFF-by-default cap (e.g.
+`STOP_MAGNET_NUDGE`/`STOP_MAGNET_BAND`) and validate live. Repro: `stop_hygiene.py --selfcheck` /
+`--replay [--band 0.05 --off 0.03]`.
