@@ -730,20 +730,51 @@ def reconcile(state: dict, broker: dict, log: list) -> None:
                 log.append({"event": "closed_confirmed", "symbol": sym,
                             "order_id": stale.get("closing_order_id")})
             else:
-                # Estimate the realized P&L at the stop level (the broker fill price isn't in the
-                # snapshot): an ESTIMATE, flagged as such — it feeds the per-book tripwire, never
-                # a P&L claim. Without it, stop-outs while asleep (the most common loss path)
-                # would be invisible to the book ledger.
+                # Determine HOW it left (resting stop fired vs. sold while asleep) and pull the REAL
+                # broker fill price by re-reading the order ledger — the tick snapshot can't see a
+                # fired stop. Falls back to the stop-level estimate when the ledger read is empty.
                 _entry, _qty = _f(stale.get("entry_price")), _f(stale.get("qty"), 0.0) or 0.0
                 _stoppx = _f(stale.get("stop_price"))
+                cl = _classify_external_close(sym, stale)
+                _fillpx = cl.get("fill_price")
+                _fqty = cl.get("fill_qty") or _qty
+                # real realized when the broker fill price is known (truth, not flagged estimate);
+                # else the stop-level estimate so a sleeping stop-out still hits the book tripwire.
+                _real = (round((_fillpx - _entry) * _fqty, 2)
+                         if (_entry and _fillpx and _fqty) else None)
                 _rest = (round((_stoppx - _entry) * _qty, 2)
                          if (_entry and _stoppx and _qty) else None)
+                # Snapshot the trade's standing the instant it left the book — especially for the
+                # 'unknown' close_kind, where the exit price is a mystery. The live quote, the peak the
+                # trail rode to (high_water), the TP target, and how long it was held together let a
+                # reader reconstruct WHERE it likely exited and against which level, without the fill.
+                _q = (broker.get("quotes") or {}).get(sym) or {}
+                _last = _f(_first(_q, "last", "bid", "ask"))
+                _ets = stale.get("entry_ts")
+                _held_min = None
+                if _ets:
+                    try:
+                        _held_min = round(
+                            (datetime.now(timezone.utc)
+                             - datetime.fromisoformat(_ets)).total_seconds() / 60.0, 1)
+                    except (ValueError, TypeError):
+                        _held_min = None
                 log.append({"event": "closed_external", "symbol": sym,
-                            "note": "position gone from broker — resting stop fired or sold while engine asleep",
+                            "close_kind": cl.get("close_kind"),
+                            "note": "position gone from broker — " + cl.get("note", ""),
                             "had_stop": stale.get("resting_stop_order_id"),
-                            "book": book_of(stale), "qty": _qty or None,
+                            "our_stop_state": cl.get("our_stop_state"),
+                            "ledger_sells": cl.get("ledger_sells"),
+                            "close_order_id": cl.get("close_order_id"),
+                            "book": book_of(stale), "qty": _fqty or None,
                             "entry_price": _entry, "stop_price": _stoppx,
-                            "realized_est_usd": _rest})
+                            "fill_price": _fillpx,
+                            "last_quote": _last,
+                            "high_water": _f(stale.get("high_water")),
+                            "take_profit_price": _f(stale.get("take_profit_price")),
+                            "entry_ts": _ets, "held_min": _held_min,
+                            "realized_usd": _real,
+                            "realized_est_usd": None if _real is not None else _rest})
 
 
 def execute_sell(sym: str, action: dict, state: dict, broker: dict, caps: dict, log: list) -> dict:
@@ -889,6 +920,95 @@ def _read_order(sym: str, order_id: str) -> dict | None:
         if isinstance(o, dict) and _first(o, "id", "order_id") == order_id:
             return o
     return None
+
+
+def _classify_external_close(sym: str, stale: dict) -> dict:
+    """Figure out HOW a now-gone position actually left the book — don't just guess "stop or sold".
+
+    The tick snapshot's `orders` is state="confirmed" (open resting stops only), so a stop that
+    FIRED or a discretionary sell that filled while the engine slept is invisible there. We re-read
+    the full agentic order ledger for this symbol (filled orders included) and match the exit:
+      - the lot's own resting_stop_order_id now shows filled  -> 'resting_stop' (the protective stop hit)
+      - some OTHER sell filled                                -> 'sold_external' (closed outside the engine)
+      - nothing matches in the lookback window                -> 'unknown' (price/cause unconfirmed)
+    Returns the broker-truth fill price/qty/order id when found, so the trade row carries the REAL
+    exit (not the stop-level estimate). Best-effort: any read failure degrades to 'unknown'.
+
+    A just-fired stop often hasn't settled to state='filled' the instant we read — so when the first
+    read finds no FILLED sell we re-read a few times with a short sleep before booking 'unknown',
+    rather than recording a price-less mystery for an exit that confirms a second later. Tunable via
+    EXTERNAL_CLOSE_REREAD_TRIES (total reads, default 3; set 1 to disable) and
+    EXTERNAL_CLOSE_REREAD_SLEEP_S (seconds between, default 1.5)."""
+    import rh_mcp
+    import time
+    since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="seconds")
+    stop_id = stale.get("resting_stop_order_id")
+    tries = max(1, int(_f(os.environ.get("EXTERNAL_CLOSE_REREAD_TRIES"), 3) or 3))
+    sleep_s = max(0.0, _f(os.environ.get("EXTERNAL_CLOSE_REREAD_SLEEP_S"), 1.5) or 1.5)
+
+    def _scan():
+        """One ledger read -> (best filled match or None, seen_sells diagnostic list)."""
+        try:
+            blob = rh_mcp.recent_orders(sym, created_at_gte=since)
+        except Exception:
+            blob = None
+        raw = _unwrap((blob or {}).get("orders") or {})
+        if isinstance(raw, dict):
+            raw = raw.get("orders") or raw.get("results") or []
+        filled = []  # (order, is_our_stop, is_stop)
+        seen = []    # EVERY sell in the window (any state) — diagnostic for the unknown branch
+        for o in raw or []:
+            if not isinstance(o, dict):
+                continue
+            if (_first(o, "side") or "").lower() != "sell":
+                continue
+            oid = _first(o, "id", "order_id")
+            st = (_first(o, "state", "status") or "").lower()
+            is_stop = (_first(o, "stop_price") is not None
+                       or "stop" in (_first(o, "type", "trigger", "order_type") or "").lower())
+            seen.append({"order_id": oid, "state": st or "unknown", "is_stop": is_stop,
+                         "is_our_stop": oid is not None and oid == stop_id})
+            if st == "filled":
+                filled.append((o, oid is not None and oid == stop_id, is_stop))
+        # ledger is newest-first; prefer our tracked stop, else the most-recent filled sell
+        return (next((t for t in filled if t[1]), None) or (filled[0] if filled else None)), seen
+
+    match, seen_sells = _scan()
+    for _ in range(tries - 1):
+        if match:
+            break
+        if sleep_s:
+            time.sleep(sleep_s)
+        match, seen_sells = _scan()  # re-read: a fired stop may have just settled to 'filled'
+    if not match:
+        # No FILLED sell in the window. Don't bury that as a shrug — record what the ledger DID show so
+        # the row is reconstructable later: the state our own resting stop ended up in, and the count +
+        # states of every sell we saw. The usual cause is a stop that fired but hasn't settled to
+        # 'filled' in the ledger yet (or a transient read miss); these fields say which.
+        our_stop = next((s for s in seen_sells if s["is_our_stop"]), None)
+        if our_stop:
+            where = f"our resting stop {stop_id} last seen state={our_stop['state']}"
+        elif stop_id:
+            where = f"our resting stop {stop_id} not present in the 24h ledger"
+        else:
+            where = "lot carried no resting stop order"
+        saw = (f"{len(seen_sells)} sell order(s) seen, states={[s['state'] for s in seen_sells]}"
+               if seen_sells else "no sell orders at all in the window")
+        return {"close_kind": "unknown",
+                "note": f"position gone from broker, no FILLED sell in 24h ledger — {where}; {saw} "
+                        "(price/cause unconfirmed)",
+                "our_stop_state": (our_stop or {}).get("state"),
+                "ledger_sells": seen_sells or None}
+    o, is_our_stop, is_stop = match
+    px = _f(_first(o, "average_price", "average_sell_price", "price"))
+    qty = _f(_first(o, "cumulative_quantity", "filled_quantity", "quantity"))
+    oid = _first(o, "id", "order_id")
+    if is_our_stop or is_stop:
+        kind, note = "resting_stop", "resting protective stop fired at the broker"
+    else:
+        kind, note = "sold_external", "sold outside the engine while it slept (non-stop sell filled)"
+    return {"close_kind": kind, "fill_price": px, "fill_qty": qty,
+            "close_order_id": oid, "note": note}
 
 
 def _arm_entry_stop(sym: str, plan: dict, order: dict | None, order_id: str,

@@ -702,16 +702,22 @@ def manage_arm(sym: str) -> tuple[str, str]:
     return ("B", model_b) if bucket < split * 1000 else ("A", model_a)
 
 
-def run_manage_dd(p: dict, regime: dict, caps: dict, portfolio: dict, dd_model: str) -> dict:
+def run_manage_dd(p: dict, regime: dict, caps: dict, portfolio: dict, dd_model: str,
+                  tools: list | None = None, skip_probe: bool = False) -> dict:
     """Tier-2: re-assess ONE held position on FRESH data + news. Returns
     {action: keep|trim|exit|add, trim_fraction, add_dollars, conviction, hold_intent, reason}.
-    Defaults to KEEP on any failure — the hard stop + Tier-1 monitor still protect the downside."""
+    Defaults to KEEP on any failure — the hard stop + Tier-1 monitor still protect the downside.
+
+    tools defaults to MANAGE_TOOLS (production behaviour). skip_probe reuses an existing
+    dd_<sym>.json instead of re-running dd_probe — used by offline evals (manage_ab_eval.py) to
+    freeze the quant snapshot so every arm sees identical data and only model/tools vary."""
     sym = str(p.get("symbol", "")).upper().strip()
-    try:
-        subprocess.run([PYEXE, str(SCRIPTS / "dd_probe.py"), sym],
-                       capture_output=True, text=True, timeout=60)
-    except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError) as e:
-        sys.stderr.write(f"[manage] dd_probe {sym} failed ({e})\n")
+    if not skip_probe:
+        try:
+            subprocess.run([PYEXE, str(SCRIPTS / "dd_probe.py"), sym],
+                           capture_output=True, text=True, timeout=60)
+        except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError) as e:
+            sys.stderr.write(f"[manage] dd_probe {sym} failed ({e})\n")
     dd_file = TICK / f"dd_{sym}.json"
     try:
         dd = json.loads(dd_file.read_text()) if dd_file.exists() else {"symbol": sym, "error": "no_dd"}
@@ -752,7 +758,8 @@ def run_manage_dd(p: dict, regime: dict, caps: dict, portfolio: dict, dd_model: 
     })
     dd_timeout = int(os.environ.get("DD_CLAUDE_TIMEOUT_S", "240"))
     out = run_claude(prompt_text("dd_manage_prompt.txt") + manage_input,
-                     dd_model, tools=MANAGE_TOOLS, mcp=True, timeout=dd_timeout, label=f"manage:{sym}")
+                     dd_model, tools=tools or MANAGE_TOOLS, mcp=True, timeout=dd_timeout,
+                     label=f"manage:{sym}")
     if out is None:
         return {"symbol": sym, "action": "keep", "error": "manage_model_failed",
                 "reason": "manage model failed -> keep (stop + Tier-1 still protect)"}

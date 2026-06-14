@@ -185,6 +185,14 @@ def _blotter_line(row: dict) -> str:
             extra.append(_fmt_usd(float(row["realized_usd"])))
         if row.get("exit_type"):
             extra.append(EXIT_LABEL.get(row["exit_type"], row["exit_type"]))
+        # close_kind="unknown" leaves `price` empty — show the trade-standing context reconcile
+        # captured so the bullet still places where it left, not just "@ ?".
+        if price is None and row.get("last_quote") is not None:
+            extra.append(f"last~{row['last_quote']}")
+        if price is None and row.get("high_water") is not None:
+            extra.append(f"hw {row['high_water']}")
+        if row.get("held_min") is not None:
+            extra.append(f"held {row['held_min']}m")
     tag = f"  ({', '.join(extra)})" if extra else ""
     reason = " ".join(str(row.get("reason") or "").split())  # collapse newlines -> single bullet
     rtxt = f"  — {reason}" if reason else ""
@@ -258,8 +266,9 @@ def record_reconcile_events(events: list[dict], *, ts_utc: str, ts_et: str | Non
       entry_filled_confirmed              -> buy  status=filled (a prior tick's placed order filled)
       entry_unfilled / _cancelled         -> buy  status=dead   (placed order never filled — GFD
                                                                  expired / marketable limit missed)
-      closed_external                     -> sell status=filled, price unknown (resting stop fired
-                                                                 or sold while the engine slept)
+      closed_external                     -> sell status=filled; close_kind says WHICH (resting stop
+                                                                 fired vs. sold while asleep) with the
+                                                                 real broker fill price when readable
     Rows carry order_id where known; consumers dedupe placed/terminal pairs by order_id.
     Best-effort like record_fills — never crash a tick."""
     rows: list[dict] = []
@@ -280,14 +289,32 @@ def record_reconcile_events(events: list[dict], *, ts_utc: str, ts_et: str | Non
                          "qty": None, "price": None, "order_id": ev.get("order_id"),
                          "reason": "entry never filled (GFD expired / marketable limit missed)"})
         elif kind == "closed_external":
-            rows.append({"v": SCHEMA_VERSION, "ts_utc": ts_utc, "ts_et": ts_et, "mode": mode,
-                         "symbol": sym, "side": "sell", "status": "filled",
-                         "qty": ev.get("qty"), "price": None,
-                         "reason": ev.get("note", "position closed at broker while engine asleep"),
-                         **({"book": ev["book"]} if ev.get("book") else {}),
-                         **({"realized_est_usd": ev["realized_est_usd"]}
-                            if ev.get("realized_est_usd") is not None else {}),
-                         "exit_type": "stop"})
+            # close_kind (set by live_execute._classify_external_close) tells us what the sell WAS:
+            # 'resting_stop' the protective stop fired, 'sold_external' closed while asleep, else unknown.
+            ck = str(ev.get("close_kind") or "")
+            exit_type = {"resting_stop": "stop", "sold_external": "other"}.get(ck, "stop")
+            row = {"v": SCHEMA_VERSION, "ts_utc": ts_utc, "ts_et": ts_et, "mode": mode,
+                   "symbol": sym, "side": "sell", "status": "filled",
+                   "qty": ev.get("qty"), "price": ev.get("fill_price"),
+                   "reason": ev.get("note", "position closed at broker while engine asleep"),
+                   "exit_type": exit_type}
+            if ck:
+                row["close_kind"] = ck
+            if ev.get("close_order_id"):
+                row["order_id"] = ev["close_order_id"]
+            if ev.get("book"):
+                row["book"] = ev["book"]
+            # Trade-standing context captured by reconcile when the position vanished — most valuable
+            # for close_kind="unknown" where `price` is empty: the live quote at exit, the peak the
+            # trail rode to, and the hold length together place the exit even without the broker fill.
+            for k in ("last_quote", "high_water", "held_min", "our_stop_state"):
+                if ev.get(k) is not None:
+                    row[k] = ev[k]
+            if ev.get("realized_usd") is not None:
+                row["realized_usd"] = ev["realized_usd"]          # broker-truth fill -> real P&L
+            elif ev.get("realized_est_usd") is not None:
+                row["realized_est_usd"] = ev["realized_est_usd"]  # flagged estimate (price unconfirmed)
+            rows.append(row)
     if rows:
         try:
             _append_jsonl(TRADES_LOG, rows)
