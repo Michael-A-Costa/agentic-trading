@@ -18,13 +18,15 @@ US-legal, CFTC-regulated, USD, no crypto wallet, clean public REST API
 ≥0.90 favorite strategy. (Polymarket is geo-restricted for the owner; kept as
 reference only in `docs/`.)
 
-## Current state
-The "near-certain favorite" idea (buy the ≥0.90 side ending soon, hold to settlement)
-is at the **coverage-probe** stage. `scripts/kalshi_pull.py` confirms the data is fully
-accessible and reconstructs the price H hours before close from candlesticks using the
-**ask** (real buy cost, not mid). Early small-sample read is *unfavorable*: near-resolution
-extremes are Kalshi's best-calibrated region (little edge), and a single upset wipes many
-small wins (negative skew). Not a verdict — sample is tiny.
+## Current state — IDEA TESTED, ARCHIVED (no edge)
+The "near-certain favorite" idea (buy the ≥0.90 side ending soon, hold to settlement) was
+swept across the **top 50 liquid series, n=1,655 bets, 24h horizon** and **fails decisively**:
+favorites are ~3.3¢ **over**priced (realized win 0.927 vs implied 0.960), mean net return
+**−3.78%/bet**, t=−5.66, and the loss is **robust to the drop-top-N stress test** (i.e. broad
+and systematic, not a single-upset artifact). Full write-up:
+[`docs/kalshi-near-certain-favorite-FINDINGS.md`](docs/kalshi-near-certain-favorite-FINDINGS.md).
+This is Gate 1 / H2 = FAIL → archived. The tooling (`scripts/kalshi_pull.py`) stands for
+any future prediction-market hypothesis.
 
 ## Scripts
 ```bash
@@ -34,8 +36,6 @@ python3 prediction-markets/scripts/kalshi_pull.py --series KXHIGHNY,KXBTCD --out
 ```
 
 ## Next step
-Scale `kalshi_pull.py` into the full **Gate 1 / H2** backtest: all liquid series × full
-settled history × multiple horizons, with a liquidity floor, reporting the calibration
-edge net of fees **and** the drop-top-N-winners stress test. Predicted outcome: clears
-"data exists," fails "fee-survivable edge after the tail." If so, archive as a documented
-no-edge result.
+None required for this idea — it's archived. The discovery cache
+(`data/kalshi_series_liquid.json`) and tooling remain for the next hypothesis (e.g.
+post-news drift / H1, or a different price band). Re-runs skip discovery.
