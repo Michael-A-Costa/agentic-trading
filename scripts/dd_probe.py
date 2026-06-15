@@ -95,8 +95,16 @@ def _fetch_cboe_history(sym: str) -> dict:
         d = json.loads(mc._http_get(CBOE_HIST.format(sym=urllib.parse.quote(sym.upper()))))
         bars = d.get("data") or []
         pairs = [(mc._fnum(b.get("close")), mc._fnum(b.get("volume"))) for b in bars]
-        pairs = [(c, v) for (c, v) in pairs if c is not None and v is not None][-HIST_DAYS:]
-        return {"closes": [c for c, _ in pairs], "volumes": [v for _, v in pairs]} if pairs else {}
+        pairs = [(c, v) for (c, v) in pairs if c is not None and v is not None]
+        if not pairs:
+            return {}
+        # 52-week high/low from the last ~252 sessions' CLOSES (computed BEFORE the HIST_DAYS
+        # truncation that scopes the MA / 3-mo windows). Closes (not intraday highs) keeps it
+        # consistent with our 3-mo high/low; Cboe bars don't carry per-bar high/low here anyway.
+        closes_52w = [c for c, _ in pairs][-252:]
+        kept = pairs[-HIST_DAYS:]
+        return {"closes": [c for c, _ in kept], "volumes": [v for _, v in kept],
+                "hi_52w": max(closes_52w), "lo_52w": min(closes_52w)}
     except (OSError, ValueError, KeyError, TypeError):
         return {}
 
@@ -128,7 +136,8 @@ def _write_history_cache(path: Path, sym: str, hist: dict, src: str, today: str)
     rec = {"symbol": sym, "source": src, "fetched_date": today,
            "fetched_ts_et": datetime.now(mc.ET).isoformat(timespec="seconds"),
            "n_bars": len(hist["closes"]),
-           "closes": hist["closes"], "volumes": hist["volumes"]}
+           "closes": hist["closes"], "volumes": hist["volumes"],
+           "hi_52w": hist.get("hi_52w"), "lo_52w": hist.get("lo_52w")}
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(rec))
@@ -148,17 +157,19 @@ def load_history(sym: str) -> tuple[dict, str | None]:
     path = HISTORY_DIR / f"{sym}.json"
     cached = _read_history_cache(path)
     if cached and cached.get("fetched_date") == today and cached.get("closes"):
-        return {"closes": cached["closes"], "volumes": cached["volumes"]}, cached.get("source")
+        return {"closes": cached["closes"], "volumes": cached["volumes"],
+                "hi_52w": cached.get("hi_52w"), "lo_52w": cached.get("lo_52w")}, cached.get("source")
 
     hist, src = _fetch_cboe_history(sym), "cboe"
     if not hist.get("closes"):
-        hist, src = yahoo_history(sym), "yahoo"
+        hist, src = yahoo_history(sym), "yahoo"   # 3-mo only -> no hi_52w/lo_52w (52w stays null)
     if hist.get("closes"):
         _write_history_cache(path, sym, hist, src, today)
         return hist, src
 
     if cached and cached.get("closes"):   # live fetch failed -> last-known-good beats blind
-        return {"closes": cached["closes"], "volumes": cached["volumes"]}, (cached.get("source") or "cache")
+        return {"closes": cached["closes"], "volumes": cached["volumes"],
+                "hi_52w": cached.get("hi_52w"), "lo_52w": cached.get("lo_52w")}, (cached.get("source") or "cache")
     return {}, None
 
 
@@ -239,6 +250,12 @@ def probe(sym: str) -> dict:
         intraday_pct = pct(last, prev_close)
     range_pos = (round((last - day_low) / (day_high - day_low), 3)
                  if (last is not None and day_high and day_low and day_high > day_low) else None)
+    # 52-week position: normalized place in the 1-yr close range (1.0 = at 52w high, 0 = at 52w low)
+    # plus % distance to the 52w high. Breakout/washout CONTEXT for the model; null when history
+    # lacks a year (e.g. Yahoo fallback or recent IPO) — never a gate, never false-on-missing-data.
+    hi52, lo52 = mc._fnum(hist.get("hi_52w")), mc._fnum(hist.get("lo_52w"))
+    range_pos_52w = (round((last - lo52) / (hi52 - lo52), 3)
+                     if (last is not None and hi52 and lo52 and hi52 > lo52) else None)
     dollar_vol = round(today_vol * last, 0) if (today_vol and last) else None
     out.update(
         last=last,
@@ -246,6 +263,8 @@ def probe(sym: str) -> dict:
         iv30=mc._fnum(cb.get("iv30")),
         gap_pct=pct(day_open, prev_close) if (day_open and prev_close) else None,
         intraday_pct=intraday_pct, range_pos=range_pos,
+        high_52w=hi52, low_52w=lo52, range_pos_52w=range_pos_52w,
+        dist_52w_high_pct=pct(last, hi52) if (last is not None and hi52) else None,
         today_volume=today_vol, dollar_volume_today=dollar_vol,
     )
     # Hard data problem only when we can't even confirm a live price/liquidity (Cboe down too).

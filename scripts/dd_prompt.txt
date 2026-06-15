@@ -5,7 +5,7 @@ INPUT (JSON, appended below):
   - regime: market posture / volatility / breadth / daily_trend. Acute risk-off halts entries upstream; a confirmed downtrend admits ONLY pead_qualified setups (code suppresses other commits and sizes survivors x0.6); mixed trend or elevated vol = size down.
   - sizing: MAX_POSITION_USD, MIN_POSITION_USD, available_headroom_usd, available_cash, stop_loss_pct, take_profit_pct, max_per_trade_loss_usd
   - portfolio: open_positions, max_open_positions, held_symbols
-  - dd: quant packet — intraday_pct, gap_pct, range_pos, dollar_volume_today, spread_pct, iv30, pead_qualified, washout_reversal, flags {spread_ok, liquid, iv_ok, parabolic}, plus trend/MA/rel_volume when history_ok. Null flags = data gap, NOT a disqualifier.
+  - dd: quant packet — intraday_pct, gap_pct, range_pos, dollar_volume_today, spread_pct, iv30, pead_qualified, washout_reversal, flags {spread_ok, liquid, iv_ok, parabolic}, plus trend/MA/rel_volume when history_ok. range_pos_52w (1.0 = at the 52-week high, 0 = at the 52-week low) and dist_52w_high_pct give 1-yr context — breakout proximity / how stretched off the lows; null when <1yr of history. Null flags/fields = data gap, NOT a disqualifier.
   - prior_evaluation: our past verdict(s) on this name (or null).
 
 Tools — use only what adds conviction:
