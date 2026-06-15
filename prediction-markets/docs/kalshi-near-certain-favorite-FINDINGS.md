@@ -43,6 +43,24 @@ win=0.951 net **−2.78%**. Both negative.
 3. **Fees are not the culprit** — they're tiny at the extremes; the loss is the
    ask/spread vs. realized-frequency gap.
 
+## External corroboration (2026-06-14 web-research sweep)
+A multi-agent web-research sweep run the same day (`research/kalshi-bot-research.md`,
+adversarially verified) independently explains *why* the favorite side prices rich on Kalshi:
+- **The documented edge is on the LONGSHOT side, not the favorite side.** Becker's 72.1M-trade
+  study finds the "optimism tax" lives in cheap YES contracts retail overpays for: at 1¢, YES won
+  0.43% vs 1% implied (−41% EV YES vs **+23% NO**), and **NO outperformed YES at 69 of 99 price
+  levels, concentrated at the extremes.** Buying the ≥0.90 favorite is the *low-edge* side of this;
+  *fading cheap longshots* is where the money historically was.
+- **The extremes are the best-calibrated region** (GWU/UCD, 300k+ contracts) — little favorite
+  *under*pricing to harvest, consistent with our measured reversal to −0.033.
+- **The bias is decaying** — the favorite-longshot ψ-coefficient is "smaller and less significant"
+  in 2025, and the maker-taker transfer only appeared after Oct-2024 pro-MM entry.
+
+This reinforces the archive decision and re-routes the only live follow-up — *fade the longshot /
+make the spread* (Decision item 2 below) — to the market-making plan
+([`kalshi-market-making-v1-plan.md`](kalshi-market-making-v1-plan.md), H2), where adverse selection
+(the reason it's likely un-tradable after real depth) is the pre-registered risk.
+
 ## Caveats (don't over-read)
 - Candle **ask** captures spread but not depth/partial fills (true large-size fills
   could be worse, not better).
