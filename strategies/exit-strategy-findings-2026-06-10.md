@@ -589,3 +589,85 @@ unproven on this sample). **→ CHECK AT THE §A9/§A12 30-RT CHECKPOINT (~2026-
 out-of-sample, wire `q_floor_nudge` into `live_execute` behind an OFF-by-default cap (e.g.
 `STOP_MAGNET_NUDGE`/`STOP_MAGNET_BAND`) and validate live. Repro: `stop_hygiene.py --selfcheck` /
 `--replay [--band 0.05 --off 0.03]`.
+
+### A17. WHOLE-LOT trail width — PRE-REGISTERED counterfactual + variant grid (2026-06-15, NO dial change).
+**Motivating event (recorded as the prompt, NOT used to pick the grid below).** With the harvest off
+intraday 6/15 (`DISCO_SCALE_OUT_TIERS=`/`SCALE_OUT_TIERS=` OFF, owner "strong-open day — let the full
+lot run"; re-enabled at 50% that PM, see A18), the **whole-lot trail3@8** (A15) was the *only* give-back
+protection on a runner — the
+§A12 remnant test is dormant because no remnants are being minted. HQ (disco, IonQ-256-qubit gap) is the
+first live whipsaw of it: entry 15.5799 → trail armed at +8% (16.83) → sentinel peak 17.60 (+13.0%,
+14:32:48 ET) → the 3% trail trigger (17.01, ~3% below the 17.535 high-water) fired on a **single-minute
+reversal** and the whole 17-share lot filled at **16.84 (+8.1%, +$21.42)** — which was the *exact low
+tick* of that minute. HQ recovered to 17.195 by the close of the same bar and to 17.75 within 20 min.
+This is precisely the A15.1 watch-item ("a 3% trail will trip on intraday wicks and exit some runners
+early … widen 5–8% if it over-trims") getting its first live data point. **It is logged here so the
+grid/rule can be frozen BEFORE the result is scored — the grid is NOT the width that would have saved
+HQ.**
+
+**The gap this closes.** §A12 pre-registered a counterfactual for the *remnant* trail (the 25% left
+after a +10 harvest) but there is **no pre-registered test for the whole-lot trail** (the +8%-armed trail
+on the *full* lot, pre-harvest). That whole-lot trail is what A14/A15 said would "earn its own
+pre-registration once flat3 survives intraday." With harvest OFF it is now the dominant exit path, so it
+needs scoring on the same discipline as A12 — frozen grid, binding decision rule, ≥N-trip threshold, no
+post-hoc variants.
+
+**Instrumentation (TO BUILD — spec frozen here; mirrors `--remnant`):** add
+`exit_counterfactual.py --wholelot`. For every live lot that **armed the whole-lot trail** (first
+sentinel mark ≥ entry×(1+`TRAIL_ACTIVATE_PCT`/100), default +8%) and then exited via trail or floor,
+replay its ride from the arm point forward on the 1-min sentinel tape (`data/quotes-intraday.jsonl`)
+under each variant below, vs what the live 3% trail actually realized. High-water tracks from the arm
+mark; **be5+1% floor active throughout** (the live net — worst case still ≈+1%). When harvest is
+re-enabled, a lot that reaches +10 hands off to the §A12 remnant test at the harvest and is NOT scored
+here past that point (no double-counting); only lots that trail-exit *before* +10 are whole-lot cases.
+Entry-vol fields (`iv30`/`rvol20`) reuse the buy-row values + `entry_vol_backfill.json` sidecar, same as
+A12. (HQ's buy row predates vol-on-buy-rows — backfill it in the sidecar so the vscale arms are scorable.)
+
+**PRE-REGISTERED variant grid (frozen — identical structure to the A12 remnant grid so it cannot be
+reverse-fit to HQ):**
+- `flat2 / flat3 (live) / flat5 / flat8` — fixed trail width %.
+- `vscale1.0 / 1.25 / 1.5` — width = clamp(k × iv30_entry/√252, 3, 8); rvol20 fallback; n/a if neither.
+- `delay3@11ET` — 3% trail, armed only from 11:00 ET (high-water still tracks from the +8 arm).
+
+All variants share the +8% activation and the be5+1% floor. (Note the grid already **brackets** the
+~4.0–4.7% that a back-of-envelope says would have held HQ's wick — `vscale1.25`≈4.3%, `flat5`=5% — so the
+question "would a wider trail have held?" is answered *inside* the registered grid, no custom width needed.)
+
+**Binding decision rule (at ≥30 scored live whole-lot-trail round-trips):** adopt the variant that beats
+the live `flat3` on **mean realized return per lot** (net of the be5+1% floor, net 15bps/leg); ties or
+insufficient tape coverage **keep flat3**. Same threshold and tie-handling as §A12/§A9. Until then: **no
+dial change** — the live trail stays `TRAIL_STOP_PCT=3` / `TRAIL_ACTIVATE_PCT=8`.
+
+**Contamination / throughput notes.** (1) While harvest is OFF, *every* disco runner that clears +8% is a
+whole-lot case → this sample accrues **fast** (and the §A12 remnant sample is frozen at its current n).
+(2) When harvest flips back on, whole-lot cases revert to "trail-exit before +10 only" and accrue slower —
+not contamination, a throughput change, same caveat as A15.2. (3) The 1-min tape is the only source free
+of the daily-bar whipsaw bias (A9) — a lot whose tape starts >5 min after the arm is flagged
+TAPE-GAP and excluded from the aggregate, as in `--remnant`. **→ CHECK AT THE 30-RT CHECKPOINT (with
+§A9/§A12, ~2026-06-26 or once harvest-off accrues 30 whole-lot arms, whichever first):** run
+`exit_counterfactual.py --wholelot`; apply the rule above.
+
+### A18. Harvest RE-ENABLED at 50% (was 75%, briefly OFF) + tape truncation/market-context fixed (2026-06-15 PM).
+**Corrected history.** The 6/15 harvest-OFF was for **6/15 itself** (not "tomorrow" as the original .env
+comment mis-said) — owner let full disco lots run because the market **opened very strong**. The bet
+didn't pay, but not because riding was wrong: **our buys never captured the open's upside** (entry
+selection/timing, not the exit policy). So harvest-off cost us the capital-recycling edge for no offsetting
+gain. **Re-enabled same PM at `DISCO_SCALE_OUT_TIERS=10:0.50`** (was `10:0.75`).
+
+**Why 50%, not 75% or off.** The A15b backtest says harvest-vs-not is a per-trade wash (+0.50 vs +0.51%)
+but a **~22% terminal-equity gap** in `port_pr` — the capital-recycling edge that *binds* in this cash
+account (6/15: $3.1k total, equities $846, but only **$111 settled buying power** — velocity is the
+constraint). 50% splits it: bank half at +10 to recycle settled cash, let half ride the 3% trail for the
+runner tail. A15c's fraction sweep was INCONCLUSIVE (50–65% looked best on the daily-bar trail's optimism,
+but that's coupled to trail-survival which the tape hasn't cleared) — so 50% is a deliberate **owner
+midpoint**, not a tuned optimum. Revisit the fraction at the §A12/§A17 30-RT checkpoint once `--remnant`
+and `--wholelot` have real n.
+
+**Accrual consequence.** With harvest back on, whole-lot cases (§A17) revert to "trail-exit *before* +10
+only" → slower accrual; the §A12 remnant sample resumes (now a **50%** remnant rides, vs 75% pre-6/12).
+Neither test's grid/rule changes — only throughput. **Instrumentation shipped 6/15 PM** (no dial coupling):
+`exit_counterfactual.py --wholelot` (A17 replay), `TAPE_RETAIN_DAYS=3` in `live_sentinel.py` (a closed
+name stays on the 1-min tape 3 calendar days so its post-exit ride is observable — fixes the A17
+truncation, forward-only), and **market-context symbols** (SPY/QQQ/VIX + sector proxies) now taped every
+sentinel pass so remnant/whole-lot replays can be conditioned on the regime the trade rode, not just the
+single name.
