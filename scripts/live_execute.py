@@ -1283,7 +1283,30 @@ def main() -> int:
     if state.get("day") != today or state.get("start_of_day_equity") is None:
         state["day"] = today
         state["start_of_day_equity"] = equity
-    day_pnl = round(equity - (state.get("start_of_day_equity") or equity), 2)
+        # Deposits/withdrawals after SOD are external cash flows, NOT trading P&L. RH instant-credits
+        # an ACH deposit into `cash` (so it lands in `equity` above) while flagging the still-settling
+        # amount in `pending_deposits`. We track the running high-water of pending_deposits and add any
+        # NEW deposit to `deposit_adjustment`, which is subtracted from day_pnl so it measures trading
+        # only. Whatever is already pending at SOD is baked into SOD equity, so it's the baseline — not
+        # an adjustment. (Settlement later zeroes pending_deposits but leaves the cash; we never reduce
+        # the adjustment on that drop, keeping day_pnl stable across the settle boundary.)
+        state["deposit_hw"] = float(broker.get("pending_deposits") or 0.0)
+        state["deposit_adjustment"] = 0.0
+        state["manual_flow_adjustment"] = 0.0  # see manual override note below; clears each new day
+    pending = float(broker.get("pending_deposits") or 0.0)
+    if pending > state.get("deposit_hw", 0.0) + 1e-6:
+        state["deposit_adjustment"] = round(
+            state.get("deposit_adjustment", 0.0) + (pending - state["deposit_hw"]), 2)
+        state["deposit_hw"] = pending
+    # Manual signed override for flows the auto path can't see. WITHDRAWALS can't be auto-detected:
+    # the broker has no pending_withdrawals field, and a withdrawal looks identical to a pending
+    # deposit settling (both just drop pending_deposits / move cash), so inferring it would misread
+    # routine settlement as a withdrawal and corrupt the breaker. Set this field in live_state.json
+    # instead — NEGATIVE for a withdrawal (cash left the account), POSITIVE for a deposit the auto
+    # path missed. Like deposit_adjustment it's subtracted from day_pnl, so day_pnl stays trading-only,
+    # and it auto-clears at the next SOD (the new day's SOD equity already bakes the flow in).
+    flow_adjustment = state.get("deposit_adjustment", 0.0) + float(state.get("manual_flow_adjustment") or 0.0)
+    day_pnl = round(equity - (state.get("start_of_day_equity") or equity) - flow_adjustment, 2)
 
     log: list = []
     results: list = []
