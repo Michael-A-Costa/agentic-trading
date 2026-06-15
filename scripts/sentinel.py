@@ -41,7 +41,8 @@ ENGINE_LOG = DATA / "engine-log.jsonl"
 
 # Fire a full planner tick at these minutes past midnight ET on open day, regardless of the
 # 10-min scheduler phase — so we never miss more than 1 minute of the open window.
-FORCE_TICK_MINUTES_ET = {(9, 32), (9, 35), (9, 39)}
+# Owner 2026-06-15: blanket 9:30–9:45 every minute (was {9:32,9:35,9:39}) for a high-action open.
+FORCE_TICK_MINUTES_ET = {(9, m) for m in range(30, 46)}
 
 
 def exit_actions_from_screen(context: dict) -> list[dict]:

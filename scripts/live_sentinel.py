@@ -50,7 +50,8 @@ ENGINE_LOG = REPO / "data" / "engine-log.jsonl"
 QUOTE_TAPE = REPO / "data" / "quotes-intraday.jsonl"
 ET = ZoneInfo("America/New_York")
 
-FORCE_TICK_MINUTES_ET = {(9, 32), (9, 35), (9, 39)}
+# Owner 2026-06-15: blanket 9:30–9:45 every minute (was {9:32,9:35,9:39}) for a high-action open.
+FORCE_TICK_MINUTES_ET = {(9, m) for m in range(30, 46)}
 
 # don't re-fire a lot whose sell was already dispatched within this window (lets the planner reconcile
 # book the fill before we'd try again); after it, a still-held + still-breached lot may re-fire.
