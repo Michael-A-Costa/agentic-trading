@@ -178,6 +178,156 @@ def replay_remnant(path: list[tuple[str, str, float]], entry: float, width: floa
     return "riding", path[-1][2], path[-1][0]
 
 
+def replay_wholelot(path: list[tuple[str, str, float]], floor_px: float, width: float,
+                    tp_px: float, delay_arm: bool) -> tuple[str, float, str]:
+    """Walk the 1-min path from the +8% ARM forward under one WHOLE-LOT trail rule (A17).
+    Returns (status, exit_or_last_price, ts), status in 'trail' | 'floor' | 'tp' | 'riding'.
+    Identical mechanics to replay_remnant except the floor is the be5+1% rung (entry x 1.01),
+    not breakeven — the live net for a full lot. High-water tracks from the arm mark."""
+    hw = path[0][2]
+    arm_after = path[0][1][:10] + "T11:00:00" if delay_arm else ""
+    for ts_utc, ts_et, last in path:
+        hw = max(hw, last)
+        if last >= tp_px:
+            return "tp", tp_px, ts_utc
+        if last <= floor_px:
+            return "floor", floor_px, ts_utc
+        if (not delay_arm or ts_et >= arm_after) and last <= hw * (1 - width / 100.0):
+            return "trail", last, ts_utc
+    return "riding", path[-1][2], path[-1][0]
+
+
+def wholelot_report(cost_bps: float) -> int:
+    """--wholelot (A17): score the SAME pre-registered grid as --remnant on every live lot that
+    armed the whole-lot trail (+8%) and was never harvested (no scale_out) — i.e. the full lot
+    rode the trail. Replays each variant from the arm point on the 1-min sentinel tape, floored by
+    be5+1%, capped by TP. Grid + decision rule frozen in §A17 — do NOT add variants post-hoc."""
+    import json
+    from datetime import datetime
+    rows = tl.load_rows(LEDGER, None, None, "live", None)
+    tape = load_tape()
+    tp_cap = envf("TAKE_PROFIT_PCT", 40.0)
+    be_off = envf("TRAIL_BREAKEVEN_OFFSET_PCT", 1.0)
+    act_base = envf("TRAIL_ACTIVATE_PCT", 8.0)
+    act_disco = envf("DISCO_TRAIL_ACTIVATE_PCT", 8.0)
+    cost = cost_bps / 10000.0 * 2  # entry + exit leg, uniform across variants (cancels in deltas)
+    try:
+        backfill = json.loads((REPO / "data" / "entry_vol_backfill.json").read_text())
+    except (OSError, ValueError):
+        backfill = {}
+    # FIFO lots; flag any lot a scale_out harvest touched (those are §A12 remnant cases, not here)
+    # and record the lot's realized exit(s) for the reference column.
+    by_sym: dict[str, deque] = defaultdict(deque)
+    all_lots: list[dict] = []
+    for r in rows:
+        sym = str(r.get("symbol", "")).upper()
+        side = str(r.get("side", "")).lower()
+        qty = float(r.get("qty") or 0.0)
+        if side == "buy" and r.get("price") is not None and qty > 0:
+            lot = {"sym": sym, "buy": r, "qty_left": qty, "harvested": False, "exits": []}
+            by_sym[sym].append(lot)
+            all_lots.append(lot)
+            continue
+        if side != "sell" or qty <= 0 or r.get("price") is None:
+            continue
+        et = r.get("exit_type")
+        remaining, dq = qty, by_sym[sym]
+        while remaining > 1e-9 and dq:
+            lot = dq[0]
+            take = min(remaining, lot["qty_left"])
+            lot["exits"].append((take, float(r["price"]), r.get("ts_utc") or "", et))
+            if et == "scale_out":
+                lot["harvested"] = True
+            lot["qty_left"] -= take
+            remaining -= take
+            if lot["qty_left"] <= 1e-9:
+                dq.popleft()
+    cands = [l for l in all_lots if not l["harvested"] and l["exits"]]  # closed, never harvested
+    if not cands:
+        print("no closed whole-lot (non-harvested) live lots in the ledger yet")
+        return 0
+    if not tape:
+        print(f"{len(cands)} whole-lot candidate(s) but no quote tape yet ({QUOTE_TAPE.name})")
+        return 0
+
+    print(f"WHOLE-LOT trail replay — {len(cands)} live non-harvested lot(s), pre-registered grid "
+          f"(A17 = A12 grid), be{envf('TRAIL_BREAKEVEN_AT_PCT', 5):.0f}+{be_off:.0f}% floor + "
+          f"TP{tp_cap:.0f} cap, {cost_bps:.0f}bps/leg\n")
+    agg: dict[str, list[float]] = defaultdict(list)
+    for lot in cands:
+        b = lot["buy"]
+        sym = lot["sym"]
+        entry = float(b["price"])
+        ets = b.get("ts_utc") or ""
+        book = str(b.get("book") or "untagged")
+        act = act_disco if book == "disco" else act_base
+        arm_px = entry * (1 + act / 100.0)
+        floor_px = entry * (1 + be_off / 100.0)
+        tp_px = entry * (1 + tp_cap / 100.0)
+        date = (b.get("ts_et") or ets or "")[:10]
+        bf = backfill.get(f"{sym}:{date}", {})
+        iv30 = b.get("iv30") if b.get("iv30") is not None else bf.get("iv30")
+        rvol20 = b.get("rvol20") if b.get("rvol20") is not None else bf.get("rvol20")
+        vol_note = (f"iv30={iv30:.0f}%" if iv30 is not None else
+                    (f"rvol20={rvol20:.0f}%" if rvol20 is not None else "no entry vol"))
+        # qty-weighted realized of the closed portion (the live outcome, for reference)
+        qsum = sum(q for q, _, _, _ in lot["exits"])
+        realized = (sum(q * px for q, px, _, _ in lot["exits"]) / qsum) / entry - 1.0 if qsum else 0.0
+        last_exit_ts = max((ts for _, _, ts, _ in lot["exits"] if ts), default="")
+        path = [p for p in tape.get(sym, []) if p[0] >= ets]
+        if not path:
+            print(f"{sym:<6} entry {entry:.2f} {date} ({vol_note}) realized {realized*100:+.2f}% "
+                  f"— no tape coverage (excluded)")
+            continue
+        if path[0][2] >= arm_px:  # armed before the tape started → run-up/high-water unobserved
+            print(f"{sym:<6} entry {entry:.2f} {date} ({vol_note}) realized {realized*100:+.2f}% "
+                  f"— TAPE-GAP: armed (+{act:.0f}%) before tape coverage, EXCLUDED")
+            continue
+        arm_i = next((k for k, p in enumerate(path) if p[2] >= arm_px), None)
+        if arm_i is None:
+            print(f"{sym:<6} entry {entry:.2f} {date} ({vol_note}) realized {realized*100:+.2f}% "
+                  f"— never reached +{act:.0f}% on tape (floor case, not a trail case)")
+            continue
+        arm_path = path[arm_i:]
+        # tape truncates when the live position closes → wider variants can't be seen past our exit
+        trunc = ""
+        if last_exit_ts and path[-1][0] <= last_exit_ts:
+            trunc = "  [TAPE ENDS AT LIVE EXIT — wider-variant returns are LOWER BOUNDS]"
+        elif last_exit_ts:
+            tail = (datetime.fromisoformat(path[-1][0]) -
+                    datetime.fromisoformat(last_exit_ts)).total_seconds() / 60
+            if tail < 10:
+                trunc = f"  [tape ends {tail:.0f}m after exit — wider variants partly unobserved]"
+        peak = max(p[2] for p in arm_path)
+        print(f"{sym:<6} entry {entry:.2f} {date}  armed +{act:.0f}% @ {arm_px:.2f}  "
+              f"peak {peak:.2f} (+{(peak/entry-1)*100:.1f}%)  realized {realized*100:+.2f}%  "
+              f"({vol_note}, {len(arm_path)} marks){trunc}")
+        for label, kind, param in REMNANT_VARIANTS:
+            w = trail_width(kind, param, iv30, rvol20)
+            if w is None:
+                print(f"    {label:<12} n/a (no entry vol recorded)")
+                continue
+            status, px, ts = replay_wholelot(arm_path, floor_px, w, tp_px, kind == "delay")
+            ret = px / entry - 1.0 - cost
+            agg[label].append(ret)
+            print(f"    {label:<12} w={w:.1f}%  {status:<7} @ {px:.2f}  ({ret*100:+.2f}%)"
+                  + (f"  {ts[:16]}" if status != "riding" else "  (riding @ tape end)"))
+    if agg:
+        n = max(len(v) for v in agg.values())
+        print(f"\nper-variant mean whole-lot return (n scored, {n} max):")
+        base = sum(agg.get("flat3", [])) / len(agg["flat3"]) if agg.get("flat3") else None
+        for label, _, _ in REMNANT_VARIANTS:
+            rets = agg.get(label)
+            if rets:
+                m = sum(rets) / len(rets)
+                delta = f"  ({(m-base)*100:+.2f}% vs flat3)" if base is not None and label != "flat3" else ""
+                print(f"  {label:<12} {m*100:+.2f}%  (n={len(rets)}){delta}")
+        print(f"\ndecision rule (pre-registered, A17): at >=30 scored whole-lot round-trips adopt "
+              f"the variant beating flat3 on mean realized return; ties / insufficient tape keep "
+              f"flat3. CURRENTLY n={n} — {'BELOW' if n < 30 else 'AT/ABOVE'} the bar, no dial change.")
+    return 0
+
+
 def remnant_report() -> int:
     """--remnant: score the pre-registered trail variants on every live disco harvest with tape."""
     import json
@@ -275,10 +425,14 @@ def main() -> int:
     ap.add_argument("--refresh", action="store_true", help="refetch all price history")
     ap.add_argument("--remnant", action="store_true",
                     help="replay remnant-trail variants on the 1-min sentinel quote tape (A12)")
+    ap.add_argument("--wholelot", action="store_true",
+                    help="replay whole-lot trail variants on every non-harvested armed lot (A17)")
     args = ap.parse_args()
 
     if args.remnant:
         return remnant_report()
+    if args.wholelot:
+        return wholelot_report(args.cost_bps)
 
     rows = tl.load_rows(LEDGER, args.since, None, args.mode, args.book)
     trips = round_trips_with_meta(rows)
