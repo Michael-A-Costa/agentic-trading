@@ -538,6 +538,95 @@ def test_execute_sell_full_close_is_market():
             sys.modules.pop("rh_mcp", None)
 
 
+def _guard_fixture():
+    """rh_mcp fake + a fresh-entry whole-share lot with a resting stop, for the §A19 guard tests."""
+    import types
+    from datetime import datetime, timezone
+    calls = {"cancel": [], "place": []}
+    fake = types.ModuleType("rh_mcp")
+    fake.cancel = lambda oid: (calls["cancel"].append(oid), {"errors": {}})[1]
+    fake.place = lambda spec, ref_id: (calls["place"].append(spec),
+                                       {"order": {"data": {"id": "x1"}}, "errors": {}})[1]
+    state = {"lots": {"BRUN": {"qty": 4, "entry_price": 36.90, "stop_price": 32.47,
+                               "resting_stop_order_id": "stop1", "stop_type": "resting",
+                               "entry_ts": datetime.now(timezone.utc).isoformat(timespec="seconds")}}}
+    broker = {"positions": {"BRUN": {"qty": 4.0, "avg_cost": 36.90}},
+              "quotes": {"BRUN": {"bid": 36.74, "last": 36.76, "ask": 36.78}}}  # −0.38%, noise band
+    return fake, calls, state, broker
+
+
+def test_discretionary_guard_off_by_default_passes_through():
+    """Guard inert unless explicitly armed: a sub-threshold discretionary exit still fills by default."""
+    import types
+    saved = sys.modules.get("rh_mcp")
+    fake, calls, state, broker = _guard_fixture()
+    sys.modules["rh_mcp"] = fake
+    os.environ["LIVE_ARMED"] = "1"
+    for k in ("DISCRETIONARY_EXIT_GUARD", "DISCRETIONARY_EXIT_MIN_HOLD_MIN", "DISCRETIONARY_EXIT_MIN_MOVE_PCT"):
+        os.environ.pop(k, None)
+    try:
+        res = le.execute_sell("BRUN", {"reason": "manage: low conviction, cut it"}, state, broker, CAPS, log := [])
+        check("guard off → exit placed", res["status"] == "placed" and len(calls["place"]) == 1, (res, calls))
+        check("guard off → stop cancelled as usual", "stop1" in calls["cancel"], calls)
+        check("guard off → no block event", not any(e["event"] == "discretionary_exit_blocked" for e in log), log)
+    finally:
+        os.environ.pop("LIVE_ARMED", None)
+        sys.modules["rh_mcp"] = saved if saved is not None else sys.modules.pop("rh_mcp", None)
+
+
+def test_discretionary_guard_blocks_subthreshold_recent_exit():
+    """Armed guard SKIPS a discretionary full-lot exit on a noise-band move minutes after entry, and
+    leaves the resting stop ARMED (never cancelled) so the rail still carries the lot — the BRUN fix."""
+    saved = sys.modules.get("rh_mcp")
+    fake, calls, state, broker = _guard_fixture()
+    sys.modules["rh_mcp"] = fake
+    os.environ.update({"LIVE_ARMED": "1", "DISCRETIONARY_EXIT_GUARD": "1",
+                       "DISCRETIONARY_EXIT_MIN_HOLD_MIN": "30", "DISCRETIONARY_EXIT_MIN_MOVE_PCT": "2.0"})
+    try:
+        res = le.execute_sell("BRUN", {"reason": "manage: low conviction, parabolic, cut it"},
+                              state, broker, CAPS, log := [])
+        check("blocked exit is skipped", res["status"] == "skipped", res)
+        check("blocked exit placed nothing", calls["place"] == [], calls)
+        check("blocked exit did NOT cancel the stop (rail intact)", calls["cancel"] == [], calls)
+        check("lot still has its resting stop", state["lots"]["BRUN"]["resting_stop_order_id"] == "stop1", state)
+        check("block was logged", any(e["event"] == "discretionary_exit_blocked" for e in log), log)
+    finally:
+        for k in ("LIVE_ARMED", "DISCRETIONARY_EXIT_GUARD", "DISCRETIONARY_EXIT_MIN_HOLD_MIN",
+                  "DISCRETIONARY_EXIT_MIN_MOVE_PCT"):
+            os.environ.pop(k, None)
+        sys.modules["rh_mcp"] = saved if saved is not None else sys.modules.pop("rh_mcp", None)
+
+
+def test_discretionary_guard_passes_stop_and_big_move_and_trim():
+    """The guard is narrow: it must NOT touch a stop-loss exit, a beyond-band move, or a partial trim
+    — only sub-threshold discretionary FULL closes. All three of these should place normally."""
+    saved = sys.modules.get("rh_mcp")
+    os.environ.update({"LIVE_ARMED": "1", "DISCRETIONARY_EXIT_GUARD": "1",
+                       "DISCRETIONARY_EXIT_MIN_HOLD_MIN": "30", "DISCRETIONARY_EXIT_MIN_MOVE_PCT": "2.0"})
+    try:
+        # (a) a stop-loss-reason full close → classify_exit != 'other' → passes
+        fake, calls, state, broker = _guard_fixture()
+        sys.modules["rh_mcp"] = fake
+        res = le.execute_sell("BRUN", {"reason": "synthetic stop hit"}, state, broker, CAPS, [])
+        check("stop exit not blocked", res["status"] == "placed", res)
+        # (b) discretionary but move beyond the band (−10%) → passes
+        fake, calls, state, broker = _guard_fixture()
+        broker["quotes"]["BRUN"] = {"bid": 33.1, "last": 33.21, "ask": 33.3}  # −10%
+        sys.modules["rh_mcp"] = fake
+        res = le.execute_sell("BRUN", {"reason": "manage: thesis broke"}, state, broker, CAPS, [])
+        check("beyond-band discretionary exit not blocked", res["status"] == "placed", res)
+        # (c) a partial trim (qty set) → not a full close → passes
+        fake, calls, state, broker = _guard_fixture()
+        sys.modules["rh_mcp"] = fake
+        res = le.execute_sell("BRUN", {"reason": "manage: trim half", "qty": 2}, state, broker, CAPS, [])
+        check("partial trim not blocked", res["status"] == "placed", res)
+    finally:
+        for k in ("LIVE_ARMED", "DISCRETIONARY_EXIT_GUARD", "DISCRETIONARY_EXIT_MIN_HOLD_MIN",
+                  "DISCRETIONARY_EXIT_MIN_MOVE_PCT"):
+            os.environ.pop(k, None)
+        sys.modules["rh_mcp"] = saved if saved is not None else sys.modules.pop("rh_mcp", None)
+
+
 def test_execute_sell_rearms_stop_on_failed_sell():
     """If the sell place fails after we've cancelled the stop, re-arm it — never leave the lot naked."""
     import types
@@ -968,7 +1057,11 @@ if __name__ == "__main__":
              test_pack_entries_pead_ceiling_and_unsizable_passthrough,
              test_reconcile_trails_resting_stop, test_reconcile_trail_dryrun_places_nothing,
              test_run_relays_parallel_overlaps_and_isolates,
-             test_execute_sell_full_close_is_market, test_execute_sell_rearms_stop_on_failed_sell,
+             test_execute_sell_full_close_is_market,
+             test_discretionary_guard_off_by_default_passes_through,
+             test_discretionary_guard_blocks_subthreshold_recent_exit,
+             test_discretionary_guard_passes_stop_and_big_move_and_trim,
+             test_execute_sell_rearms_stop_on_failed_sell,
              test_reconcile_cancels_stranded_sell_then_arms,
              test_reconcile_adoption_distinct_costs,
              test_execute_buy_arms_stop_in_tick, test_execute_buy_rereads_fill_then_arms,

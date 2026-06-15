@@ -182,6 +182,8 @@ def main() -> int:
     mode = args.mode or os.environ.get("TRADING_MODE") or "all"
     print(f"MODE: {mode}" + ("  (paper + live MIXED — pass --mode live or --mode paper to split)"
                              if mode == "all" else ""))
+    if mode in ("live", "all"):
+        show_broker_truth()
     recs = load_records(args.log, args.since, mode)
     if not recs:
         print("no records in window.")
@@ -205,6 +207,34 @@ def main() -> int:
                            else DEFAULT_STATE)
     show_open(state)
     return 0
+
+
+def show_broker_truth() -> None:
+    """LIVE realized P&L does NOT live in the engine-log — live exits (resting stops, market
+    manage-exits, external closes) never land here as readable sell fills, so the engine-log
+    realized for live is structurally ~0 and the block below would silently mislead. Broker truth
+    is reconcile_ledger.py (FIFO over get_equity_orders, reconciled to broker positions). Surface
+    its last cached number up front; re-run it for a fresh figure."""
+    truth_path = REPO / "data" / "ledger_truth.json"
+    print(f"\n{'=' * 64}\nLIVE realized = BROKER TRUTH (not the engine-log)\n{'=' * 64}")
+    if not truth_path.exists():
+        print("  no data/ledger_truth.json yet — run:  python3 scripts/reconcile_ledger.py --write")
+        print("  (the engine-log block below shows ~0 live sells by construction — see docstring)")
+        return
+    try:
+        t = json.loads(truth_path.read_text())
+    except (OSError, ValueError):
+        print("  ledger_truth.json unreadable — re-run reconcile_ledger.py --write")
+        return
+    gen = (t.get("generated_utc") or "")[:16].replace("T", " ")
+    drift = t.get("drift") or []
+    print(f"  realized {fmt_usd(t.get('realized_usd', 0.0))}   over {t.get('n_round_trips', 0)} round-trips"
+          f"   win-rate {t.get('win_rate', 0)}%   PF {t.get('profit_factor')}")
+    print(f"  reconciled {'✓ exact' if not drift else f'⚠ {len(drift)} drift'}"
+          f"   as of {gen} UTC   (refresh: python3 scripts/reconcile_ledger.py)")
+    print("  exit-type split (broker-confirmed):")
+    for r in t.get("exit_types", []):
+        print(f"    {r['label']:<16}{r['n']:>4}{fmt_usd(r['realized_usd']):>12}{r['win_pct']:>6}%")
 
 
 def show_costs(since: str | None, mode: str, recs: list[dict]) -> None:

@@ -725,10 +725,38 @@ def reconcile(state: dict, broker: dict, log: list) -> None:
             if _en is None or _sp is None or _sp < _en - 1e-9:
                 state.setdefault("last_exit", {})[sym] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             if stale.get("closing_order_id"):
-                # engine-initiated exit completing — the sell is already in the trade history from
-                # the placing tick, so just confirm it (no second trade row; P6 no-double-count).
-                log.append({"event": "closed_confirmed", "symbol": sym,
-                            "order_id": stale.get("closing_order_id")})
+                # Engine-initiated exit completing. The placing tick logged a status=placed row, but a
+                # full close is a MARKET sell, so that row has price=null — without a terminal row the
+                # exit never gets a real fill price and FIFO can't pair it (the live-ledger drift bug).
+                # Re-read the closing order for broker truth and book a status=filled row under the SAME
+                # order_id; consumers dedupe by order_id, keeping the filled row and dropping the placed
+                # null-price one (P6, no double-count). Best-effort: fall back to the stop-level estimate.
+                coid = stale.get("closing_order_id")
+                _entry, _qty = _f(stale.get("entry_price")), _f(stale.get("qty"), 0.0) or 0.0
+                o = _read_order(sym, coid, lookback_s=24 * 3600)
+                _fillpx = _f(_first(o, "average_price", "average_sell_price", "price")) if o else None
+                _fqty = (_f(_first(o, "cumulative_quantity", "filled_quantity", "quantity"))
+                         if o else None) or _qty
+                _real = (round((_fillpx - _entry) * _fqty, 2)
+                         if (_entry and _fillpx and _fqty) else None)
+                _stoppx = _f(stale.get("stop_price"))
+                _rest = (round((_stoppx - _entry) * _qty, 2)
+                         if (_entry and _stoppx and _qty) else None)
+                _ets = stale.get("entry_ts")
+                _held_min = None
+                if _ets:
+                    try:
+                        _held_min = round((datetime.now(timezone.utc)
+                                           - datetime.fromisoformat(_ets)).total_seconds() / 60.0, 1)
+                    except (ValueError, TypeError):
+                        _held_min = None
+                log.append({"event": "exit_filled_confirmed", "symbol": sym, "order_id": coid,
+                            "qty": _fqty or None, "fill_price": _fillpx,
+                            "entry_price": _entry, "book": book_of(stale),
+                            "reason": stale.get("closing_reason") or "engine exit filled",
+                            "high_water": _f(stale.get("high_water")), "held_min": _held_min,
+                            "realized_usd": _real,
+                            "realized_est_usd": None if _real is not None else _rest})
             else:
                 # Determine HOW it left (resting stop fired vs. sold while asleep) and pull the REAL
                 # broker fill price by re-reading the order ledger — the tick snapshot can't see a
@@ -777,6 +805,52 @@ def reconcile(state: dict, broker: dict, log: list) -> None:
                             "realized_est_usd": None if _real is not None else _rest})
 
 
+def _discretionary_exit_blocked(action: dict, lot: dict, broker: dict, sym: str) -> dict | None:
+    """Capital-preservation GUARDRAIL (exit-strategy-findings §A19) — GATED, default OFF.
+
+    Blocks a DISCRETIONARY full-lot exit only when the move is still noise AND the lot is minutes old:
+    the documented BRUN failure mode — a hand-cut on a sub-threshold move the protective rail would
+    never take. Matured broker truth (reconcile_ledger, n=87): discretionary exits −$61 @31% win vs
+    mechanical rails +$96 @~94%. Returns a context dict when the exit should be SKIPPED (so the caller
+    returns before cancelling the resting stop → rail stays armed and carries the lot), else None.
+
+    NEVER blocks stops / TP / scale-outs / EOD / wind-down / breaker liquidations — only manage-driven
+    FULL closes (exit_type 'other'). Double-gated: the master flag must be on AND BOTH thresholds set
+    >0, so it is inert until the owner deliberately arms all three (no silent behaviour change)."""
+    if os.environ.get("DISCRETIONARY_EXIT_GUARD", "0").strip().lower() in ("0", "false", "no", ""):
+        return None
+    reason = action.get("reason", "") or ""
+    if reason.startswith("[breaker-exit]"):                 # never block a circuit-breaker liquidation
+        return None
+    if trade_log.classify_exit(reason) != "other":          # stop/TP/scale/EOD/wind-down pass through
+        return None
+    if action.get("qty") is not None or action.get("scale_tiers"):  # only FULL closes, not trims/scale-outs
+        return None
+    min_hold = _f(os.environ.get("DISCRETIONARY_EXIT_MIN_HOLD_MIN"), 0.0) or 0.0
+    min_move = _f(os.environ.get("DISCRETIONARY_EXIT_MIN_MOVE_PCT"), 0.0) or 0.0
+    if min_hold <= 0 or min_move <= 0:                      # both knobs required → inert by default
+        return None
+    entry = _f(lot.get("entry_price"))
+    ets = lot.get("entry_ts")
+    if not entry or not ets:
+        return None
+    try:
+        held_min = (datetime.now(timezone.utc)
+                    - datetime.fromisoformat(str(ets).replace("Z", "+00:00"))).total_seconds() / 60.0
+    except (ValueError, AttributeError):
+        return None
+    qd = broker["quotes"].get(sym, {})
+    px = _f(qd.get("last") or qd.get("bid") or qd.get("ask"))
+    if px is None:
+        return None
+    move_pct = (px / entry - 1.0) * 100.0
+    if held_min < min_hold and abs(move_pct) < min_move:
+        return {"held_min": round(held_min, 1), "move_pct": round(move_pct, 2),
+                "min_hold_min": min_hold, "min_move_pct": min_move,
+                "entry_price": round(entry, 4), "last": round(px, 4)}
+    return None
+
+
 def execute_sell(sym: str, action: dict, state: dict, broker: dict, caps: dict, log: list) -> dict:
     """Cancel any resting stop, then sell. Returns a result record."""
     import rh_mcp
@@ -807,6 +881,19 @@ def execute_sell(sym: str, action: dict, state: dict, broker: dict, caps: dict, 
     urgent = action.get("qty") is None
     spec = sell_spec(sym, qty, whole=whole, quote=broker["quotes"].get(sym, {}), caps=caps, urgent=urgent)
     res.update(order_spec=spec, qty=qty, urgent=urgent)
+
+    # GUARDRAIL (gated, §A19): a discretionary full-lot exit on a sub-threshold move minutes after entry
+    # is the documented money-loser — skip it and let the protective rail carry the lot. Evaluated BEFORE
+    # the resting-stop cancel below, so a blocked exit leaves the stop ARMED. Inert unless the owner sets
+    # DISCRETIONARY_EXIT_GUARD=1 + both thresholds (default OFF — no behaviour change for the live run).
+    blk = _discretionary_exit_blocked(action, lot, broker, sym)
+    if blk:
+        res["reject_reason"] = (f"discretionary-exit guard: full-lot manage exit at {blk['move_pct']:+.2f}% "
+                                f"after {blk['held_min']:.0f}m held — inside the {blk['min_move_pct']:.0f}%/"
+                                f"{blk['min_hold_min']:.0f}m noise band; holding (rail intact)")
+        log.append({"event": "discretionary_exit_blocked", "symbol": sym, "book": res.get("book"),
+                    "reason": action.get("reason", ""), **blk})
+        return res
 
     if not armed():
         res["status"] = "dryrun"
@@ -851,10 +938,13 @@ def execute_sell(sym: str, action: dict, state: dict, broker: dict, caps: dict, 
     if _entry and _px:
         res["realized_est_usd"] = round((float(_px) - _entry) * float(qty), 2)
     if qty >= held - 1e-9:
-        # Mark the lot as engine-closed so reconcile can tell THIS sell (already in the trade history)
-        # from a genuinely external closure (resting stop fired / sold outside the engine) — only the
-        # latter gets booked as a new trade row when the position disappears (P6, no double-count).
+        # Mark the lot as engine-closed so reconcile can tell THIS sell from a genuinely external
+        # closure (resting stop fired / sold outside the engine). A full close is a MARKET sell, so the
+        # placed row above carries price=null — next tick reconcile re-reads this order_id for the REAL
+        # fill price and books a terminal status=filled row (dedupe by order_id keeps it, drops the
+        # null-price placed row). Remember the reason/exit_type so the terminal row keeps the WHY.
         lot["closing_order_id"] = order_id
+        lot["closing_reason"] = res.get("reason") or action.get("reason") or ""
     else:
         # PARTIAL (scale-out): the lot lives on at the remnant qty — do NOT mark it engine-closed,
         # or a later stop-out of the remnant would be mis-read as this sell completing. Mark the
@@ -905,13 +995,14 @@ def _confirm_recent_buy(sym: str, log: list) -> dict | None:
     return best
 
 
-def _read_order(sym: str, order_id: str) -> dict | None:
-    """Re-read ONE just-placed order from broker truth to get its CURRENT fill state (state /
+def _read_order(sym: str, order_id: str, lookback_s: int = 180) -> dict | None:
+    """Re-read ONE order from broker truth to get its CURRENT fill state (state /
     cumulative_quantity / average_price). The place echo is captured at submission, so a marketable
     limit reads there as unfilled — we re-read to see the fill and size the stop off the real average
-    price. Returns the matching order dict, or None if it isn't visible yet."""
+    price. `lookback_s` widens the window for orders placed on a PRIOR tick (e.g. an engine exit
+    confirmed by reconcile minutes later). Returns the matching order dict, or None if not visible."""
     import rh_mcp
-    since = (datetime.now(timezone.utc) - timedelta(seconds=180)).isoformat(timespec="seconds")
+    since = (datetime.now(timezone.utc) - timedelta(seconds=lookback_s)).isoformat(timespec="seconds")
     blob = rh_mcp.recent_orders(sym, created_at_gte=since)
     raw = _unwrap((blob or {}).get("orders") or {})
     if isinstance(raw, dict):

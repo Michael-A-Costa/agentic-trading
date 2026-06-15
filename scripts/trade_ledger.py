@@ -225,6 +225,10 @@ def main() -> int:
     mode = args.mode or os.environ.get("TRADING_MODE") or "all"
     print(f"MODE: {mode}" + ("  (paper + live MIXED — pass --mode live for live truth)"
                              if mode == "all" else ""))
+    if mode in ("live", "all"):
+        print("  NOTE: live round-trips below are FIFO over OUR event log. Pre-2026-06-15 exits "
+              "logged market sells at price=null and don't all pair — for SETTLEMENT-TRUTH live "
+              "realized P&L use:  python3 scripts/reconcile_ledger.py  (FIFO over broker fills).")
     if args.book:
         print(f"BOOK: {args.book}")
     rows = load_rows(args.ledger, args.since, args.symbol, mode, args.book)

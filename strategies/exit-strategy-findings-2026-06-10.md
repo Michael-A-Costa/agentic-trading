@@ -671,3 +671,91 @@ name stays on the 1-min tape 3 calendar days so its post-exit ride is observable
 truncation, forward-only), and **market-context symbols** (SPY/QQQ/VIX + sector proxies) now taped every
 sentinel pass so remnant/whole-lot replays can be conditioned on the regime the trade rode, not just the
 single name.
+
+### A19. DISCRETIONARY-EXIT GUARDRAIL — gated, default OFF + null-price scorer fix (2026-06-15 PM, NO dial change).
+**Trigger.** BRUN (disco, 6/15): bought 36.90 at a local high on an explicitly *low-conviction* entry,
+hand-cut 6 min later at 36.76 (−0.38%) on "low conviction / parabolic / stale catalyst" — **all of which
+were true at entry, none new at exit**. The stock then ran to 38.00 (+2.1% off the exit). A −0.38% move
+carries no signal and the protective rail would never have fired; the discretionary layer manufactured a
+loss. This is not an anecdote to tune on (N=1) — it is one instance of an **already-matured** pattern.
+
+**Realized-$ by exit type (reconcile_ledger.py, broker truth, n=87 round-trips):**
+| exit type | n | realized | win% |
+|---|---|---|---|
+| **discretionary** | 71 | **−$61.45** | 31% |
+| scale-out | 3 | +$21.90 | 100% |
+| take-profit | 2 | +$29.57 | 100% |
+| stop-loss | 11 | +$44.14 | 91% |
+
+This is real, but it is **not** an indictment of exit *timing* on its own: realized-$ folds in the
+**entry** (a bad entry closed by a discretionary sell books a loss the exit didn't cause). To isolate the
+exit decision you have to ask the counterfactual — *given the entry, would the mechanical rail have done
+better than the hand-cut?*
+
+**Two-sided check — owner asked: "is discretionary saving us from BIGGER losses elsewhere?" Answer: YES,
+materially, and this corrects the framing.** Scored on the let-run counterfactual after the null-price fix
+(23 discretionary exits with usable daily history; delta = actual − let-run, positive = the cut beat the
+rail):
+
+| | n | total delta | examples |
+|---|---|---|---|
+| **CUT SAVED** (rail would've been worse) | 10 | **+19.97%** | HROW +5.3, ALOY +3.8, QNT +3.2, SM +2.0, SAIL +1.4 |
+| **HOLD better** (rail would've won) | 8 | **−27.30%** | PDFS −11.9, CBRL −4.3, ASST −4.2, CCEP −2.4, CPB −1.4 |
+| ~tie | 5 | ~0 | DVN, CRK, NWE, EYE, VG |
+
+**Net let-run delta: −0.31%/trade mean, +0.10% median — a near-WASH, not a −$61 leak.** The discretionary
+exit *layer*, isolated from entry quality, is roughly break-even vs the rail. The owner's intuition holds:
+in 10 of 23 cases the cut genuinely saved capital on names that kept falling (ALOY, SM, SAIL were real
+deteriorations). The damage is **concentrated, not pervasive** — a few cuts on names that then ran (PDFS
+dominates) drag the mean slightly red.
+
+**Why this argues for a SURGICAL guard, not a blanket ban.** A blanket "stop discretionary exits" would
+forfeit the +20% of real saves — wrong. The defensible target is only the slice with *no information
+content*: a full cut on a sub-threshold move (|move| < ~2%) **minutes** after entry, on no new info — the
+BRUN class. Caveat already visible in this sample: QNT was a small-move cut (+0.78%) that *saved* +3.2%,
+so the **MIN_HOLD gate matters** — the guard must fire only on the genuinely-recent (BRUN's 6-min), not
+every small move. Daily bars can't see hold-time, so this is exactly why the guard is gated and must be
+**validated post-arming** (below), never assumed.
+
+**Shipped (both no-dial, behaviour-neutral until armed):**
+1. **Null-price scorer fix.** Live MARKET exits log `price: null` in `trades.jsonl` (see
+   [[live-realized-broker-truth]]); `round_trips_with_meta` skipped them, so **31 live exits — including
+   BRUN — were silently absent** from `exit_counterfactual.py` (it was scoring ~30 of ~64 live round-trips
+   and nobody knew). The scorer now backfills the exit price from `data/ledger_truth.json` (broker
+   settlement truth, matched by symbol + nearest fill time ±30m), marks recovered rows `bf`, and warns
+   when `ledger_truth.json` is missing/stale. Run `reconcile_ledger.py --write` first. Matured count went
+   1 → 2 immediately and the live sample will now accrue honestly.
+2. **The guardrail** (`_discretionary_exit_blocked` in `live_execute.py`). Blocks a sell **only** when ALL
+   hold: guard armed; exit_type is `other` (discretionary — never a stop/TP/scale/EOD/wind-down, never a
+   `[breaker-exit]`); it is a **full close** (no qty / no scale_tiers); held < `DISCRETIONARY_EXIT_MIN_HOLD_MIN`
+   minutes; and `|unrealized move| < DISCRETIONARY_EXIT_MIN_MOVE_PCT`. Evaluated **before** the resting-stop
+   cancel, so a blocked exit leaves the rail ARMED to carry the lot. Logs `discretionary_exit_blocked`.
+
+**GATING.** `DISCRETIONARY_EXIT_GUARD=0` by default, and **inert unless the flag is on AND both thresholds
+are >0** (triple condition — no silent activation). Tests: `test_discretionary_guard_*` in
+`test_live_execute.py` (off-by-default passes through; sub-threshold recent full close blocked with stop
+intact; stop/beyond-band/trim all pass through).
+
+**BACKTEST OF THE CONFIG (replay over actual history, 2026-06-15).** Replayed the guard conditions
+(held < MIN_HOLD ∧ |move-at-cut| < MIN_MOVE) over all **69** priced discretionary round-trips, comparing
+the blocked set's held-to-now outcome to the cut:
+| config | blocks | blocked-set if held | passed set |
+|---|---|---|---|
+| **30m / 2.0% (armed)** | **2** (BRUN, WYFI) | **+$3.04** net (BRUN +3.16, WYFI −0.12) | 67 trips — the entire ±$50–75 swing |
+| 15m / 1.0% | 2 | same two | — |
+| 60m / 3.0% | 4 | +$4.53, still BRUN-driven | 65 |
+
+Two conclusions, and they refine the framing above: **(1) the config is correctly scoped** — the "BRUN
+class" (full cut, sub-2% move, <30 min held) is genuinely rare; it touches BRUN + a rounding-error WYFI
+and leaves all 30 "cut-saved-us" fallers and the timing wash untouched. So it cannot damage the informed
+cuts. **(2) It is INSURANCE, not a P&L lever** — total measurable benefit over our entire live history is
+~+$3, one trade. The discretionary P&L story (the −$61 realized, the timing wash) lives almost entirely in
+the **67 trades the guard never touches** — i.e. in **entry quality**, which this guard does not pretend to
+fix. Do not read §A19 as a fix for the discretionary leak; read it as a cheap, bounded patch against the
+single worst no-info failure mode (BRUN), expected to fire ~once a month.
+
+**ARMED 2026-06-15** at `DISCRETIONARY_EXIT_GUARD=1`, `MIN_HOLD=30`, `MIN_MOVE=2.0` (owner). **Decision
+rule:** kept as standing insurance given the near-zero footprint and the proven failure mode; the
+`discretionary_exit_blocked` log + let-run scorer continue to check that blocked lots do better held — if a
+future blocked lot is clearly hurt by the hold, revisit. This is not where the P&L work is: the real lever
+is the entry gate that minted the −$61 of closed-at-a-loss entries (next focus, separate from exits).

@@ -28,6 +28,7 @@ import os
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 ENDPOINT = os.environ.get("RH_MCP_URL", "https://agent.robinhood.com/mcp/trading")
@@ -199,6 +200,39 @@ def recent_orders(account: str, symbol: str, created_at_gte: str | None = None) 
     if created_at_gte:
         args["created_at_gte"] = created_at_gte
     return _run([("orders", "get_equity_orders", args)])
+
+
+def all_orders(account: str, state: str | None = None, max_pages: int = 10) -> list[dict]:
+    """Page through the FULL agentic equity-order history (newest first) over ONE MCP session.
+
+    Unlike recent_orders (one symbol), this sweeps every symbol and follows the `data.next` cursor
+    until exhausted, so it's the authoritative fill record for ledger reconciliation. `state` filters
+    server-side (e.g. "filled"); omit for all states. Returns the flat list of order dicts. Raises
+    DirectError on any transport/auth failure (caller decides whether to fall back / abort)."""
+    if not enabled():
+        raise DirectError("RH_DIRECT_MCP disabled")
+    timeout = float(os.environ.get("RH_DIRECT_TIMEOUT_S", "20"))
+    client = _Client(_keychain_token(), timeout)
+    args: dict = {"account_number": account, "placed_agent": "agentic"}
+    if state:
+        args["state"] = state
+    orders: list[dict] = []
+    cursor: str | None = None
+    for _ in range(max_pages):
+        call_args = dict(args)
+        if cursor:
+            call_args["cursor"] = cursor
+        payload = client.call("get_equity_orders", call_args)
+        data = payload.get("data") or {}
+        orders.extend(data.get("orders") or [])
+        nxt = data.get("next")
+        if not nxt:
+            break
+        parsed = urllib.parse.urlparse(nxt)
+        cursor = urllib.parse.parse_qs(parsed.query).get("cursor", [None])[0]
+        if not cursor:
+            break
+    return orders
 
 
 def review(account: str, spec: dict) -> dict:

@@ -288,6 +288,29 @@ def record_reconcile_events(events: list[dict], *, ts_utc: str, ts_et: str | Non
                          "symbol": sym, "side": "buy", "status": "dead",
                          "qty": None, "price": None, "order_id": ev.get("order_id"),
                          "reason": "entry never filled (GFD expired / marketable limit missed)"})
+        elif kind == "exit_filled_confirmed":
+            # An engine-initiated exit (full close = MARKET sell) that the placing tick logged as
+            # status=placed with price=null. Book the terminal status=filled row carrying the REAL
+            # broker fill price + realized P&L under the SAME order_id, so _dedupe_order_lifecycle
+            # collapses the placed/filled pair to the truth and FIFO can finally pair the exit.
+            row = {"v": SCHEMA_VERSION, "ts_utc": ts_utc, "ts_et": ts_et, "mode": mode,
+                   "symbol": sym, "side": "sell", "status": "filled",
+                   "qty": ev.get("qty"), "price": ev.get("fill_price"),
+                   "reason": ev.get("reason", "engine exit filled (confirmed by reconcile)"),
+                   "close_kind": "engine_exit",
+                   "exit_type": classify_exit(ev.get("reason", ""))}
+            if ev.get("order_id"):
+                row["order_id"] = ev["order_id"]
+            if ev.get("book"):
+                row["book"] = ev["book"]
+            for k in ("high_water", "held_min"):
+                if ev.get(k) is not None:
+                    row[k] = ev[k]
+            if ev.get("realized_usd") is not None:
+                row["realized_usd"] = ev["realized_usd"]
+            elif ev.get("realized_est_usd") is not None:
+                row["realized_est_usd"] = ev["realized_est_usd"]
+            rows.append(row)
         elif kind == "closed_external":
             # close_kind (set by live_execute._classify_external_close) tells us what the sell WAS:
             # 'resting_stop' the protective stop fired, 'sold_external' closed while asleep, else unknown.

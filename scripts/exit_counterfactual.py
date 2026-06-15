@@ -38,10 +38,11 @@ ties or insufficient tape coverage keep flat3.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -52,6 +53,7 @@ import trade_ledger as tl
 REPO = Path(__file__).resolve().parent.parent
 LEDGER = REPO / "data" / "trades.jsonl"
 QUOTE_TAPE = REPO / "data" / "quotes-intraday.jsonl"
+LEDGER_TRUTH = REPO / "data" / "ledger_truth.json"  # reconcile_ledger.py --write (broker-fill truth)
 
 # PRE-REGISTERED remnant-trail variant grid (A12) — frozen before any tape existed. Each entry:
 # (label, kind, param). vscale width = clamp(k x iv30/sqrt252 daily-sigma %, 3, 8); falls back to
@@ -83,9 +85,65 @@ def letrun_policy(cost_bps: float) -> dict:
     return pol
 
 
-def round_trips_with_meta(rows: list[dict]) -> list[dict]:
+def load_broker_exit_prices() -> dict[str, list[tuple[datetime, float]]]:
+    """Per-symbol broker-fill exit prices from data/ledger_truth.json (reconcile_ledger.py --write):
+    {SYM: [(exit_dt_utc, exit_price), ...]} sorted by time. This is the SETTLEMENT-TRUTH price used to
+    backfill the trades.jsonl sell rows that logged `price: null` (live MARKET exits — see
+    [[live-realized-broker-truth]]); without it those round-trips never pair and silently vanish from
+    the let-run scorer (the BRUN-shaped blind spot). Deduped by exit_order_id since one broker order can
+    span several FIFO chunks that all share its average_price."""
+    out: dict[str, list[tuple[datetime, float]]] = defaultdict(list)
+    if not LEDGER_TRUTH.exists():
+        return out
+    try:
+        d = json.loads(LEDGER_TRUTH.read_text())
+    except (OSError, ValueError):
+        return out
+    seen: set = set()
+    for t in d.get("round_trips", []):
+        sym = str(t.get("symbol", "")).upper()
+        px, ts, oid = t.get("exit_price"), t.get("exit_ts"), t.get("exit_order_id")
+        if px is None or not ts:
+            continue
+        key = (sym, oid, ts)
+        if oid and key in seen:
+            continue
+        seen.add(key)
+        try:  # reconcile_ledger stores exit_ts as "YYYY-MM-DD HH:MM:SS" (UTC)
+            dt = datetime.fromisoformat(ts.replace(" ", "T")).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        out[sym].append((dt, float(px)))
+    for v in out.values():
+        v.sort()
+    return out
+
+
+def backfill_exit_price(sym: str, ts_utc: str, broker_exits: dict, window_min: float = 30.0):
+    """The broker-fill exit price for sym closest in time to a null-logged sell, within +/- window_min.
+    None when no broker exit matches (then the round-trip stays dropped, as before)."""
+    cands = broker_exits.get(sym, [])
+    if not cands:
+        return None
+    try:
+        t = datetime.fromisoformat((ts_utc or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    best, best_gap = None, window_min * 60
+    for dt, px in cands:
+        gap = abs((dt - t).total_seconds())
+        if gap <= best_gap:
+            best, best_gap = px, gap
+    return best
+
+
+def round_trips_with_meta(rows: list[dict], broker_exits: dict | None = None) -> list[dict]:
     """FIFO entry/exit pairing like trade_ledger.build_round_trips, but carrying the buy row's
-    entry date and book (needed to align the replay and split the aggregate)."""
+    entry date and book (needed to align the replay and split the aggregate). A live MARKET-exit sell
+    logs `price: null`; when broker_exits is supplied we backfill that price from settlement truth so
+    the round-trip pairs instead of vanishing — each trip carries price_src ('log' | 'broker_backfill')."""
     open_lots: dict[str, deque] = defaultdict(deque)  # sym -> deque of [qty, price, date, book]
     trips: list[dict] = []
     for r in rows:
@@ -93,6 +151,11 @@ def round_trips_with_meta(rows: list[dict]) -> list[dict]:
         side = str(r.get("side", "")).lower()
         qty = float(r.get("qty") or 0.0)
         price = r.get("price")
+        price_src = "log"
+        if side == "sell" and price is None and broker_exits is not None:
+            price = backfill_exit_price(sym, r.get("ts_utc") or "", broker_exits)
+            if price is not None:
+                price_src = "broker_backfill"
         date = (r.get("ts_et") or r.get("ts_utc") or "")[:10]
         if qty <= 0 or price is None or not date:
             continue
@@ -107,6 +170,7 @@ def round_trips_with_meta(rows: list[dict]) -> list[dict]:
             trips.append({"symbol": sym, "qty": take, "entry_price": lot[1],
                           "entry_date": lot[2], "book": lot[3],
                           "exit_price": float(price), "exit_date": date,
+                          "price_src": price_src,
                           "exit_type": r.get("exit_type", "other"),
                           # manage-DD A/B arm that produced this exit (None for stop/EOD/TP exits)
                           "manage_arm": r.get("manage_arm"),
@@ -435,10 +499,17 @@ def main() -> int:
         return wholelot_report(args.cost_bps)
 
     rows = tl.load_rows(LEDGER, args.since, None, args.mode, args.book)
-    trips = round_trips_with_meta(rows)
+    # Backfill null-priced live MARKET exits from broker settlement truth so they pair (see
+    # load_broker_exit_prices). Skip for paper (paper fills always carry a price).
+    broker_exits = load_broker_exit_prices() if args.mode in ("live", "all") else None
+    if args.mode in ("live", "all") and not broker_exits:
+        print(f"note: {LEDGER_TRUTH.name} missing/empty — null-priced live exits will be DROPPED. "
+              f"Run `python3 scripts/reconcile_ledger.py --write` to backfill them.\n")
+    trips = round_trips_with_meta(rows, broker_exits)
     if not trips:
         print("no closed round-trips match the filters")
         return 0
+    n_backfilled = sum(1 for t in trips if t.get("price_src") == "broker_backfill")
 
     pol = letrun_policy(args.cost_bps)
     pol_desc = (f"stop{pol['stop']:.0f}/sc{pol['softcut']:.0f}/be{pol['be']:.0f}"
@@ -455,6 +526,7 @@ def main() -> int:
     complete, partial, unpriced = [], [], []
     for t in trips:
         sym = t["symbol"]
+        bf = " bf" if t.get("price_src") == "broker_backfill" else ""  # exit price from broker truth
         actual = t["exit_price"] / t["entry_price"] - 1.0
         try:
             bars = bars_for(sym, t["exit_date"], cache, args.refresh)
@@ -465,7 +537,7 @@ def main() -> int:
             unpriced.append(t)
             print(f"{t['exit_date']:<11}{sym:<6}{t['book']:<9}{t['entry_price']:>8.2f}"
                   f"{t['exit_price']:>8.2f}{actual * 100:>+7.2f}% {t['exit_type']:<12}"
-                  f"{'no bars':>7}")
+                  f"{'no bars':>7}{bf}")
             continue
         horizon = min(args.hold, len(bars) - 1 - i)
         if horizon < 1:
@@ -478,7 +550,7 @@ def main() -> int:
         print(f"{t['exit_date']:<11}{sym:<6}{t['book']:<9}{t['entry_price']:>8.2f}"
               f"{t['exit_price']:>8.2f}{actual * 100:>+7.2f}% {t['exit_type']:<12}"
               f"{cf * 100:>+6.2f}%{cf_day:>6}d  {(actual - cf) * 100:>+6.2f}%"
-              + ("  PARTIAL" if is_partial else ""))
+              + ("  PARTIAL" if is_partial else "") + bf)
 
     def agg(label: str, recs: list[dict]) -> None:
         if not recs:
@@ -512,6 +584,9 @@ def main() -> int:
               f"(counterfactual still running — re-run after more sessions)")
     if unpriced:
         print(f"{len(unpriced)} round-trip(s) had no usable daily history (see 'no bars' rows)")
+    if n_backfilled:
+        print(f"{n_backfilled} exit(s) priced from broker settlement truth ('bf' rows — null in "
+              f"trades.jsonl, recovered via {LEDGER_TRUTH.name})")
     return 0
 
 
