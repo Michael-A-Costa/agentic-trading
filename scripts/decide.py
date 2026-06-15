@@ -839,6 +839,10 @@ def main() -> int:
     # pushed into a fresh intraday-high zone (>= DD_REJECT_REDD_RANGE and higher than at reject time).
     reject_redd_pct = float(os.environ.get("DD_REJECT_REDD_PCT", "2.0"))
     reject_redd_range = float(os.environ.get("DD_REJECT_REDD_RANGE", "0.90"))
+    # A cached R1 *spread* reject is a transient microstructure veto, not a thesis — so we don't let it
+    # stick: it's overturned (re-DD'd) the moment the live bid/ask spread tightens back under the same
+    # bar dd_probe used to veto it. Cheap — run_dd short-circuits a still-wide name before the LLM.
+    spread_max = float(os.environ.get("SPREAD_MAX_PCT", "0.5"))
     now = time.time()
     cache_dirty = False
     # Prune dead entries so the file doesn't grow every session: verdicts stamped for a prior ET day,
@@ -948,12 +952,19 @@ def main() -> int:
                 move_pct = (cur / ref - 1) * 100 if (ref and cur) else 0.0
                 if cdec == "commit":
                     stale = drift_pct > 0 and abs(move_pct) > drift_pct
-                else:  # reject — overturn only on an upside breakout, never on downside follow-through
+                else:  # reject — overturn on an upside breakout, never on downside follow-through...
                     ref_rp, cur_rp = cached.get("ref_range_pos"), c.get("range_pos")
                     broke_up = reject_redd_pct > 0 and move_pct > reject_redd_pct
                     broke_range = bool(ref_rp is not None and cur_rp is not None
                                        and cur_rp >= reject_redd_range and cur_rp > ref_rp)
-                    stale = broke_up or broke_range
+                    # ...OR, for a transient spread veto, the moment the live spread tightens under the bar:
+                    # a spread-only R1 reject must not freeze a name whose only problem (a wide open-auction
+                    # spread) has since cleared. cur_spread None (no bid/ask) => no spread-based re-DD.
+                    creason = ((cached.get("result") or {}).get("reason") or "").lower()
+                    cur_spread = c.get("spread_pct")
+                    spread_cleared = bool(is_r1 and "spread" in creason
+                                          and cur_spread is not None and cur_spread < spread_max)
+                    stale = broke_up or broke_range or spread_cleared
                 servable = cdec in ("commit", "reject") and same_day and within_rolling and not stale
                 # Re-DD before BUYING a committed name: only act on a commit verdict that was produced
                 # THIS tick (freshly ingested from its async worker, so sym in ingested_now). A commit
@@ -1028,8 +1039,9 @@ def main() -> int:
                 res.setdefault("book", route_book(res, c))
             # Cache commits and rejects (each reused under its asymmetric trigger + TTL at read time);
             # never cache an error — a transient model/timeout failure must be retried, not frozen. R1
-            # rejects ARE cached (res["r1"]) but read back under the short r1_ttl, so a transient spread/
-            # liquidity veto is re-checked within ~25 min instead of frozen all day or re-probed every tick.
+            # rejects ARE cached (res["r1"]) but never STICK on the spread: the read-side overturns a
+            # spread-only veto the instant the live spread tightens under SPREAD_MAX_PCT (and the short
+            # r1_ttl is the backstop), so a wide-at-the-open name re-DDs the moment it's exitable.
             if not res.get("cached") and res.get("decision") in ("commit", "reject"):
                 cache[sym] = {"ts": now, "day": today_et,          # stamped for age/scoping (reuse is
                                                                    #   indefinite unless DD_CACHE_INDEFINITE=0)

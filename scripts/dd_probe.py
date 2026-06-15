@@ -55,6 +55,10 @@ HIST_DAYS = 66   # keep only ~3 trading months, so MA20/50, 20d-vol, and the 3-M
 
 # Keyless quality thresholds (intraday signals from Cboe — no daily history needed). Tunable.
 LIQ_FLOOR_USD = 5_000_000   # >= $5M traded today = liquid enough for our small paper sizes
+# Spread veto bar (shared with decide.py's R1 spread-reject re-check): spread% below this = exitable.
+# A wide spread at the OPEN is usually transient, so decide overturns a cached spread-reject the
+# moment the live spread tightens back under this same bar — see decide.py serve loop.
+SPREAD_MAX_PCT = float(os.environ.get("SPREAD_MAX_PCT", "0.5"))
 IV_CEIL = 80.0              # iv30 above this = too jumpy for a ~5-min synthetic stop to protect
 PARABOLIC_GAP_PCT = 8.0     # gapped >8% at the open = blow-off / chase risk
 PARABOLIC_MOVE_PCT = 5.0    # >5% intraday AND pinned at the day's high = extended chase
@@ -297,7 +301,7 @@ def probe(sym: str) -> dict:
     liq_dollar_vol = dollar_vol if dollar_vol is not None else avg_dollar_vol
     out["flags"] = {
         # keyless tradeability / structure
-        "spread_ok": spread_pct is not None and spread_pct < 0.5,
+        "spread_ok": spread_pct is not None and spread_pct < SPREAD_MAX_PCT,
         "liquid": liq_dollar_vol is not None and liq_dollar_vol >= LIQ_FLOOR_USD,
         "iv_ok": iv is None or iv < IV_CEIL,           # unknown IV -> don't veto on it
         "parabolic": bool((out.get("gap_pct") is not None and out["gap_pct"] > PARABOLIC_GAP_PCT)

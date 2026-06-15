@@ -381,10 +381,16 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
     for sym in candidates:
         q = quotes.get(sym) or {}
         pm = pead_meta.get(sym)
+        # Live bid/ask spread% (same formula as dd_probe), already fetched this tick — lets decide
+        # overturn a cached R1 spread-reject the instant the spread tightens, instead of freezing the
+        # name under the short r1_ttl. None when bid/ask unavailable (then decide won't re-DD on spread).
+        _b, _a = q.get("bid"), q.get("ask")
+        spread_pct = round((_a - _b) / ((_a + _b) / 2) * 100, 3) if (_b and _a and (_a + _b)) else None
         entry: dict = {
             "symbol": sym, "last": q.get("last"),
             "intraday_pct": mc.intraday_pct(q) if q else None,
             "range_pos": mc.range_position(q) if q else None,
+            "spread_pct": spread_pct,
             "date": q.get("date"),  # per-symbol freshness (fail-closed: stale candidate is excluded)
         }
         if pm:
@@ -640,6 +646,8 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
         #  is in its drift window; decide.py still verifies the measured gap+vol signal.)
         entry_candidates = [{"symbol": c["symbol"], "intraday_pct": c.get("intraday_pct"),
                              "range_pos": c.get("range_pos"), "last": c.get("last"),
+                             "spread_pct": c.get("spread_pct"),  # decide overturns a cached spread-reject once this clears
+
                              **({"mktcap": c["mktcap"]} if c.get("mktcap") is not None else {}),
                              **({"catalyst": c["catalyst"],
                                  "earnings_date": c["earnings_date"],
