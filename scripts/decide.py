@@ -181,6 +181,108 @@ def dispatch_dd(sym: str, c: dict, now: float) -> bool:
         return False
 
 
+# ----------------------------------------------------------------------- async manage (MANAGE_ASYNC)
+# The same decoupling as async entry DD, applied to the Tier-2 hold re-assessment. A due holding's
+# manage-DD (dd_probe quant refresh + Haiku/Sonnet news judgment, ~20s) used to BLOCK the tick; in
+# async mode the tick spawns a detached manage_worker.py (writing data/manage_jobs/<SYM>.json) and a
+# LATER tick ingests the verdict and applies the keep/trim/exit/add against the live position. The
+# fast protective layer (resting hard stop + the 1-min Tier-1 sentinel) is unchanged and still fires
+# every tick, so deferring the DISCRETIONARY verdict by one tick never delays the seatbelt. Knobs:
+#   MANAGE_ASYNC=1                  on (defaults to DD_ASYNC's value)
+#   MANAGE_ASYNC_MAX_INFLIGHT=4     ceiling on concurrent manage workers (bounds CPU/web contention)
+#   MANAGE_ASYNC_RUNNING_TIMEOUT_S  a 'running' marker older than this => worker died, reap
+MANAGE_JOBS = REPO / "data" / "manage_jobs"
+
+
+def _manage_async_on() -> bool:
+    return os.environ.get("MANAGE_ASYNC", os.environ.get("DD_ASYNC", "0")).strip().lower() in ("1", "true", "yes")
+
+
+def _manage_running_timeout() -> int:
+    return int(os.environ.get("MANAGE_ASYNC_RUNNING_TIMEOUT_S", "360"))
+
+
+def manage_job_in_flight(sym: str, now: float) -> bool:
+    """True if a background manage-DD for sym is dispatched and not yet finished (fresh 'running')."""
+    try:
+        job = json.loads((MANAGE_JOBS / f"{sym.upper()}.json").read_text())
+    except (OSError, ValueError):
+        return False
+    return job.get("status") == "running" and (now - job.get("ts", 0)) <= _manage_running_timeout()
+
+
+def count_manage_in_flight(now: float) -> int:
+    if not MANAGE_JOBS.exists():
+        return 0
+    n = 0
+    for f in MANAGE_JOBS.glob("*.json"):
+        try:
+            job = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if job.get("status") == "running" and (now - job.get("ts", 0)) <= _manage_running_timeout():
+            n += 1
+    return n
+
+
+def ingest_manage_jobs(mcache: dict, now: float) -> dict:
+    """Fold FINISHED manage verdicts in: stamp the manage cache (TTL coasts on keep/trim/exit/add),
+    fold the detached worker's token spend into THIS tick's ledger (relabel 'async:'), and reap dead
+    'running' markers. Returns {sym: result} for verdicts that finished — the caller applies each
+    against the LIVE position (re-checking it's still held and not already exiting first)."""
+    if not MANAGE_JOBS.exists():
+        return {}
+    out: dict = {}
+    for f in MANAGE_JOBS.glob("*.json"):
+        try:
+            job = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        sym = (job.get("symbol") or f.stem).upper()
+        status = job.get("status")
+        if status == "done":
+            res = job.get("result") or {}
+            for _call in ((job.get("usage") or {}).get("calls") or []):
+                _rec = dict(_call)
+                _rec["label"] = f"async:{_rec.get('label') or ('manage:' + sym)}"
+                with _USAGE_LOCK:
+                    _USAGE_LEDGER.append(_rec)
+            mcache[sym] = {"ts": now, "band": job.get("band"), "ttl_min": job.get("ttl_min"), "result": res}
+            out[sym] = res
+            try:
+                f.unlink()  # consumed
+            except OSError:
+                pass
+        elif status == "running" and (now - job.get("ts", 0)) > _manage_running_timeout():
+            try:
+                f.unlink()  # worker died -> reap so the holding can be re-dispatched
+            except OSError:
+                pass
+    return out
+
+
+def dispatch_manage(p: dict, regime: dict, caps: dict, portfolio: dict,
+                    arm: str, model: str, band, ttl_min, now: float) -> bool:
+    """Fire-and-forget a detached manage_worker for one holding. Freezes the risk-scored position
+    packet (the snapshot that made it DUE) into the 'running' marker so the worker acts on exactly
+    that, and a later tick won't double-dispatch. Returns True if spawned."""
+    sym = str(p.get("symbol", "")).upper()
+    try:
+        MANAGE_JOBS.mkdir(parents=True, exist_ok=True)
+        marker = {"symbol": sym, "status": "running", "ts": now, "arm": arm, "model": model,
+                  "band": band, "ttl_min": ttl_min,
+                  "input": {"position": p, "regime": regime, "caps": caps, "portfolio": portfolio}}
+        tmp = (MANAGE_JOBS / f"{sym}.json").with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(marker))
+        os.replace(tmp, MANAGE_JOBS / f"{sym}.json")
+        subprocess.Popen([PYEXE, str(SCRIPTS / "manage_worker.py"), sym],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)  # detach so it outlives this tick
+        return True
+    except OSError:
+        return False
+
+
 def claude_bin() -> str:
     return (os.environ.get("AGENTIC_CLAUDE") or shutil.which("claude")
             or str(Path.home() / ".local/bin/claude"))
@@ -776,6 +878,51 @@ def run_manage_dd(p: dict, regime: dict, caps: dict, portfolio: dict, dd_model: 
             "risks": v.get("risks", [])}
 
 
+def _apply_manage_action(res: dict, p: dict, context: dict, actions: list) -> None:
+    """Turn ONE manage verdict into an entry/exit action against the LIVE position. Shared by the
+    synchronous and async manage paths so they build identical actions. 'keep' -> no action (the
+    caller still bumps the manage-cache TTL so the holding coasts). A/B attribution (manage_arm /
+    manage_model) rides on `res` (set by the dispatcher/worker) onto the trade row."""
+    sym = p["symbol"]
+    ab = {"manage_arm": res.get("manage_arm"), "manage_model": res.get("manage_model")}
+    act = res.get("action")
+    if act == "exit":
+        actions.append({"symbol": sym, "side": "sell", **ab,
+                        "reason": f"[manage/exit] {res.get('reason', '')}"})
+    elif act == "trim" and res.get("trim_fraction"):
+        try:
+            frac = max(0.0, min(1.0, float(res["trim_fraction"])))
+        except (TypeError, ValueError):
+            frac = 0.0
+        lot_qty = float(p.get("qty") or 0.0)
+        qty = round(frac * lot_qty, 6)
+        # Whole-share discipline (live, P2): a partial sell must leave BOTH legs whole — a fractional
+        # remainder is stop-less dust. Floor the trim to whole shares; a lot too small to split keeps.
+        if (str(context.get("mode", "")).lower() == "live"
+                and lot_qty >= 1 and lot_qty == int(lot_qty)):
+            qty = float(int(qty))
+            if qty < 1 or lot_qty - qty < 1:
+                sys.stderr.write(f"[decide] manage trim {sym} skipped: "
+                                 f"{frac:.0%} of {lot_qty:g} sh can't keep both "
+                                 "legs whole-share (P2)\n")
+                qty = 0.0
+        if qty > 0:
+            actions.append({"symbol": sym, "side": "sell", "qty": qty, **ab,
+                            "reason": f"[manage/trim {int(frac * 100)}%] {res.get('reason', '')}"})
+    elif act == "add" and res.get("add_dollars"):
+        try:
+            addd = float(res["add_dollars"])
+        except (TypeError, ValueError):
+            addd = 0.0
+        if addd > 0:
+            actions.append({"symbol": sym, "side": "buy", "dollar_amount": addd,
+                            "conviction": res.get("conviction"),
+                            "hold_intent": res.get("hold_intent"),
+                            "thesis_type": p.get("thesis_type"),
+                            "book": p.get("book") or "disco",  # add-on inherits the lot's book
+                            "reason": f"[manage/add] {res.get('reason', '')}"})
+
+
 def main() -> int:
     reset_usage()   # start this tick's token ledger clean
     context = json.loads((TICK / "context_latest.json").read_text())
@@ -1102,97 +1249,102 @@ def main() -> int:
     manage_results = []
     try:
         positions_ctx = context.get("positions", [])
-        # Interleave the two DD waves: only run the manage wave on a tick that did NOT already run fresh
-        # entry DDs, so a single tick never pays for BOTH waves (~2x). Tier-1 protective sells run every
-        # tick regardless (tick_context), so a deferred manage-DD never leaves a critical holding unwatched.
-        if (context.get("market_open") and not context.get("data_stale") and positions_ctx
-                and not entry_did_fresh):
+        manage_async = _manage_async_on()
+        # SYNC path interleaves the two DD waves: it only runs on a tick that did NOT already run fresh
+        # entry DDs, so a single tick never BLOCKS on both model waves (~2x). ASYNC path instead always
+        # APPLIES finished verdicts (cheap — reading job files), and only staggers new DISPATCH off
+        # entry-dispatch ticks (so detached entry + manage workers don't pile concurrent web agents onto
+        # one Mac). Tier-1 protective sells run every tick regardless (tick_context), so a deferred
+        # manage-DD never leaves a critical holding unwatched.
+        if context.get("market_open") and not context.get("data_stale") and positions_ctx:
             mcache = load_manage_cache()
             exiting = {a.get("symbol") for a in actions if a.get("side") == "sell"}  # already exiting this tick
-            due = []
-            for p in positions_ctx:
-                sym = p.get("symbol")
-                if not sym or sym in exiting:
-                    continue
-                prisk = p.get("risk") or {}
-                ttl_min = float(prisk.get("redd_ttl_min", 20.0))
-                ent = mcache.get(sym)
-                is_due = (ent is None or prisk.get("band") == "critical"
-                          or (now - float(ent.get("ts", 0))) >= ttl_min * 60)
-                if is_due:
-                    due.append((float(prisk.get("risk", 0) or 0), p))
-            due.sort(key=lambda x: -x[0])                       # riskiest holdings first
+            pos_by_sym = {p.get("symbol"): p for p in positions_ctx if p.get("symbol")}
+            port = context.get("portfolio") or {}
+            pm = {"cash": port.get("cash", 0.0), "exposure": port.get("positions_value", 0.0)}
             max_manage = int(os.environ.get("HOLD_REVIEW_MAX_PER_TICK", "4"))
-            due_ps = [p for _, p in due[:max_manage]]
-            if due_ps:
-                pm = {"cash": context["portfolio"]["cash"],
-                      "exposure": context["portfolio"].get("positions_value", 0.0)}
-                mfresh = {}
-                arms = {p["symbol"]: manage_arm(p["symbol"]) for p in due_ps}  # (arm, model) per holding
-                workers = min(len(due_ps), int(os.environ.get("DD_MAX_PARALLEL", "4")))
-                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-                    futs = {ex.submit(run_manage_dd, p, regime, caps, pm, arms[p["symbol"]][1]): p["symbol"]
-                            for p in due_ps}
-                    for fut in concurrent.futures.as_completed(futs):
-                        s = futs[fut]
-                        try:
-                            mfresh[s] = fut.result()
-                        except Exception as e:               # one manage-DD blowing up isn't fatal
-                            mfresh[s] = {"symbol": s, "action": "keep",
-                                         "error": f"manage_exception: {e}", "reason": ""}
-                for p in due_ps:
-                    sym = p["symbol"]
-                    res = mfresh.get(sym)
-                    if not res:
+
+            def _due_holdings() -> list:
+                """(risk, position) for holdings whose risk-adaptive re-DD TTL has elapsed (or critical,
+                or never managed), riskiest first; skipping any already exiting this tick."""
+                due = []
+                for p in positions_ctx:
+                    sym = p.get("symbol")
+                    if not sym or sym in exiting:
                         continue
                     prisk = p.get("risk") or {}
-                    arm, arm_model = arms.get(sym, ("A", None))  # A/B attribution for this exit/trim
-                    res["manage_arm"], res["manage_model"] = arm, arm_model
-                    ab = {"manage_arm": arm, "manage_model": arm_model}  # rides the action -> trade row
-                    mcache[sym] = {"ts": now, "band": prisk.get("band"),
-                                   "ttl_min": prisk.get("redd_ttl_min"), "result": res}
+                    ttl_min = float(prisk.get("redd_ttl_min", 20.0))
+                    ent = mcache.get(sym)
+                    is_due = (ent is None or prisk.get("band") == "critical"
+                              or (now - float(ent.get("ts", 0))) >= ttl_min * 60)
+                    if is_due:
+                        due.append((float(prisk.get("risk", 0) or 0), p))
+                due.sort(key=lambda x: -x[0])
+                return due
+
+            if manage_async:
+                # 1) APPLY verdicts finished by detached workers from PRIOR ticks — every tick, even
+                #    after an entry dispatch, so a ready exit/trim is never held back. Re-check the
+                #    symbol is STILL held and not already exiting (a stop/sentinel may have closed it
+                #    in the gap) before acting on the now-slightly-stale verdict.
+                ingested = ingest_manage_jobs(mcache, now)
+                for sym, res in ingested.items():
+                    p = pos_by_sym.get(sym)
+                    if not p or sym in exiting:
+                        continue
                     manage_results.append(res)
-                    act = res.get("action")
-                    if act == "exit":
-                        actions.append({"symbol": sym, "side": "sell", **ab,
-                                        "reason": f"[manage/exit] {res.get('reason', '')}"})
-                    elif act == "trim" and res.get("trim_fraction"):
-                        try:
-                            frac = max(0.0, min(1.0, float(res["trim_fraction"])))
-                        except (TypeError, ValueError):
-                            frac = 0.0
-                        lot_qty = float(p.get("qty") or 0.0)
-                        qty = round(frac * lot_qty, 6)
-                        # Whole-share discipline (live, P2): a partial sell must leave BOTH legs
-                        # whole — a fractional remainder is stop-less dust (a 0.35-share SRAD trim
-                        # re-created exactly what the dust cleanup removed). Floor the trim to
-                        # whole shares; a lot too small to split keeps (exit is the tool for real
-                        # deterioration).
-                        if (str(context.get("mode", "")).lower() == "live"
-                                and lot_qty >= 1 and lot_qty == int(lot_qty)):
-                            qty = float(int(qty))
-                            if qty < 1 or lot_qty - qty < 1:
-                                sys.stderr.write(f"[decide] manage trim {sym} skipped: "
-                                                 f"{frac:.0%} of {lot_qty:g} sh can't keep both "
-                                                 "legs whole-share (P2)\n")
-                                qty = 0.0
-                        if qty > 0:
-                            actions.append({"symbol": sym, "side": "sell", "qty": qty, **ab,
-                                            "reason": f"[manage/trim {int(frac * 100)}%] {res.get('reason', '')}"})
-                    elif act == "add" and res.get("add_dollars"):
-                        try:
-                            addd = float(res["add_dollars"])
-                        except (TypeError, ValueError):
-                            addd = 0.0
-                        if addd > 0:
-                            actions.append({"symbol": sym, "side": "buy", "dollar_amount": addd,
-                                            "conviction": res.get("conviction"),
-                                            "hold_intent": res.get("hold_intent"),
-                                            "thesis_type": p.get("thesis_type"),
-                                            "book": p.get("book") or "disco",  # add-on inherits the lot's book
-                                            "reason": f"[manage/add] {res.get('reason', '')}"})
-                    # "keep" -> no action (the cache ts is still bumped so it coasts for its TTL)
-                save_manage_cache(mcache)
+                    _apply_manage_action(res, p, context, actions)
+                # 2) DISPATCH new due holdings (riskiest first, bounded by MANAGE_ASYNC_MAX_INFLIGHT),
+                #    staggered off entry-dispatch ticks. The frozen risk packet rides the 'running'
+                #    marker; the verdict acts a later tick.
+                if not entry_did_fresh:
+                    ceiling = int(os.environ.get("MANAGE_ASYNC_MAX_INFLIGHT", "4"))
+                    running = count_manage_in_flight(now)
+                    dispatched = []
+                    for _, p in _due_holdings()[:max_manage]:
+                        sym = p["symbol"]
+                        if sym in ingested or manage_job_in_flight(sym, now):
+                            continue                       # acted this tick, or already in flight
+                        if running + len(dispatched) >= ceiling:
+                            break
+                        arm, arm_model = manage_arm(sym)
+                        prisk = p.get("risk") or {}
+                        if dispatch_manage(p, regime, caps, pm, arm, arm_model,
+                                           prisk.get("band"), prisk.get("redd_ttl_min"), now):
+                            dispatched.append(sym)
+                    if dispatched:
+                        print(f"  async manage: +{len(dispatched)} dispatched ({', '.join(dispatched)}), "
+                              f"{count_manage_in_flight(now)} running total (verdicts act a later tick)")
+                save_manage_cache(mcache)                  # ingest may have stamped TTLs even with no dispatch
+            elif not entry_did_fresh:
+                due_ps = [p for _, p in _due_holdings()[:max_manage]]
+                if due_ps:
+                    mfresh = {}
+                    arms = {p["symbol"]: manage_arm(p["symbol"]) for p in due_ps}  # (arm, model) per holding
+                    workers = min(len(due_ps), int(os.environ.get("DD_MAX_PARALLEL", "4")))
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                        futs = {ex.submit(run_manage_dd, p, regime, caps, pm, arms[p["symbol"]][1]): p["symbol"]
+                                for p in due_ps}
+                        for fut in concurrent.futures.as_completed(futs):
+                            s = futs[fut]
+                            try:
+                                mfresh[s] = fut.result()
+                            except Exception as e:           # one manage-DD blowing up isn't fatal
+                                mfresh[s] = {"symbol": s, "action": "keep",
+                                             "error": f"manage_exception: {e}", "reason": ""}
+                    for p in due_ps:
+                        sym = p["symbol"]
+                        res = mfresh.get(sym)
+                        if not res:
+                            continue
+                        prisk = p.get("risk") or {}
+                        arm, arm_model = arms.get(sym, ("A", None))  # A/B attribution for this exit/trim
+                        res["manage_arm"], res["manage_model"] = arm, arm_model
+                        mcache[sym] = {"ts": now, "band": prisk.get("band"),
+                                       "ttl_min": prisk.get("redd_ttl_min"), "result": res}
+                        manage_results.append(res)
+                        _apply_manage_action(res, p, context, actions)
+                    save_manage_cache(mcache)
     except Exception as e:  # a manage-pass failure must not sink the tick's entries/exits
         sys.stderr.write(f"[decide] manage pass failed (ignored): {e}\n")
 
