@@ -757,5 +757,11 @@ single worst no-info failure mode (BRUN), expected to fire ~once a month.
 **ARMED 2026-06-15** at `DISCRETIONARY_EXIT_GUARD=1`, `MIN_HOLD=30`, `MIN_MOVE=2.0` (owner). **Decision
 rule:** kept as standing insurance given the near-zero footprint and the proven failure mode; the
 `discretionary_exit_blocked` log + let-run scorer continue to check that blocked lots do better held — if a
-future blocked lot is clearly hurt by the hold, revisit. This is not where the P&L work is: the real lever
-is the entry gate that minted the −$61 of closed-at-a-loss entries (next focus, separate from exits).
+future blocked lot is clearly hurt by the hold, revisit.
+
+**Follow-up (entry-gate-plan-2026-06-15 §Phase 0 RESULT).** The "−$61 → entry quality" hand-off was
+checked and **does not hold as stated**: grouping realized P&L by ENTRY (not exit leg) shows the book is
+net +$35 with no gate-able losing entry attribute — `conviction=low`/`disco`/`news` are the *profit*
+centres; the only negative slice is the pre-tagging 6/08–6/09 cohort (a calendar artifact). The −$61 is an
+exit-leg accounting view of an otherwise-profitable book, not −$61 of bad entries. No entry gate is
+warranted now; two thin watch-items (`thesis=momentum`/`sector`) are logged for the next checkpoint.
