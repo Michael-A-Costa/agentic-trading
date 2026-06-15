@@ -35,7 +35,7 @@ import subprocess
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -48,7 +48,23 @@ STATE = REPO / "data" / "live_state.json"
 LOCK = REPO / "data" / ".tick.lock"
 ENGINE_LOG = REPO / "data" / "engine-log.jsonl"
 QUOTE_TAPE = REPO / "data" / "quotes-intraday.jsonl"
+TRADES = REPO / "data" / "trades.jsonl"
 ET = ZoneInfo("America/New_York")
+
+# How many calendar days a TRADED symbol stays on the 1-min tape AFTER its position closes (A17).
+# Default 3 so a closed runner's post-exit ride stays observable for the whole-lot/remnant trail
+# counterfactuals — the tape used to stop the instant we went flat, making a wider trail's upside
+# unmeasurable. =1 keeps the rest of the exit day; tune via .env.
+TAPE_RETAIN_DAYS = int(os.environ.get("TAPE_RETAIN_DAYS", "3") or 3)
+
+# Broad-market context taped alongside our positions every pass (A18), under a separate "context" key,
+# so remnant/whole-lot replays — and any regime study — have the SAME 1-min history for the tape a
+# trade rode, not just the single name. Equity-quotable basket only: VIX the index isn't on the equity
+# endpoint, so VIXY is the vol-regime proxy (read direction, not level) — mirrors market_conditions.py's
+# INDEXES + VIX_PROXY. Override via TAPE_MARKET_SYMBOLS (comma-separated).
+MARKET_CONTEXT_SYMBOLS = [s.strip().upper() for s in
+                         os.environ.get("TAPE_MARKET_SYMBOLS", "SPY,QQQ,IWM,DIA,VIXY").split(",")
+                         if s.strip()]
 
 # Owner 2026-06-15: blanket 9:30–9:45 every minute (was {9:32,9:35,9:39}) for a high-action open.
 FORCE_TICK_MINUTES_ET = {(9, m) for m in range(30, 46)}
@@ -212,6 +228,30 @@ def _tier_breach(sym: str, lot: dict, now_s: float) -> tuple[str, float, float, 
             last2, qty_out, gains, quote)
 
 
+def _tape_symbols(state: dict, now_et: datetime) -> list[str]:
+    """Symbols to record on the 1-min tape this pass: every currently-held lot PLUS every symbol we
+    TRADED in the last TAPE_RETAIN_DAYS calendar days (read from data/trades.jsonl). Keeping a closed
+    name on the tape past its exit is what lets exit_counterfactual.py --wholelot / --remnant see the
+    POST-exit ride — a wider trail's benefit is unobservable if the tape stops the instant we go flat
+    (the A17 truncation). Quotes work regardless of whether we still hold the name."""
+    syms = {s.upper() for s in (state.get("lots") or {})}
+    floor = (now_et.date() - timedelta(days=max(0, TAPE_RETAIN_DAYS - 1))).isoformat()
+    try:
+        for line in TRADES.read_text().splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            d = (row.get("ts_et") or row.get("ts_utc") or "")[:10]
+            if d and d >= floor:
+                s = str(row.get("symbol") or "").upper()
+                if s:
+                    syms.add(s)
+    except OSError:
+        pass
+    return sorted(syms)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Fast live risk pass for fractional/synthetic lots.")
     ap.add_argument("--dry-run", action="store_true", help="detect + log only; fire nothing")
@@ -248,18 +288,28 @@ def main() -> int:
           + (f": {', '.join(watched)}" if watched else ""))
     # One batched REAL-TIME quote fetch for the whole pass (broker marks via rh_direct); any
     # symbol the batch misses falls back to per-symbol Cboe inside _quote().
+    # Fetch the whole TAPE set (held lots + recently-traded closed names) PLUS the broad-market context
+    # basket in one batch. The breach/trim loop below still iterates only state.lots, so taping extra
+    # symbols changes nothing it fires.
+    tape_syms = _tape_symbols(state, now_et)
     _QUOTES.clear()
-    _QUOTES.update({s: q for s, q in _fetch_rh_quotes(sorted(state.get("lots") or {})).items()
+    _QUOTES.update({s: q for s, q in
+                    _fetch_rh_quotes(sorted(set(tape_syms) | set(MARKET_CONTEXT_SYMBOLS))).items()
                     if q.get("last") is not None})  # a price-less entry must fall through to Cboe
-    # Persist this pass's real-time marks (A12): the 1-min tape is the only data that can replay
-    # remnant-trail variants honestly — daily bars can't see the ALOY-style intraday wick. One
-    # row per pass, all held lots; consumed by exit_counterfactual.py --remnant.
+    # Persist this pass's real-time marks (A12/A17/A18): the 1-min tape is the only data that can replay
+    # remnant- and whole-lot-trail variants honestly — daily bars can't see the ALOY-style intraday
+    # wick. We tape EVERY recently-traded symbol (TAPE_RETAIN_DAYS), not just held lots, so a closed
+    # runner's post-exit ride stays observable; market context goes under "context". consumed by
+    # exit_counterfactual.py.
     if _QUOTES:
         try:
             with QUOTE_TAPE.open("a") as f:
-                f.write(json.dumps({"ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                                    "ts_et": now_et.isoformat(timespec="seconds"),
-                                    "quotes": {s: q["last"] for s, q in _QUOTES.items()}}) + "\n")
+                f.write(json.dumps({
+                    "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "ts_et": now_et.isoformat(timespec="seconds"),
+                    "quotes": {s: _QUOTES[s]["last"] for s in tape_syms if s in _QUOTES},
+                    "context": {s: _QUOTES[s]["last"] for s in MARKET_CONTEXT_SYMBOLS if s in _QUOTES},
+                }) + "\n")
         except OSError:
             pass
     breaches = []  # (sym, reason, last, qty)
