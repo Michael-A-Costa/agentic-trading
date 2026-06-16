@@ -861,3 +861,46 @@ fix today without fabricating signal.
    best matured delta, NOT the one that blocks the most. NOTE: 390 (full session) holds all 32 incl.
    names that kept falling (PDFS −6.0%, MOS −5.3%, HL −3.6%) — a tighter 60–90m window isolates the fast
    panic churns without over-holding the slow bleeds.
+
+### A22. 1-min trail ratchet + breakeven/trail-activate retune — SHIPPED + ARMED LIVE (2026-06-16 PM).
+
+**Context.** Owner's cent-precision principle ([[cent-precision-compounds]]): follow the stock up,
+lock small gains, don't give back. Two gaps surfaced — (a) the trailing stop only re-armed on the
+~4-min planner tick, lagging a runner between ticks; (b) the breakeven rung (peak +5% → lift stop to
+entry×1.01) armed too late, so +3–5% pops that faded round-tripped back to red (AMKR peaked +4.3%→
+−$1.90, ARQQ +4.0%→−$4.24, both OUST lots; verified on the 1-min tape, not daily bars).
+
+**(1) 1-min trail ratchet — `live_sentinel.py`.** The sentinel now re-runs the planner's exact
+`live_execute.trail_stop_price` every ~1 min (new `_trail_decision` + apply loop): on a raise it moves
+the whole-share resting stop (cancel+replace) / bumps the synthetic stop in place. Decoupled from the
+DD-bearing planner tick — **shortening the planner interval was the WRONG lever** (it's the expensive
+LLM path; token cost is irrelevant under the flat plan but tick-overlap/rate-limits aren't), so the
+cheap deterministic ratchet moved to the already-running 1-min pass instead. Ratchet-only, skips
+lots exiting/trimming this pass, honours `TRAIL_MIN_STEP_PCT`. Tests: `test_trail_decision_*` (27
+assertions / 7 tests green). **Verified live**: 3 ratchets fired 6/16 (TGTX 47.36→49.03 trail; BKH
+63.39→72.75, INOD 96.79→111.09 breakeven), no errors, no instant-sells.
+
+**(2) Breakeven/trail-activate retune.** New replay `scripts/breakeven_counterfactual.py` — INTRADAY
+on the 1-min tape (`exit_counterfactual.py` is daily-bar and CANNOT see same-session give-backs).
+FIFO-pairs round-trips, walks each one's minute path under the live stop schedule, varies ONE dial,
+holds the rest constant. **40 of 46 RTs covered** (tape spans only 6/12–6/16 — directional, not the
+≥30-independent-setup gate); fidelity tight (actual −$1.47 vs replay@BE5 −$1.29).
+- `TRAIL_BREAKEVEN_AT_PCT` sweep: 5→3 = **+$12.7** on covered RTs, catches the AMKR/ARQQ/OUST fades,
+  −$0.10 in-sample cost. Raw optimum was 1.5 (+$28) but its worst-clip blows to −$2.98 (clips a real
+  runner) — **overfit to a fade-heavy 3-day sample; rejected.** Picked **BE_AT=3** (noise-buffered knee).
+- `TRAIL_ACTIVATE_PCT` sweep @ BE_AT=3: +$1.51, **zero clip damage at every level**, benefit plateaus
+  at 4.0 (a 3%-wide trail only overtakes the entry×1.01 floor above ~+4.1% peak, so ACT<4 is a no-op).
+  Picked **ACT=4** — earliest useful point; fills the +3→+7.5% dead zone where the stop used to park.
+
+**Dials set (`.env`, owner 6/16):** `TRAIL_BREAKEVEN_AT_PCT 5→3`, `TRAIL_ACTIVATE_PCT 7.5→4`,
+`DISCO_TRAIL_ACTIVATE_PCT 7.5→4` (prior 8→7.5 same session). Offset +1%, trail width 3%, catastrophe
+−12% unchanged. Trail@4% still cedes to the higher rung, so real runners (>+7.5%) aren't capped.
+
+**Spread check (owner question).** The breakeven stop is a FIXED `entry×1.01` — it does NOT recompute
+against live spread; the +1% is a static friction cushion. Arming is on `last` (not ask), so the +3%
+trigger isn't spread-inflated. Holds up on our book because entries are gated at `SPREAD_MAX_PCT=0.5`:
+live spreads 6/16 median **0.07%**, worst 0.49% (KLIC) → +1% nets +0.5–0.97% after selling the bid,
+and the +3→+1% arm-to-stop gap (2%) is ~4× the worst spread. **Residual risk:** intraday spread
+blow-out on a high-IV mover (the [[disco-trail-iv-whipsaw]] / ALOY pattern), where the entry gate no
+longer binds and +1% can net ~0. **Pre-registered hardening (NOT built):** spread-aware breakeven floor
+`entry×(1+max(1.0%, k×live_spread%))` so the locked level floats above noise on wide/fast names only.

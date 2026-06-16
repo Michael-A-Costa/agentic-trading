@@ -15,6 +15,14 @@ downside — the +10% harvest trigger is upside, visible only to the engine — 
 tier trims at ~1-min granularity instead of the planner's 5-min cadence, via the same unit-tested
 live_execute.execute_sell partial path (cancel stop -> limit sell -> bookkeeping -> re-arm).
 
+And it RATCHETS the trailing stop on ALL lots (2026-06-16): the planner tick only raises a runner's
+protective stop toward the high-water mark every ~4 min, so between ticks a climbing lot's stop lags
+the price. This pass re-runs the planner's exact ratchet (live_execute.trail_stop_price -> resting
+cancel+replace for whole-share lots, in-place stop_price for synthetic) every ~1 min, so the stop
+follows the stock up at 1-min resolution — the cent-precision the owner wants on the runners, at no
+extra DD cost (this path is pure + a broker cancel/place, never an LLM call). Ratchet-only: it can
+never lower a stop, and a lot being exited/trimmed this pass is skipped (handled next pass).
+
 Design (so it doesn't fight the planner):
   - It READS live_state.json + public quotes lock-free (a slightly stale read is harmless — a sell of
     an already-closed lot just rejects at the broker). It only acquires the shared data/.tick.lock to
@@ -30,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -112,6 +121,33 @@ def _quote_last(q: dict | None) -> float | None:
 
 # Pass-scoped quote cache: one batched REAL-TIME fetch per sentinel pass (see _quote).
 _QUOTES: dict[str, dict] = {}
+
+# Pass-scoped cap cache. The trail ratchet (see main) needs the SAME .env trail dials the planner
+# tick uses — TRAIL_*/DISCO_TRAIL_*/STOP_LOSS_PCT — resolved by tick_context._build_caps. Those rungs
+# are pure env percentages, independent of the equity/sod args, so we pass 0/0 (the dollar caps the
+# builder also computes are irrelevant here and unused by trail_stop_price).
+_CAPS: dict = {}
+
+
+def _caps() -> dict:
+    if not _CAPS:
+        import tick_context as tc
+        _CAPS.update(tc._build_caps(0.0, 0.0))
+    return _CAPS
+
+
+def _trail_decision(lot: dict, caps: dict, last: float | None) -> tuple[float | None, float | None, bool, bool]:
+    """Pure trail-ratchet decision for one lot at price `last`, reusing the planner's exact rung logic.
+    Returns (new_stop, high_water, raise_due, peak_rose):
+      - new_stop / high_water: live_execute.trail_stop_price output (new_stop=None => no raise warranted).
+      - raise_due:  the stop should be ratcheted UP (new_stop strictly above the current stop).
+      - peak_rose:  the high-water mark advanced (persist it even when the raise is below MIN_STEP).
+    No I/O. Both flags False => nothing to do for this lot this pass."""
+    import live_execute as le
+    new_stop, hw = le.trail_stop_price(lot, caps, last)
+    raise_due = new_stop is not None and new_stop > (le._f(lot.get("stop_price")) or 0.0) + 1e-9
+    peak_rose = hw is not None and hw > (le._f(lot.get("high_water")) or 0.0) + 1e-9
+    return new_stop, hw, raise_due, peak_rose
 
 
 def _fetch_rh_quotes(symbols: list[str]) -> dict[str, dict]:
@@ -325,7 +361,26 @@ def main() -> int:
         thit = _tier_breach(sym, lot, now_s)
         if thit:
             trims.append((sym, *thit))
-    if not breaches and not trims:
+
+    # Trail-ratchet PRE-CHECK (pure, lock-free): which held lots have a stop-raise or a fresh peak
+    # pending? A lot already exiting/trimming this pass is skipped — the exit/trim path owns its stop,
+    # and ratcheting it would race that re-arm. The actual move is recomputed under the lock against
+    # fresh state (the planner may have ratcheted in between), so this is only a "is it worth the lock"
+    # gate. Cheap: quotes are already in the pass cache; trail_stop_price does no I/O.
+    caps = _caps()
+    busy = {b[0] for b in breaches} | {t[0] for t in trims}
+    ratchet_syms = []
+    for sym, lot in (state.get("lots") or {}).items():
+        if sym in busy:
+            continue
+        last = _quote_last(_quote(sym))
+        if last is None:
+            continue
+        _, _, raise_due, peak_rose = _trail_decision(lot, caps, last)
+        if raise_due or peak_rose:
+            ratchet_syms.append(sym)
+
+    if not breaches and not trims and not ratchet_syms:
         return 0
 
     # 2) Only now contend the shared lock (a trigger is rare). If the planner holds it, retry next min.
@@ -346,6 +401,7 @@ def main() -> int:
         lots = state.get("lots") or {}
         rh_mcp = None
         fired = 0
+        state_dirty = False   # a trail ratchet changed stop_price/high_water (write state even if no fill)
         for sym, reason, last, _qty in breaches:
             lot = lots.get(sym)
             if not lot or not _needs_watch(lot):
@@ -415,7 +471,50 @@ def main() -> int:
                 except Exception as e:  # noqa: BLE001
                     _log({"event": "sentinel_trim_tradelog_failed", "symbol": sym, "error": str(e),
                           "ts_utc": datetime.now(timezone.utc).isoformat()})
-        if fired and not args.dry_run:
+        # 4) Trail ratchet — raise protective stops toward the high-water mark at 1-min granularity.
+        # Faithful replica of live_execute.reconcile's trail block (lines ~678-697): whole-share resting
+        # lots move the real broker stop via _retrail_resting (cancel+place); synthetic/fractional lots
+        # ratchet stop_price in place. Recomputed against the re-read state so a planner ratchet between
+        # the scan and the lock isn't undone. Ratchet-ONLY (never lowers) and the churn guard
+        # (TRAIL_MIN_STEP_PCT) lives inside trail_stop_price. Unarmed/dry-run: log intent, no side effects.
+        rlog: list = []
+        for sym in ratchet_syms:
+            lot = lots.get(sym)
+            if not lot or sym in {b[0] for b in breaches}:
+                continue  # planner dropped it, or it's exiting this pass
+            last = _quote_last(_quote(sym))
+            if last is None:
+                continue
+            new_stop, hw, raise_due, peak_rose = _trail_decision(lot, caps, last)
+            if not raise_due and not peak_rose:
+                continue
+            if args.dry_run or not _armed():
+                if raise_due:
+                    print(f"[sentinel] DRY — would TRAIL {sym} {lot.get('stop_price')} -> {new_stop} (hw={hw})")
+                    _log({"event": "sentinel_trail_dryrun", "symbol": sym, "from": lot.get("stop_price"),
+                          "to": new_stop, "high_water": hw, "ts_utc": datetime.now(timezone.utc).isoformat()})
+                continue
+            if peak_rose:
+                lot["high_water"] = hw
+                state_dirty = True
+            if not raise_due or new_stop is None:
+                continue
+            qty = float(lot.get("qty") or 0.0)
+            whole = qty >= 1 and qty == math.floor(qty)
+            old_stop = lot.get("stop_price")
+            if whole and lot.get("resting_stop_order_id") and lot.get("stop_type") == "resting":
+                import live_execute as le
+                le._retrail_resting(sym, math.floor(qty), new_stop, lot, [], rlog)
+            else:
+                lot["stop_price"] = new_stop  # synthetic / fractional: pure-data ratchet, no broker order
+                rlog.append({"event": "trail_synthetic", "symbol": sym, "from": old_stop,
+                             "to": new_stop, "high_water": hw})
+            state_dirty = True
+            print(f"[sentinel] TRAIL {sym} {old_stop} -> {new_stop} (hw={hw})")
+        for ev in rlog:
+            _log({**ev, "source": "sentinel_trail", "ts_utc": datetime.now(timezone.utc).isoformat()})
+
+        if (fired or state_dirty) and not args.dry_run:
             tmp = STATE.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(state))
             os.replace(tmp, STATE)

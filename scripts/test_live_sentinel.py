@@ -142,10 +142,79 @@ def test_tier_breach_gate_off():
         os.environ.pop("SCALE_OUT_TIERS", None)
 
 
+def _trail_env(**over):
+    """Set the trail dials the ratchet reads, return a restore thunk. Clears the pass-scoped cap cache
+    so _trail_decision re-resolves them (it memoizes in _CAPS)."""
+    base = {"TRAIL_STOP_PCT": "3", "TRAIL_ACTIVATE_PCT": "8", "TRAIL_BREAKEVEN_AT_PCT": "5",
+            "TRAIL_BREAKEVEN_OFFSET_PCT": "1.0", "TRAIL_MIN_STEP_PCT": "0.5", "STOP_LOSS_PCT": "12.0",
+            "DISCO_TRAIL_STOP_PCT": "0", "DISCO_TRAIL_ACTIVATE_PCT": "0", "DISCO_EXITS_LIVE": "0"}
+    base.update({k: str(v) for k, v in over.items()})
+    saved = {k: os.environ.get(k) for k in base}
+    os.environ.update(base)
+    lsn._CAPS.clear()
+
+    def restore():
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        lsn._CAPS.clear()
+    return restore
+
+
+def test_trail_decision_ratchets_up_to_peak():
+    """A lot up well past the activate threshold rides TRAIL_STOP_PCT below the high-water mark, and the
+    ratchet is raise-only (a stop already above the trail level is left untouched)."""
+    restore = _trail_env()
+    try:
+        caps = lsn._caps()
+        # entry 100, peaked at 130 (+30%), current stop still near the entry floor -> trail to 130*0.97
+        lot = {"qty": 2.0, "entry_price": 100.0, "high_water": 130.0, "stop_price": 95.0,
+               "resting_stop_order_id": "x", "stop_type": "resting", "book": "pead"}
+        new_stop, hw, raise_due, peak_rose = lsn._trail_decision(lot, caps, 130.0)
+        check("raise is due", raise_due is True, (new_stop, raise_due))
+        check("trails 3% below the 130 peak", abs(new_stop - 126.1) < 1e-6, new_stop)
+        check("hw holds at the peak", hw == 130.0, hw)
+        # a NEW high lifts both the hw and the stop
+        n2, hw2, rd2, pr2 = lsn._trail_decision({**lot, "stop_price": 126.1}, caps, 140.0)
+        check("new high ratchets again", rd2 and abs(n2 - 135.8) < 1e-6, (n2, rd2))
+        check("peak rose flag set", pr2 is True, pr2)
+        # already trailing AT the level -> ratchet-only no-op (never lowers)
+        n3, _, rd3, _ = lsn._trail_decision({**lot, "stop_price": 126.1}, caps, 130.0)
+        check("stop at level -> no raise", rd3 is False and n3 is None, (n3, rd3))
+        # a lower print never drags the stop down
+        n4, _, rd4, _ = lsn._trail_decision({**lot, "stop_price": 126.1}, caps, 120.0)
+        check("lower price -> no raise (ratchet-only)", rd4 is False, (n4, rd4))
+    finally:
+        restore()
+
+
+def test_trail_decision_churn_guard_and_inactive():
+    """A raise smaller than TRAIL_MIN_STEP_PCT is suppressed; a lot below the activate threshold (but
+    past breakeven-at) lifts only to the breakeven rung, not a trail."""
+    restore = _trail_env()
+    try:
+        caps = lsn._caps()
+        # stop 126.10, peak nudges so the trailed stop would be 126.50 — a +0.32% raise < 0.5% guard
+        lot = {"qty": 2.0, "entry_price": 100.0, "high_water": 130.41, "stop_price": 126.10,
+               "resting_stop_order_id": "x", "stop_type": "resting", "book": "pead"}
+        _, _, raise_due, _ = lsn._trail_decision(lot, caps, 130.41)
+        check("sub-min-step raise suppressed", raise_due is False, raise_due)
+        # up +6% (past breakeven-at 5, below activate 8): stop lifts to entry*(1+offset) = 101, not a trail
+        be = {"qty": 2.0, "entry_price": 100.0, "high_water": 106.0, "stop_price": 88.0,
+              "resting_stop_order_id": "x", "stop_type": "resting", "book": "pead"}
+        new_stop, _, rd, _ = lsn._trail_decision(be, caps, 106.0)
+        check("breakeven rung engages", rd and abs(new_stop - 101.0) < 1e-6, new_stop)
+    finally:
+        restore()
+
+
 if __name__ == "__main__":
     tests = [test_quote_last_reads_raw_cboe_keys, test_breach_fires_on_raw_cboe_quote,
              test_tier_breach_disco_overlay, test_realtime_rh_quotes_preferred,
-             test_tier_breach_gate_off]
+             test_tier_breach_gate_off, test_trail_decision_ratchets_up_to_peak,
+             test_trail_decision_churn_guard_and_inactive]
     for fn in tests:
         fn()
     print(f"OK — {_passed} assertions passed across {len(tests)} tests")
