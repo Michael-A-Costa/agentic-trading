@@ -826,9 +826,20 @@ def _discretionary_exit_blocked(action: dict, lot: dict, broker: dict, sym: str)
         return None
     if action.get("qty") is not None or action.get("scale_tiers"):  # only FULL closes, not trims/scale-outs
         return None
-    min_hold = _f(os.environ.get("DISCRETIONARY_EXIT_MIN_HOLD_MIN"), 0.0) or 0.0
-    min_move = _f(os.environ.get("DISCRETIONARY_EXIT_MIN_MOVE_PCT"), 0.0) or 0.0
-    if min_hold <= 0 or min_move <= 0:                      # both knobs required → inert by default
+    # Two independently-gated bands, each inert until its full knob set is >0. The guard fires if EITHER
+    # matches; both leave the resting stop ARMED so the catastrophe rail keeps carrying the lot.
+    #   NOISE band — the BRUN shape: a hand-cut MINUTES in on a FLAT (<min_move) move.
+    noise_hold = _f(os.environ.get("DISCRETIONARY_EXIT_MIN_HOLD_MIN"), 0.0) or 0.0
+    noise_move = _f(os.environ.get("DISCRETIONARY_EXIT_MIN_MOVE_PCT"), 0.0) or 0.0
+    noise_on = noise_hold > 0 and noise_move > 0
+    #   SWING band (Tier-1, 2026-06-16 PURR/DRVN churn): a multi-day hold_intent='swing' thesis exited on
+    #   first-session intraday weakness is the documented leak — the manage layer reading −3% noise as
+    #   thesis failure, against the no-intraday-edge finding. Hold a swing through its first session unless
+    #   the loss deepens past the give-up floor; below the floor (a real breakdown) the exit still goes.
+    swing_hold = _f(os.environ.get("DISCRETIONARY_EXIT_SWING_HOLD_MIN"), 0.0) or 0.0
+    swing_giveup = _f(os.environ.get("DISCRETIONARY_EXIT_SWING_GIVEUP_PCT"), 0.0) or 0.0
+    swing_on = swing_hold > 0 and swing_giveup > 0 and lot.get("hold_intent") == "swing"
+    if not (noise_on or swing_on):                         # nothing armed → inert by default
         return None
     entry = _f(lot.get("entry_price"))
     ets = lot.get("entry_ts")
@@ -844,10 +855,12 @@ def _discretionary_exit_blocked(action: dict, lot: dict, broker: dict, sym: str)
     if px is None:
         return None
     move_pct = (px / entry - 1.0) * 100.0
-    if held_min < min_hold and abs(move_pct) < min_move:
-        return {"held_min": round(held_min, 1), "move_pct": round(move_pct, 2),
-                "min_hold_min": min_hold, "min_move_pct": min_move,
-                "entry_price": round(entry, 4), "last": round(px, 4)}
+    base = {"held_min": round(held_min, 1), "move_pct": round(move_pct, 2),
+            "entry_price": round(entry, 4), "last": round(px, 4)}
+    if noise_on and held_min < noise_hold and abs(move_pct) < noise_move:
+        return {**base, "band": "noise", "min_hold_min": noise_hold, "min_move_pct": noise_move}
+    if swing_on and held_min < swing_hold and move_pct > -swing_giveup:
+        return {**base, "band": "swing", "min_hold_min": swing_hold, "min_move_pct": swing_giveup}
     return None
 
 
@@ -888,9 +901,14 @@ def execute_sell(sym: str, action: dict, state: dict, broker: dict, caps: dict, 
     # DISCRETIONARY_EXIT_GUARD=1 + both thresholds (default OFF — no behaviour change for the live run).
     blk = _discretionary_exit_blocked(action, lot, broker, sym)
     if blk:
-        res["reject_reason"] = (f"discretionary-exit guard: full-lot manage exit at {blk['move_pct']:+.2f}% "
-                                f"after {blk['held_min']:.0f}m held — inside the {blk['min_move_pct']:.0f}%/"
-                                f"{blk['min_hold_min']:.0f}m noise band; holding (rail intact)")
+        band = blk.get("band", "noise")
+        desc = (f"inside the {blk['min_move_pct']:.0f}%/{blk['min_hold_min']:.0f}m noise band"
+                if band == "noise" else
+                f"swing thesis still in first session (<{blk['min_hold_min']:.0f}m held, "
+                f"loss < {blk['min_move_pct']:.0f}% give-up floor)")
+        res["reject_reason"] = (f"discretionary-exit guard [{band}]: full-lot manage exit at "
+                                f"{blk['move_pct']:+.2f}% after {blk['held_min']:.0f}m held — {desc}; "
+                                f"holding (rail intact)")
         log.append({"event": "discretionary_exit_blocked", "symbol": sym, "book": res.get("book"),
                     "reason": action.get("reason", ""), **blk})
         return res

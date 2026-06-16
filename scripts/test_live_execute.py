@@ -627,6 +627,82 @@ def test_discretionary_guard_passes_stop_and_big_move_and_trim():
         sys.modules["rh_mcp"] = saved if saved is not None else sys.modules.pop("rh_mcp", None)
 
 
+def _swing_fixture(held_h=0.0, last=35.72, hold_intent="swing"):
+    """rh_mcp fake + a hold_intent='swing' whole-share lot, for the Tier-1 swing-band guard tests.
+    Default quote is −3.2% off the 36.90 entry (the PURR/DRVN first-session churn shape)."""
+    import types
+    from datetime import datetime, timezone, timedelta
+    calls = {"cancel": [], "place": []}
+    fake = types.ModuleType("rh_mcp")
+    fake.cancel = lambda oid: (calls["cancel"].append(oid), {"errors": {}})[1]
+    fake.place = lambda spec, ref_id: (calls["place"].append(spec),
+                                       {"order": {"data": {"id": "x1"}}, "errors": {}})[1]
+    ets = (datetime.now(timezone.utc) - timedelta(hours=held_h)).isoformat(timespec="seconds")
+    state = {"lots": {"DRVN": {"qty": 11, "entry_price": 36.90, "stop_price": 32.47,
+                               "resting_stop_order_id": "stop1", "stop_type": "resting",
+                               "hold_intent": hold_intent, "entry_ts": ets}}}
+    broker = {"positions": {"DRVN": {"qty": 11.0, "avg_cost": 36.90}},
+              "quotes": {"DRVN": {"bid": last - 0.02, "last": last, "ask": last + 0.02}}}
+    return fake, calls, state, broker
+
+
+def test_swing_guard_blocks_first_session_swing_exit():
+    """Tier-1: a hold_intent='swing' lot exited on first-session intraday weakness (−3.2%, 21m) is held,
+    and its resting stop stays ARMED. Noise-band knobs OFF → proves the swing band fires on its own."""
+    saved = sys.modules.get("rh_mcp")
+    fake, calls, state, broker = _swing_fixture(held_h=0.35)   # ~21 min old
+    sys.modules["rh_mcp"] = fake
+    os.environ.update({"LIVE_ARMED": "1", "DISCRETIONARY_EXIT_GUARD": "1",
+                       "DISCRETIONARY_EXIT_SWING_HOLD_MIN": "390",
+                       "DISCRETIONARY_EXIT_SWING_GIVEUP_PCT": "8.0"})
+    for k in ("DISCRETIONARY_EXIT_MIN_HOLD_MIN", "DISCRETIONARY_EXIT_MIN_MOVE_PCT"):
+        os.environ.pop(k, None)
+    try:
+        res = le.execute_sell("DRVN", {"reason": "manage: weak follow-through, cut it"},
+                              state, broker, CAPS, log := [])
+        check("swing exit skipped", res["status"] == "skipped", res)
+        check("swing exit placed nothing", calls["place"] == [], calls)
+        check("swing exit did NOT cancel the stop (rail intact)", calls["cancel"] == [], calls)
+        check("block logged as swing band",
+              any(e["event"] == "discretionary_exit_blocked" and e.get("band") == "swing" for e in log), log)
+    finally:
+        for k in ("LIVE_ARMED", "DISCRETIONARY_EXIT_GUARD",
+                  "DISCRETIONARY_EXIT_SWING_HOLD_MIN", "DISCRETIONARY_EXIT_SWING_GIVEUP_PCT"):
+            os.environ.pop(k, None)
+        sys.modules["rh_mcp"] = saved if saved is not None else sys.modules.pop("rh_mcp", None)
+
+
+def test_swing_guard_scoped_to_swing_and_lets_breakdowns_and_stale_through():
+    """The swing band is narrow: an intraday lot, a beyond-give-up loss, and a past-session swing all pass."""
+    saved = sys.modules.get("rh_mcp")
+    os.environ.update({"LIVE_ARMED": "1", "DISCRETIONARY_EXIT_GUARD": "1",
+                       "DISCRETIONARY_EXIT_SWING_HOLD_MIN": "390",
+                       "DISCRETIONARY_EXIT_SWING_GIVEUP_PCT": "8.0"})
+    for k in ("DISCRETIONARY_EXIT_MIN_HOLD_MIN", "DISCRETIONARY_EXIT_MIN_MOVE_PCT"):
+        os.environ.pop(k, None)
+    try:
+        # (a) hold_intent != swing → not the swing band's business
+        fake, calls, state, broker = _swing_fixture(held_h=0.35, hold_intent="intraday")
+        sys.modules["rh_mcp"] = fake
+        res = le.execute_sell("DRVN", {"reason": "manage: cut it"}, state, broker, CAPS, [])
+        check("intraday lot not blocked by swing band", res["status"] == "placed", res)
+        # (b) swing but loss past the give-up floor (−10% < −8%) → a real breakdown still exits
+        fake, calls, state, broker = _swing_fixture(held_h=0.35, last=33.21)   # −10%
+        sys.modules["rh_mcp"] = fake
+        res = le.execute_sell("DRVN", {"reason": "manage: thesis broke"}, state, broker, CAPS, [])
+        check("beyond-give-up swing loss not blocked", res["status"] == "placed", res)
+        # (c) swing held past the first session (8h > 390m) → manage may exit
+        fake, calls, state, broker = _swing_fixture(held_h=8.0)
+        sys.modules["rh_mcp"] = fake
+        res = le.execute_sell("DRVN", {"reason": "manage: day-2 weakness"}, state, broker, CAPS, [])
+        check("past-session swing not blocked", res["status"] == "placed", res)
+    finally:
+        for k in ("LIVE_ARMED", "DISCRETIONARY_EXIT_GUARD",
+                  "DISCRETIONARY_EXIT_SWING_HOLD_MIN", "DISCRETIONARY_EXIT_SWING_GIVEUP_PCT"):
+            os.environ.pop(k, None)
+        sys.modules["rh_mcp"] = saved if saved is not None else sys.modules.pop("rh_mcp", None)
+
+
 def test_execute_sell_rearms_stop_on_failed_sell():
     """If the sell place fails after we've cancelled the stop, re-arm it — never leave the lot naked."""
     import types

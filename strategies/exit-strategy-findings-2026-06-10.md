@@ -819,3 +819,45 @@ after the dump" is survivorship on one name. **If pursued:** pass `minutes_since
 in the first N min* — scored on the counterfactual before arming (same discipline as §A19). Note the
 `delay3@11ET` remnant variant already pre-registers "don't act at the open"; **let that resolve at the
 ~2026-06-26 checkpoint before opening a second open-timing test.** No code, no feature, until then.
+
+### A21. SWING-BAND extension to the §A19 guard — built + tested, INERT, awaiting matured replay (2026-06-16 PM, NO dial change).
+
+**Motive (PURR/DRVN churn, 2026-06-16).** Two low-conviction `hold_intent="swing"` lots were committed
+full-size, then the manage pass cut them on first-session intraday weakness — PURR sold 10.38 @ 10:20
+(21 min held, −3.5%), DRVN sold 13.15 @ 10:32 (50 min, −3.2%). Engine-log exit reasons: *"weak
+follow-through on low conviction news entry"* / *"entry thesis unconfirmed… momentum failure."* Both
+judge a **multi-day swing thesis on first-bar price action** — directly against `signal-has-no-intraday-edge`
+(the signal is anti-predictive at the 1-day horizon; edge is at 5–10d). The armed §A19 noise band
+(30m/2%) missed BOTH: PURR escaped on move (−3.5% > 2%), DRVN on time (50m > 30m).
+
+**Class size (broker truth, reconcile join w/ engine-log hold_intent).** `manage "other"` full exits
+inside the first session (<390 min held): **n=32, −$44.63 realized, ~80% losers** — over half the
+−$83 lifetime discretionary leak concentrated in one behavior. The clearest fast churns: PURR 21m,
+DRVN 51m, AAPL 37m, OSCR 35m, BRUN 6m, WYFI 1m.
+
+**What shipped (INERT).** `live_execute._discretionary_exit_blocked` now runs TWO independently-gated
+bands; guard fires if either matches, both leave the resting stop ARMED:
+- NOISE band (§A19, unchanged) — `held < MIN_HOLD_MIN AND |move| < MIN_MOVE_PCT`.
+- SWING band (new) — fires only on `lot.hold_intent=="swing"`: `held < SWING_HOLD_MIN AND move >
+  -SWING_GIVEUP_PCT`. Holds a swing through its first session unless the loss deepens past the give-up
+  floor (a real breakdown still exits; the −12% hard stop is the catastrophe rail).
+  New env knobs `DISCRETIONARY_EXIT_SWING_HOLD_MIN` + `DISCRETIONARY_EXIT_SWING_GIVEUP_PCT`, both
+  required >0 → inert by default. NOT in `.env` → zero live behaviour change. Tests:
+  `test_swing_guard_blocks_first_session_swing_exit`, `test_swing_guard_scoped_to_swing_and_lets_breakdowns_and_stale_through`
+  (197 assertions / 48 tests green).
+
+**Why NOT armed yet.** The held-to-horizon counterfactual is structurally premature: `exit_counterfactual.py
+--mode live` matured only n=2 (rest PARTIAL: 21d horizon not elapsed; today's = "no bars"). Same-session
+proxy on the only two checkable churns is weakly supportive — PURR recovered to 10.455 and DRVN to
+13.215, both ABOVE their exit fill (sold the intraday low) — but n=2, ~0.5% magnitude. Cannot size the
+fix today without fabricating signal.
+
+**→ RECHECK (~2026-06-23, 5 sessions out — or at the §A12/§A17 ~2026-06-26 checkpoint, whichever first):**
+1. Re-run `exit_counterfactual.py --mode live` once the 6/15–6/16 swing exits mature.
+2. Filter to the `manage "other"` first-session class (the n=32 above, grown by then).
+3. **ARM only if** matured mean delta ≥ **+0.5%/trade** AND median ≥ 0 (holding beat exiting on the
+   typical trade, not just the mean).
+4. **Threshold sweep** `SWING_HOLD_MIN ∈ {60, 90, 390}` × `GIVEUP_PCT ∈ {6, 8}`; pick the cell with the
+   best matured delta, NOT the one that blocks the most. NOTE: 390 (full session) holds all 32 incl.
+   names that kept falling (PDFS −6.0%, MOS −5.3%, HL −3.6%) — a tighter 60–90m window isolates the fast
+   panic churns without over-holding the slow bleeds.
