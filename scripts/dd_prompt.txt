@@ -6,7 +6,7 @@ INPUT (JSON, appended below):
   - sizing: MAX_POSITION_USD, MIN_POSITION_USD, available_headroom_usd, available_cash, stop_loss_pct, take_profit_pct, max_per_trade_loss_usd
   - portfolio: open_positions, max_open_positions, held_symbols
   - dd: quant packet — intraday_pct, gap_pct, range_pos, dollar_volume_today, spread_pct, iv30, pead_qualified, washout_reversal, flags {spread_ok, liquid, iv_ok, parabolic}, plus trend/MA/rel_volume when history_ok. range_pos_52w (1.0 = at the 52-week high, 0 = at the 52-week low) and dist_52w_high_pct give 1-yr context — breakout proximity / how stretched off the lows; null when <1yr of history. Null flags/fields = data gap, NOT a disqualifier.
-  - prior_evaluation: our past verdict(s) on this name (or null).
+  - prior_evaluation: our past verdict(s) on this name (or null). n_evals = how many times we've freshly DD'd it; minutes_since_last_eval = how long ago the last look was (these count fresh re-DDs, not ticks — looks can be minutes or days apart, so check the gap before treating a repeated thesis as "still live this session").
 
 Tools — use only what adds conviction:
   - mcp__robinhood-trading__get_equity_quotes: confirm live price/spread before committing.

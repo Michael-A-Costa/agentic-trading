@@ -77,8 +77,20 @@ def get_note(sym: str) -> dict | None:
     s = _load()["stocks"].get(sym.upper())
     if not s:
         return None
+    # Compute the gap to NOW so the DD model can reason about look spacing instead of guessing
+    # it: last_eval is an absolute UTC stamp, but the packet carries no clock to diff against, so
+    # n_evals ("6th look") alone can't tell the model whether those looks were minutes or days apart.
+    last_eval = s.get("last_eval")
+    mins_since = None
+    if last_eval:
+        try:
+            mins_since = round((datetime.now(timezone.utc)
+                                - datetime.fromisoformat(last_eval)).total_seconds() / 60.0, 1)
+        except (TypeError, ValueError):
+            mins_since = None
     return {
-        "last_eval": s.get("last_eval"),
+        "last_eval": last_eval,
+        "minutes_since_last_eval": mins_since,
         "n_evals": s.get("n_evals"),
         "last_decision": s.get("decision"),
         "summary": s.get("summary"),
