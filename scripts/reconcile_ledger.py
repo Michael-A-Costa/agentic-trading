@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import sys
 from collections import defaultdict, deque
 from datetime import datetime, timezone
@@ -38,9 +39,11 @@ from trade_log import classify_exit, EXIT_LABEL
 
 REPO = Path(__file__).resolve().parent.parent
 TRADES_LOG = REPO / "data" / "trades.jsonl"
+QUOTE_TAPE = REPO / "data" / "quotes-intraday.jsonl"  # 1-min sentinel tape: per-symbol last price
 SNAPSHOT = REPO / "data" / "tick" / "broker_snapshot.json"
 OUT = REPO / "data" / "ledger_truth.json"
 ACCOUNT = None  # resolved from rh_direct/.env at runtime
+SLIP_WINDOW_SEC = 120  # match an exit fill to the nearest tape price within +/- this many seconds
 
 
 def _f(x) -> float | None:
@@ -199,6 +202,65 @@ def label_trip(exit_ts: str, sym: str, log_exits: dict[str, list[tuple[datetime,
     return best
 
 
+# ---------------------------------------------------------------- exit slippage (fill vs tape)
+def load_quote_tape() -> dict[str, list[tuple[datetime, float]]]:
+    """1-min sentinel tape -> {SYM: [(utc_dt, last), ...]} in time order. The tape stores one last
+    price per symbol per open-market minute (no bid/ask), so it is a MID-ISH reference, not a true
+    mid — slippage below is measured against it and labelled accordingly."""
+    out: dict[str, list[tuple[datetime, float]]] = defaultdict(list)
+    if not QUOTE_TAPE.exists():
+        return out
+    for line in QUOTE_TAPE.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        try:
+            dt = datetime.fromisoformat((row.get("ts_utc") or "").replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        for sym, last in (row.get("quotes") or {}).items():
+            if isinstance(last, (int, float)) and last > 0:
+                out[str(sym).upper()].append((dt, float(last)))
+    for v in out.values():
+        v.sort(key=lambda x: x[0])
+    return out
+
+
+def tape_ref(sym: str, exit_ts: str, tape: dict[str, list[tuple[datetime, float]]],
+             window_sec: float = SLIP_WINDOW_SEC) -> float | None:
+    """The tape price nearest the exit fill for `sym`, within +/- window_sec. None if no tape sample
+    is close enough (symbol never on tape, or the fill fell outside open-market sentinel passes)."""
+    try:
+        et = datetime.fromisoformat(exit_ts.replace(" ", "T") + "+00:00")
+    except ValueError:
+        return None
+    best, best_gap = None, window_sec
+    for dt, px in tape.get(sym, []):
+        gap = abs((dt - et).total_seconds())
+        if gap <= best_gap:
+            best, best_gap = px, gap
+    return best
+
+
+def order_kind(exit_type: str) -> str:
+    """How the exit was sent, inferred from exit_type (sell_spec.urgent): a partial scale-out goes as
+    a price-protected marketable LIMIT; every full close (stop / take-profit / discretionary 'other')
+    goes as a fill-certain MARKET sell. This is the market-vs-limit axis the slippage view compares."""
+    return "limit" if exit_type == "scale_out" else "market"
+
+
+def _slip_stats(rows: list[dict]) -> dict:
+    bps = [r["slippage_bps"] for r in rows if r.get("slippage_bps") is not None]
+    if not bps:
+        return {"n": 0, "mean_bps": None, "median_bps": None}
+    return {"n": len(bps), "mean_bps": round(statistics.mean(bps), 1),
+            "median_bps": round(statistics.median(bps), 1)}
+
+
 # ---------------------------------------------------------------- assemble
 def reconcile(state: str = "filled") -> dict:
     orders = fetch_broker_orders(state=state)
@@ -209,6 +271,16 @@ def reconcile(state: str = "filled") -> dict:
     log_exits = exit_types_from_log()
     for t in trips:
         t["exit_type"] = label_trip(t["exit_ts"], t["symbol"], log_exits)
+
+    # exit slippage: how far the real broker fill sat from the 1-min tape price at exit time.
+    # >0 = price improvement (sold above the tape ref), <0 = cost (sold below). Inferred order_kind
+    # (market full close vs limit scale-out) is the axis the --slippage view compares.
+    tape = load_quote_tape()
+    for t in trips:
+        ref = tape_ref(t["symbol"], t["exit_ts"], tape)
+        t["tape_ref"] = round(ref, 4) if ref else None
+        t["order_kind"] = order_kind(t["exit_type"])
+        t["slippage_bps"] = round((t["exit_price"] / ref - 1.0) * 1e4, 1) if ref else None
 
     realized = round(sum(t["realized_usd"] for t in trips), 2)
     wins = [t for t in trips if t["realized_usd"] > 1e-9]
@@ -256,6 +328,17 @@ def reconcile(state: str = "filled") -> dict:
         "open_book_reconstructed": open_book,
         "open_book_broker": bpos,
         "drift": drift,
+        "slippage": {
+            "window_sec": SLIP_WINDOW_SEC,
+            "ref": "1-min sentinel tape last price (mid-ish, no bid/ask); >0 bps = sold above ref",
+            "n_matched": sum(1 for t in trips if t.get("slippage_bps") is not None),
+            "n_total": len(trips),
+            "all": _slip_stats(trips),
+            "by_order_kind": {k: _slip_stats([t for t in trips if t["order_kind"] == k])
+                              for k in ("market", "limit")},
+            "by_exit_type": {e: _slip_stats([t for t in trips if t["exit_type"] == e])
+                             for e in sorted({t["exit_type"] for t in trips})},
+        },
         "round_trips": sorted(trips, key=lambda t: t["exit_ts"], reverse=True),
     }
 
@@ -273,6 +356,24 @@ def report(d: dict) -> None:
     print(f"\n{'-'*70}\nexit type            n     realized      win%\n{'-'*70}")
     for r in d["exit_types"]:
         print(f"{r['label']:<18}{r['n']:>4}{fmt_usd(r['realized_usd']):>13}{r['win_pct']:>8}%")
+
+    slip = d.get("slippage", {})
+    if slip:
+        print(f"\n{'-'*70}\nEXIT SLIPPAGE — fill vs 1-min tape ({slip['n_matched']}/{slip['n_total']} "
+              f"matched within {slip['window_sec']}s)\n{'-'*70}")
+        print("  (>0 = sold ABOVE tape ref / price improvement; <0 = sold below / cost)")
+
+        def _row(label: str, s: dict) -> None:
+            if s.get("n"):
+                print(f"  {label:<22}n={s['n']:>3}   mean {s['mean_bps']:>+7.1f} bps   "
+                      f"median {s['median_bps']:>+7.1f} bps")
+            else:
+                print(f"  {label:<22}n=  0   (no tape-matched exits)")
+        _row("MARKET (full closes)", slip["by_order_kind"]["market"])
+        _row("LIMIT (scale-outs)", slip["by_order_kind"]["limit"])
+        print(f"  {'-'*60}")
+        for e, s in slip["by_exit_type"].items():
+            _row(EXIT_LABEL.get(e) or e, s)
 
     print(f"\n{'-'*70}\nper-symbol net realized ({len(d['per_symbol'])} names)\n{'-'*70}")
     for r in d["per_symbol"]:

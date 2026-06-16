@@ -765,3 +765,57 @@ net +$35 with no gate-able losing entry attribute — `conviction=low`/`disco`/`
 centres; the only negative slice is the pre-tagging 6/08–6/09 cohort (a calendar artifact). The −$61 is an
 exit-leg accounting view of an otherwise-profitable book, not −$61 of bad entries. No entry gate is
 warranted now; two thin watch-items (`thesis=momentum`/`sector`) are logged for the next checkpoint.
+
+### A20. EXIT-FILL SLIPPAGE instrumented — market-vs-limit question answered, NO dial change (2026-06-16).
+
+**Trigger.** A −$43.79 `day_pnl` morning (6 full exits, 5 of them MARKET orders, several at the open)
+raised the hypothesis: full closes are sent as naked MARKET sells (sell_spec `urgent=True`), so they
+"eat the open spread" — should discretionary full closes be marketable LIMITs like the scale-out trims?
+A 6-fill hand-check said no; this section instruments it so the answer rests on the whole book, per the
+standing rule (prove exit changes in replay over ≥30 round-trips, never by eyeballing fills).
+
+**What shipped (measurement only, read-only).**
+- `reconcile_ledger.py`: every broker-truth round-trip now carries `tape_ref` (1-min sentinel tape price
+  nearest the fill, ±120s = `SLIP_WINDOW_SEC`), `slippage_bps` (fill vs ref; **>0 = sold ABOVE ref /
+  price improvement, <0 = cost**), and `order_kind` (inferred from `exit_type`: scale-out → `limit`,
+  every full close → `market` — the market-vs-limit axis). A `slippage` summary (by order kind, by exit
+  type) lands in `ledger_truth.json` + a new EXIT SLIPPAGE section in the report.
+- `exit_counterfactual.py --slippage`: per-trip table + aggregates over broker truth, decision rule inline.
+- Tape ref is last-price, not true mid (the tape has no bid/ask) — bps are mid-ish, labelled as such.
+
+**RESULT (n=56 of 97 round-trips tape-matched — past the 30 bar).**
+```
+MARKET (full closes)   n=56   mean −11.5 bps   median −7.2 bps
+  └ discretionary      n=44   mean  −6.0 bps   median −7.2 bps   ← negligible
+  └ stop-loss          n=12   mean −31.7 bps   median −12.9 bps  ← the real slip
+LIMIT (scale-outs)     n= 0   (no tape-matched exits)
+```
+Confirms the hand-check at scale: the discretionary full closes one would convert to limits cost only
+~6 bps — not worth reintroducing the ALOY naked-lot risk (a limit landing non-marketable above a
+falling market while the protective stop is already cancelled — the bug `sell_spec`'s MARKET-on-urgent
+design exists to prevent). The slippage that *does* exist is in STOP exits (−32 bps mean; NTLA 6/16
+was −113 bps), which fire into fast moves — **exactly where a market order is correct** and a limit
+would chase or strand.
+
+**Decision rule (pre-registered):** at ≥30 tape-matched MARKET full closes, a market→limit change is
+only warranted if mean slippage is materially negative AND not concentrated in fast-move stops. As of
+n=56 it is neither → **NO dial change; market-on-urgent stays.**
+
+**Caveats / open.** (1) LIMIT scale-outs have 0 tape matches (sparse, fall outside the ±120s window),
+so the comparison is still one-sided — the market side is solid, the limit baseline needs scale-outs
+that land during sentinel passes (slower accrual since A18 cut the remnant to 50%). (2) Re-run
+`exit_counterfactual.py --slippage` at the §A12/§A17 ~2026-06-26 checkpoint; revisit only if the stop
+bucket worsens or a limit baseline accrues that beats market on calm full closes.
+
+**WATCH-ITEM (open-timing volatility) — feature, NOT prose; not motivated yet.** The −$43.79 morning
+raised "should the discretionary bot know the open is volatile / gap-downs often mean-revert, and hold
+off exiting in the first N minutes?" Rejected as a prose note to `decide.py`: that violates the
+`data-as-feature-not-prose` rule (the discretionary layer loses on soft narrative), and the current
+data does not support it — the open exits that felt bad (ELVR/ARQQ/RGTI) were *protective* (risk/stop,
+which you must NOT delay on a gap-down), the one discretionary open exit (CPB 9:37) filled at +0.14%,
+and the discretionary losers (PURR 10:20, DRVN 10:32) were not at the open. The "ELVR recovered +2.6%
+after the dump" is survivorship on one name. **If pursued:** pass `minutes_since_open` (± opening-range
+σ) as a STRUCTURED FEATURE and gate it in code — *suppress non-protective discretionary full-lot exits
+in the first N min* — scored on the counterfactual before arming (same discipline as §A19). Note the
+`delay3@11ET` remnant variant already pre-registers "don't act at the open"; **let that resolve at the
+~2026-06-26 checkpoint before opening a second open-timing test.** No code, no feature, until then.

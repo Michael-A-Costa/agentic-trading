@@ -48,6 +48,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import backtest_gap_drift as gd
 import backtest_quickwin as qw
+import reconcile_ledger as rl
 import trade_ledger as tl
 
 REPO = Path(__file__).resolve().parent.parent
@@ -478,6 +479,55 @@ def remnant_report() -> int:
     return 0
 
 
+def slippage_report(book: str | None = None) -> int:
+    """--slippage: real exit-fill quality vs the 1-min tape, from BROKER TRUTH (reconcile_ledger).
+
+    Answers the market-vs-limit question raised by the open-dump exits: every full close (stop / TP /
+    discretionary) is sent as a MARKET order, every scale-out as a price-protected LIMIT. This scores
+    how far each real fill landed from the tape price at exit time (>0 bps = sold above ref / price
+    improvement, <0 = cost), so a market->limit change can be argued from >=30 round-trips of data
+    rather than eyeballing a handful of fills."""
+    try:
+        d = rl.reconcile()
+    except rl.rh_direct.DirectError as e:
+        print(f"broker fetch failed (direct MCP): {e}", file=sys.stderr)
+        print("  refresh the keychain token (run a live tick or `claude /mcp`) and retry.", file=sys.stderr)
+        return 2
+
+    trips = [t for t in d["round_trips"] if (book is None or t.get("book") == book)]
+    matched = [t for t in trips if t.get("slippage_bps") is not None]
+    slip = d["slippage"]
+    print(f"EXIT SLIPPAGE — fill vs 1-min tape (broker truth, {len(matched)}/{len(trips)} matched "
+          f"within {slip['window_sec']}s)\n")
+    print(f"  ref: {slip['ref']}\n")
+    hdr = (f"{'exit ts':<20}{'sym':<6}{'kind':<7}{'exit_type':<14}"
+           f"{'fill':>9}{'tape':>9}{'slip_bps':>10}")
+    print(hdr)
+    print("-" * len(hdr))
+    for t in sorted(matched, key=lambda t: t["exit_ts"], reverse=True):
+        print(f"{t['exit_ts']:<20}{t['symbol']:<6}{t['order_kind']:<7}{t['exit_type']:<14}"
+              f"{t['exit_price']:>9.2f}{t['tape_ref']:>9.2f}{t['slippage_bps']:>+10.1f}")
+
+    def _agg(label: str, s: dict) -> None:
+        if s.get("n"):
+            print(f"  {label:<24}n={s['n']:>3}   mean {s['mean_bps']:>+7.1f} bps   "
+                  f"median {s['median_bps']:>+7.1f} bps")
+        else:
+            print(f"  {label:<24}n=  0   (no tape-matched exits)")
+
+    print(f"\n{'='*60}\nBY ORDER KIND (the market-vs-limit axis)\n{'='*60}")
+    _agg("MARKET (full closes)", slip["by_order_kind"]["market"])
+    _agg("LIMIT (scale-outs)", slip["by_order_kind"]["limit"])
+    print(f"\n{'-'*60}\nBY EXIT TYPE\n{'-'*60}")
+    for e, s in slip["by_exit_type"].items():
+        _agg(e, s)
+    print(f"\n  n matched = {slip['n_matched']}/{slip['n_total']} round-trips. Decision rule: at >=30 "
+          f"tape-matched\n  MARKET full closes, a market->limit change is only worth it if mean "
+          f"slippage is\n  materially negative AND not concentrated in fast-move stops (where market "
+          f"is correct).")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", default="live", help="live | paper | all (default live)")
@@ -491,8 +541,12 @@ def main() -> int:
                     help="replay remnant-trail variants on the 1-min sentinel quote tape (A12)")
     ap.add_argument("--wholelot", action="store_true",
                     help="replay whole-lot trail variants on every non-harvested armed lot (A17)")
+    ap.add_argument("--slippage", action="store_true",
+                    help="exit-fill quality vs the 1-min tape (market-vs-limit), from broker truth")
     args = ap.parse_args()
 
+    if args.slippage:
+        return slippage_report(args.book)
     if args.remnant:
         return remnant_report()
     if args.wholelot:
