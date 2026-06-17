@@ -146,3 +146,45 @@ history before arming.
 - Is the drag a *selection* problem (wrong names reach DD) or a *sizing* problem (right screen, too big on
   low-conviction)? The conviction × thesis_type split separates these and decides whether the fix lives in
   `tick_context.py` (screen) or `decide.py`/`pack_entries` (size).
+
+---
+
+## E1. Opening-window extension gate — built + tested, SHADOW (2026-06-17, NO dial change)
+
+**Trigger.** JBL post-mortem: 1 share bought 9:36 ET at $421.85 (day-0 PEAD, +9% extended), faded to ~$395
+= the whole 3085→3060 mark-down. Owner: "be more careful buying pops — check our methodology."
+
+**Replay** (`scripts/entry_timing_replay.py`, 97 broker-truth round-trips joined to their screen candidate;
+outcome = realized pnl_pct, exit timing is an established wash so this isolates ENTRY quality):
+
+- **Test 1 — extension:** non-monotonic. Edge lives in the **+3–10%** band (PF 1.7–1.9). Both tails lose:
+  barely-moving 0–3% (PF 0.4) and over-extended **10%+ (n=32, −$6.9, drop-2-best −$42)**.
+- **Test 2 — anchor/chase:** NO POWER. The marketable-limit cap already keeps ~93% of fills within 0.5%
+  of screen; only 2 trips chased >1.5%. The "fills below screen lose" result is momentum-direction, not
+  chase cost. Not pursued.
+- **Test 4 — open throttle:** first 60m = −$42 / 31 trips (PF≤0.66); 60m+ = **+$51 / 66 (PF 1.96)**. The
+  entire book's profit is post-opening-hour entries.
+- **Cross-tab (the real finding):** the loss is the *intersection* — extended **AND** opening-window:
+
+  |            | ext <10% | ext ≥10% |
+  |------------|----------|----------|
+  | first 60m  | −$7 / 13 | **−$35 / 18** |
+  | 60m+       | +$23 / 52 | +$28 / 14 |
+
+  Extended-but-late is fine (+$28); opening-window-but-normal is mild (−$7). So the fix is a tight
+  extension cap **scoped to the opening window**, not a blanket extension cap or a blanket open throttle.
+
+**What shipped (SHADOW).** `tick_context.open_window_extension_block()` (pure, unit-tested:
+`test_open_gate.py`, 12 checks) called in the candidate loop. Knobs `OPEN_GATE_MODE` (shadow|enforce|off),
+`OPEN_GATE_WINDOW_MIN=60`, `OPEN_GATE_MAX_EXT_PCT=6`. Default **shadow** = records would-blocks into
+`screen.open_gate.blocked` every tick, filters NOTHING (zero order-behaviour change). `enforce` drops the
+candidate before it consumes a DD slot. Verified live: `open_gate` emits in `context_latest.json`.
+
+**Caveats.** (1) The 97 closed trips EXCLUDE today's still-open opening-burst names (JBL et al.), so the
+−$35 cell is likely understated. (2) Key cell n=18 — strong prior, not proof. (3) Cap=6% is the starting
+hypothesis (catches JBL's screen-time +9.2%); the shadow log calibrates the exact bar.
+
+**Arming gate (pre-registered, do NOT loosen).** Arm `OPEN_GATE_MODE=enforce` only when, over the shadow
+window PLUS the matured replay (today's burst closed + re-run `entry_timing_replay.py`): the in-window
+extended cell is still realized-$ negative with PF<1.0 AND survives dropping its 2 best trips, AND the
+would-block set's forward outcome is worse than the passed set. Recheck ~2026-06-24.

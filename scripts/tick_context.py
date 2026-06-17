@@ -46,6 +46,22 @@ def envf(key: str, default: float) -> float:
         return default
 
 
+def open_window_extension_block(intraday_pct: float | None, mins_since_open: float | None,
+                                window_min: float, max_ext_pct: float) -> bool:
+    """True if a candidate is over-extended INSIDE the opening window.
+
+    Backstory (entry_timing_replay.py, JBL post-mortem 2026-06-17): across 97 broker-truth
+    round-trips the one net-losing entry cohort is EXTENDED names bought in the opening burst —
+    intraday_pct>=10% AND <60m after open booked -$35 / 18 trips, while both profit centres sit
+    elsewhere (later-extended +$28, later-normal +$23). Pure + side-effect-free so it unit-tests
+    without a full context fixture. Either knob <=0 disables it (inert)."""
+    if window_min <= 0 or max_ext_pct <= 0:
+        return False
+    if mins_since_open is None or not (0.0 <= mins_since_open < window_min):
+        return False
+    return intraday_pct is not None and intraday_pct >= max_ext_pct
+
+
 def scale_out_tiers(env_key: str = "SCALE_OUT_TIERS") -> list[tuple[float, float]]:
     """Parse a tier ladder env var ("gain%:fracOfInitQty, ...") into sorted (gain, frac) pairs.
 
@@ -594,6 +610,18 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
     pead_neg_dropped: list[str] = []
     pead_direction = env("PEAD_DIRECTION", "up").strip().lower()
     discovered_set = {str(s).upper() for s in discovered}
+    # Opening-window extension gate (entry_timing_replay.py, JBL post-mortem 2026-06-17).
+    # MODE=shadow (default): records would-blocks into screen["open_gate"] for the engine-log,
+    # filters NOTHING — zero order behaviour change while it shadows live. MODE=enforce actually
+    # drops the candidate; MODE=off disables both the log and the check. Window/cap are knobs so a
+    # matured replay (once today's open-burst names close) can calibrate the bar before arming.
+    open_gate_mode = env("OPEN_GATE_MODE", "shadow").strip().lower()
+    open_gate_window = envf("OPEN_GATE_WINDOW_MIN", 60.0)
+    open_gate_max_ext = envf("OPEN_GATE_MAX_EXT_PCT", 6.0)
+    open_gate_on = open_gate_mode in ("shadow", "enforce")
+    open_et = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    mins_since_open = (now_et - open_et).total_seconds() / 60.0 if is_open else None
+    open_gate_blocked: list[dict] = []
     if allow_entries and not hostile:
         movers = []
         for c in cand:
@@ -629,6 +657,15 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
             # (the override's original trap); earnings-window names keep their measured edge.
             if downtrend_pead_only and c.get("catalyst") != "earnings":
                 continue
+            # Opening-window extension gate: shadow-log (and, when MODE=enforce, drop) a name that's
+            # already too extended this early in the session — the one net-losing entry cohort.
+            if open_gate_on and open_window_extension_block(
+                    c.get("intraday_pct"), mins_since_open, open_gate_window, open_gate_max_ext):
+                open_gate_blocked.append({"symbol": sym, "intraday_pct": c.get("intraday_pct"),
+                                          "mins_since_open": round(mins_since_open, 1)
+                                          if mins_since_open is not None else None})
+                if open_gate_mode == "enforce":
+                    continue
             movers.append(c)                        # FREE REIN (benign tape): no signal gate — the agent decides
         # PEAD candidates sort first (day 0 most urgent), then by intraday magnitude.
         movers.sort(key=lambda c: (
@@ -656,9 +693,14 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
                                 if c.get("catalyst") else {}),
                              "reason": _candidate_reason(c)}
                             for c in movers]
+    open_gate_log = ({"mode": open_gate_mode, "window_min": open_gate_window,
+                      "max_ext_pct": open_gate_max_ext,
+                      "mins_since_open": round(mins_since_open, 1) if mins_since_open is not None else None,
+                      "blocked": open_gate_blocked} if open_gate_on else None)
     screen = {"exits": exits, "entry_candidates": entry_candidates,
               "hostile_regime": hostile, "downtrend_pead_only": downtrend_pead_only,
               "cooling": sorted(cooling),
+              **({"open_gate": open_gate_log} if open_gate_log else {}),
               **({"pead_negative_gap_dropped": pead_neg_dropped} if pead_neg_dropped else {})}
 
     # --- GATE decision (deterministic; the wrapper branches on this) ---
