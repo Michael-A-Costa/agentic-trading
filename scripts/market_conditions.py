@@ -414,6 +414,38 @@ def fetch_quotes(symbols: list[str]) -> tuple[dict[str, dict], str]:
     raise RuntimeError("all sources failed (" + "; ".join(notes) + ")")
 
 
+def backfill_ohlc(quotes: dict[str, dict], symbols: list[str], deadline_s: float = 6.0) -> int:
+    """Best-effort: fill MISSING open/high/low on `quotes` from keyless Cboe, WITHOUT touching
+    last/bid/ask. rh_direct (the live primary) carries no session OHLC, so range_position() — and the
+    open-window selector's closing-strength term — go blind on the live path. This restores them from
+    the sanctioned keyless OHLC origin (owner data-rule: rh_direct for the execution price, keyless for
+    structure; 15-min-delayed day high/low is plenty for a coarse 0-1 range feature). Returns the count
+    of symbols enriched. Fail-soft + deadline-bounded: any error/timeout leaves the quotes as-is
+    (range_pos stays None, exactly as before). When the winning source already carries OHLC (Cboe/Stooq),
+    `need` is empty and this no-ops without a fetch."""
+    need = [s for s in symbols
+            if (quotes.get(s) or {}).get("high") is None or (quotes.get(s) or {}).get("low") is None]
+    if not need:
+        return 0
+    try:
+        stop = threading.Event()
+        cb = fetch_cboe(need, perf_counter() + deadline_s, stop)
+        stop.set()
+    except Exception:
+        return 0
+    filled = 0
+    for s in need:
+        src, dst = cb.get(s) or {}, quotes.get(s)
+        if dst is None:
+            continue
+        if any(dst.get(k) is None and src.get(k) is not None for k in ("open", "high", "low")):
+            for k in ("open", "high", "low"):
+                if dst.get(k) is None and src.get(k) is not None:
+                    dst[k] = src[k]
+            filled += 1
+    return filled
+
+
 # --------------------------------------------------------------------------- daily trend (multi-day)
 def _fetch_daily_closes(sym: str) -> list[float]:
     """Last ~1y of daily closes (oldest->newest) for `sym`, keyless. [] on failure.
@@ -611,11 +643,20 @@ def intraday_pct(q: dict) -> float | None:
 
 
 def range_position(q: dict) -> float | None:
-    """Where last sits in the day's range: 0 = at low, 1 = at high."""
+    """Where last sits in the day's range: 0 = at low, 1 = at high.
+
+    `last` can sit OUTSIDE a stale day high/low — notably on the live path, where `last` is real-time
+    (rh_direct) but high/low are backfilled from 15-min-delayed Cboe, so a name that just made a fresh
+    high reads last > high. Extend the range to include `last` (hi=max, lo=min) so the result stays in
+    [0,1] (a fresh high -> 1.0) regardless of source mix. No effect when OHLC is same-source as last
+    (paper/Cboe), where last is already within [low, high]."""
     hi, lo, last = q.get("high"), q.get("low"), q.get("last")
-    if hi is not None and lo is not None and last is not None and hi != lo:
-        return round((last - lo) / (hi - lo), 3)
-    return None
+    if hi is None or lo is None or last is None:
+        return None
+    hi, lo = max(hi, last), min(lo, last)
+    if hi == lo:
+        return None
+    return round((last - lo) / (hi - lo), 3)
 
 
 def assess(quotes: dict[str, dict], trend: dict | None = None) -> dict:

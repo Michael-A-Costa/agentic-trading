@@ -40,7 +40,40 @@ TICK = REPO / "data" / "tick"
 DD_CACHE = REPO / "data" / "dd_cache.json"
 MANAGE_CACHE = REPO / "data" / "manage_cache.json"   # Tier-2: last-managed ts + verdict per holding
 DD_JOBS = REPO / "data" / "dd_jobs"                  # async (DD_ASYNC) mode: one <SYM>.json job/result file
+TRADES = REPO / "data" / "trades.jsonl"              # executed-fill ledger — open-window entry budget source
 PYEXE = sys.executable or "python3"
+
+
+def open_window_buys_today(today_et: str, window_min: float) -> int:
+    """Count BUY fills already logged today within the first `window_min` minutes after 09:30 ET.
+    The cross-tick budget for the open-window entry selector: this tick's fills aren't written yet,
+    so the count reflects PRIOR ticks only — letting one window-wide cap hold across the many
+    force-triggered ticks the open-sweep fires (which the per-tick MAX_ENTRIES alone can't bound)."""
+    if not TRADES.exists():
+        return 0
+    n = 0
+    try:
+        with TRADES.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line or '"buy"' not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if r.get("side") != "buy" or (r.get("ts_et") or "")[:10] != today_et:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(r["ts_et"]).astimezone(ET)
+                except Exception:
+                    continue
+                mins = (dt.hour * 60 + dt.minute) - (9 * 60 + 30)
+                if 0 <= mins < window_min:
+                    n += 1
+    except Exception:
+        return n
+    return n
 
 
 def prompt_text(fname: str) -> str:
@@ -1240,6 +1273,63 @@ def main() -> int:
                 actions.append(act)
         if cache_dirty:
             save_cache(cache)
+
+        # --- Open-window competitive entry selection (entry_timing_replay.py, 2026-06-18) ----------
+        # Replay over 97 broker-truth trips: the first 60 min is the loss center (-$42 vs +$51 after),
+        # and the worst cell is "early AND extended". So the open is NOT first-come-first-serve. Inside
+        # the window we (1) raise the bar — drop sub-floor-conviction commits (pead-qualified keep their
+        # seat, they're the measured edge) — and (2) make the survivors COMPETE: score them and keep
+        # only the best, up to ONE window-wide cap tracked across the open-sweep's force-ticks via the
+        # fill ledger. Benched/below-bar names re-DD and can still enter AFTER the window, where the
+        # replay says they actually pay. Knobs: OPEN_SELECT_* (MAX_ENTRIES<0 disables the selector).
+        mins_open = screen.get("mins_since_open")
+        open_win = float(os.environ.get("OPEN_SELECT_WINDOW_MIN", "60"))
+        open_cap = int(os.environ.get("OPEN_SELECT_MAX_ENTRIES", "3"))
+        if (open_cap >= 0 and mins_open is not None and 0 <= mins_open < open_win
+                and any(a.get("side") == "buy" for a in actions)):
+            rank = {"high": 3, "medium": 2, "low": 1}
+            floor = rank.get(os.environ.get("OPEN_SELECT_MIN_CONVICTION", "medium").lower(), 2)
+            cand_by_sym = {s: c for s, c in shortlist}
+            def _conv(a): return rank.get((a.get("conviction") or "low").lower(), 1)
+            def _score(a):
+                s = _conv(a) * 1000
+                if a.get("pead_qualified") is True:
+                    s += 500
+                c = cand_by_sym.get(a["symbol"], {})
+                ext = c.get("intraday_pct")
+                if ext is not None:
+                    if 3.0 <= ext < 10.0:      # replay sweet spot (PF 1.6-1.9)
+                        s += 200
+                    elif 0.0 <= ext < 3.0:     # flat/weak open (0-3% bucket, PF 0.4)
+                        s -= 100
+                    elif ext < 0.0:            # bought below the open (knife — chase<0 bucket, PF 0.61)
+                        s -= 50
+                s += int((c.get("range_pos") or 0.0) * 10)   # tiebreak: intraday closing strength
+                return s
+            buys = [a for a in actions if a.get("side") == "buy"]
+            non_buys = [a for a in actions if a.get("side") != "buy"]
+            qualified, below_bar = [], []
+            for a in buys:                     # (1) conviction floor — pead-qualified is exempt
+                (qualified if (_conv(a) >= floor or a.get("pead_qualified") is True)
+                 else below_bar).append(a)
+            qualified.sort(key=_score, reverse=True)            # (2) compete, then window-wide cap
+            already = open_window_buys_today(today_et, open_win)
+            room = max(0, open_cap - already)
+            winners, benched = qualified[:room], qualified[room:]
+            deferred = ([(a, "below open conviction floor") for a in below_bar]
+                        + [(a, f"open-window full ({open_cap} cap, {already} placed)") for a in benched])
+            if deferred:
+                for a, why in deferred:
+                    print(f"  OPEN-SELECT defer {a['symbol']} ({a.get('conviction')}): {why}")
+                actions = non_buys + winners
+                screen["open_select"] = {
+                    "window_min": open_win, "cap": open_cap, "already_placed": already,
+                    "min_conviction_rank": floor, "mins_since_open": mins_open,
+                    "kept": sorted(a["symbol"] for a in winners),
+                    "deferred": sorted(a["symbol"] for a, _ in deferred)}
+                print(f"  OPEN-SELECT: {len(buys)} commit(s) -> kept {len(winners)} "
+                      f"{sorted(a['symbol'] for a in winners)}, deferred {len(deferred)} "
+                      f"[{mins_open:.0f}m since open, room={room}]")
 
     # --- Tier-2: risk-adaptive manage-DD on HELD positions that are DUE (riskiest first, capped) ---
     # Each holding carries a risk-adaptive re-DD TTL (hold_risk.py: critical->now, high->5m, med->20m,

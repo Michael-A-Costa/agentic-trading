@@ -330,6 +330,21 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
     except (OSError, RuntimeError) as e:
         fetch_error = str(e)
 
+    # OHLC backfill: rh_direct (the live quote primary) carries no day high/low/open, so range_position()
+    # returns None on every live candidate (range_pos has been null on live since ~6/10). Restore it from
+    # keyless Cboe for the symbols whose range_pos matters (held + candidates — indexes don't need it),
+    # WITHOUT touching the rh_direct last/bid/ask. No-ops when Cboe/Stooq already won (OHLC present).
+    if (quotes and os.environ.get("QUOTES_OHLC_BACKFILL", "1").strip().lower()
+            not in ("0", "false", "no", "")):
+        try:
+            n_bf = mc.backfill_ohlc(quotes, list(dict.fromkeys(held + candidates)))
+            if n_bf:
+                sys.stderr.write(f"[tick] OHLC-backfill: enriched {n_bf} quote(s) from Cboe "
+                                 f"(range_pos restored)\n")
+                sys.stderr.flush()
+        except Exception:
+            pass  # best-effort; range_pos stays None on failure, exactly as before
+
     # Persist the quotes this tick already fetched so the parallel DD probes can reuse them instead of
     # each re-hitting Cboe (N cold processes bursting it is what trips the 429 -> no_live_quote). Only
     # the FULL-scope planner tick writes it (the monitor sentinel's partial set must not clobber the
@@ -700,6 +715,7 @@ def build_context(now_utc: datetime | None = None, scope: str = "full", *,
     screen = {"exits": exits, "entry_candidates": entry_candidates,
               "hostile_regime": hostile, "downtrend_pead_only": downtrend_pead_only,
               "cooling": sorted(cooling),
+              "mins_since_open": round(mins_since_open, 1) if mins_since_open is not None else None,
               **({"open_gate": open_gate_log} if open_gate_log else {}),
               **({"pead_negative_gap_dropped": pead_neg_dropped} if pead_neg_dropped else {})}
 
