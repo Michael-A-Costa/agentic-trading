@@ -58,16 +58,40 @@ if [[ "$PRECHECK" == GATE=SKIP:market_* ]]; then
   exit 0
 fi
 
-# --- single-flight lock (atomic mkdir); treat >15-min-old lock as stale ---
+# --- single-flight lock (atomic mkdir + PID-tagged owner) ---
+# The 10-sec sentinel shares this lock but holds it only a few seconds, and only when it actually
+# fires an exit/trim/ratchet. So DON'T skip the whole 4-min tick on contention — read the holder's
+# PID from "$LOCK/owner" and decide:
+#   • holder PID is DEAD (crash/SIGKILL left the dir behind) -> reclaim NOW (seconds, not 15 min)
+#   • holder is ALIVE (sentinel mid-pass, or another planner) -> wait it out; the sentinel frees
+#     within seconds, a concurrent planner never does -> skip after LOCK_WAIT_S to avoid overlap
+# The >15-min find is now only a backstop for the rare PID-reuse case (dead PID reused, looks alive);
+# it stays well above any legit planner hold (~3-4 min) so it can't reclaim a live slow tick.
 LOCK="${REPO}/data/.tick.lock"
-if ! mkdir "$LOCK" 2>/dev/null; then
-  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +15 2>/dev/null)" ]; then
-    log "stale lock — reclaiming"; rmdir "$LOCK" 2>/dev/null; mkdir "$LOCK" 2>/dev/null || exit 0
-  else
-    log "another tick is running — skip"; exit 0
+LOCK_WAIT_S="${TICK_LOCK_WAIT_S:-30}"
+lock_owner_pid() { awk '{print $1; exit}' "$LOCK/owner" 2>/dev/null; }
+lock_holder_dead() {
+  local pid; pid="$(lock_owner_pid)"
+  [ -z "$pid" ] && return 1                  # no owner yet (holder mid-acquire) -> treat as alive
+  kill -0 "$pid" 2>/dev/null && return 1     # alive
+  return 0                                   # dead
+}
+waited=0
+until mkdir "$LOCK" 2>/dev/null; do
+  if lock_holder_dead; then
+    log "tick-lock holder (pid $(lock_owner_pid)) is dead — reclaiming"; rm -rf "$LOCK"; continue
   fi
-fi
-trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +15 2>/dev/null)" ]; then
+    log "lock held >15 min (wedged/PID-reuse) — reclaiming"; rm -rf "$LOCK"; continue
+  fi
+  if [ "$waited" -ge "$LOCK_WAIT_S" ]; then
+    log "lock still held by live pid $(lock_owner_pid) after ${waited}s (another tick) — skip"; exit 0
+  fi
+  sleep 1; waited=$((waited + 1))
+done
+printf '%s %s %s\n' "$$" planner "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$LOCK/owner" 2>/dev/null || true
+[ "$waited" -gt 0 ] && log "acquired lock after ${waited}s wait"
+trap 'rm -rf "$LOCK" 2>/dev/null' EXIT
 
 {
   SECONDS=0

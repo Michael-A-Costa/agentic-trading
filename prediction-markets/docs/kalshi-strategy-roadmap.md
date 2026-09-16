@@ -24,7 +24,7 @@ build a faster loop — so the maker path reopens. But two hard facts still boun
 |---|---|---|
 | Favorite-buying (≥0.90) | done | **DEAD** — measured −3.78%/bet, t=−5.66 ([FINDINGS](kalshi-near-certain-favorite-FINDINGS.md)) |
 | **Taker mispricing — full calibration curve** | **yes, running** | **Phase 0** — decides whether any taker pocket exists at all |
-| **Passive maker / longshot-fade** | no (needs L2 collector) | **Phase A** — the evidence-backed edge; speed now unlocked |
+| **Passive maker / longshot-fade** | yes (built it) | **DEAD** — n=61 accessible, net −$811 realistic, t/mkt −0.80, drop-top-5 −$1.3k ([FINDINGS](kalshi-longshot-fade-FINDINGS.md)) |
 | **Post-news drift / base-rate divergence** | partly (needs event tape) | **Phase B** — fits our infra + equity DNA; weak profit evidence |
 | Cross-venue arb | n/a | **OFF** — owner geo-blocked from Polymarket; speed race anyway |
 | Paid DLP program | n/a | **LATER** — signed Market Maker Agreement; only after a track record |
@@ -121,7 +121,11 @@ collector and run the tests precisely to find out with our own data, not to assu
 
 ---
 
-**One-line bottom line:** Favorite-buying is dead; Phase 0 (running) tells us if *any* taker pocket
-exists; if not, the only real shot is **Phase A — a faster maker/longshot-fade loop on the thin
-contested-less series**, which the now-unlocked speed makes survivable (not large); Phase B (news
-drift) is the cheap, on-DNA long shot. Everything stays research-only until it clears the gates.
+**One-line bottom line (UPDATED 2026-06-18):** Favorite-buying dead, taker dead, and now
+**Phase A maker/longshot-fade DEAD too** — measured net-negative on our own forward data (n=61
+accessible, −$811 realistic, t/mkt −0.80, drop-top-5 −$1.3k; [FINDINGS](kalshi-longshot-fade-FINDINGS.md)).
+Every taker/maker statistical pocket has now been tested and refuted. The only remaining card is
+**Phase B (post-news drift)** — the cheap, on-DNA long shot with the weakest prior; run it because
+it's nearly free, not because we expect it to print. If Phase B also fails, the roadmap's default
+stands: **archive Kalshi as a discipline exercise, not a P&L machine.** Tooling retained; all
+research-only.

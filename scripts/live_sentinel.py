@@ -40,6 +40,7 @@ import argparse
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -55,7 +56,49 @@ import market_conditions   # noqa: E402  session_state
 REPO = Path(__file__).resolve().parent.parent
 STATE = REPO / "data" / "live_state.json"
 LOCK = REPO / "data" / ".tick.lock"
+LOCK_OWNER = LOCK / "owner"   # "<pid> <role> <iso>" — lets a contender tell a live holder from a crashed one
 ENGINE_LOG = REPO / "data" / "engine-log.jsonl"
+
+
+def _lock_owner_pid() -> int | None:
+    """PID of the current lock holder, or None if no/garbled owner file (holder mid-acquire)."""
+    try:
+        return int(LOCK_OWNER.read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True   # exists (owned by another user — never the case here, but it IS alive)
+    return True
+
+
+def _acquire_lock() -> bool:
+    """Take the shared tick lock (atomic mkdir + PID-tagged owner). Returns True if held.
+
+    A leaked lock from a CRASHED/SIGKILLed holder (dir left behind, owner PID dead) is reclaimed
+    immediately so the sentinel isn't blinded until a planner tick clears it. A LIVE holder (planner
+    mid-tick) returns False — the caller defers to the next 10s pass. We never reclaim a live holder;
+    the planner's own >15-min find-backstop covers the rare PID-reuse wedge.
+    """
+    for attempt in (1, 2):
+        try:
+            os.mkdir(LOCK)
+            LOCK_OWNER.write_text(f"{os.getpid()} sentinel {datetime.now(timezone.utc).isoformat()}\n")
+            return True
+        except FileExistsError:
+            pid = _lock_owner_pid()
+            if attempt == 1 and pid is not None and not _pid_alive(pid):
+                print(f"[sentinel] tick-lock holder (pid {pid}) is dead — reclaiming")
+                shutil.rmtree(LOCK, ignore_errors=True)
+                continue
+            return False
+    return False
 QUOTE_TAPE = REPO / "data" / "quotes-intraday.jsonl"
 TRADES = REPO / "data" / "trades.jsonl"
 ET = ZoneInfo("America/New_York")
@@ -383,11 +426,10 @@ def main() -> int:
     if not breaches and not trims and not ratchet_syms:
         return 0
 
-    # 2) Only now contend the shared lock (a trigger is rare). If the planner holds it, retry next min.
+    # 2) Only now contend the shared lock (a trigger is rare). If a LIVE planner holds it, retry next
+    #    pass; a lock left by a crashed holder is reclaimed inside _acquire_lock so we don't stay blind.
     if not args.dry_run:
-        try:
-            os.mkdir(LOCK)
-        except FileExistsError:
+        if not _acquire_lock():
             print(f"[sentinel] {len(breaches)} breach(es) + {len(trims)} trim(s) but planner holds "
                   "the lock — retry next pass")
             return 0
@@ -520,10 +562,7 @@ def main() -> int:
             os.replace(tmp, STATE)
     finally:
         if not args.dry_run:
-            try:
-                os.rmdir(LOCK)
-            except OSError:
-                pass
+            shutil.rmtree(LOCK, ignore_errors=True)   # rm -rf: the dir now holds an owner file
     return 0
 
 
