@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent: HOURLY read-only account status check (24/7). Never places orders.
+  Times are LOCAL (this Mac runs US/Eastern). Pairs with com.agentic.trend-open / -close.
+
+  Install:  sed "s#/ABSOLUTE/PATH/TO#$HOME#g" scripts/com.agentic.trend-status.plist > ~/Library/LaunchAgents/com.agentic.trend-status.plist
+            launchctl load -w ~/Library/LaunchAgents/com.agentic.trend-status.plist
+  Stop:     launchctl unload -w ~/Library/LaunchAgents/com.agentic.trend-status.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agentic.trend-status</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/ABSOLUTE/PATH/TO/agentic-trading/scripts/run_trend.sh</string>
+        <string>status</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/ABSOLUTE/PATH/TO/agentic-trading</string>
+
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE/PATH/TO/agentic-trading/data/logs/trend-status.out</string>
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE/PATH/TO/agentic-trading/data/logs/trend-status.err</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

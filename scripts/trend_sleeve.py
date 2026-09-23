@@ -18,7 +18,9 @@ Rules (all here in Python; no LLM in the loop):
   - resize (vol target drift) only on Mondays, and only by >= max(1 share, TREND_RESIZE_MIN_FRAC).
 
 Phases: `--phase open` (~09:45 ET) reconciles, then acts on the signal; `--phase close` (~15:50 ET)
-only reconciles + guards the stop. TREND_ARMED!=1 is a dry-run: real review, logs intent, places nothing.
+only reconciles + guards the stop; `--phase status` (hourly, 24/7) is READ-ONLY — snapshots the account,
+flags anomalies (lot without a resting stop, broker/state mismatch, stray positions/orders, breaker,
+broker unreachable) and raises a macOS notification on any. TREND_ARMED!=1 is a dry-run: real review, logs intent, places nothing.
 """
 from __future__ import annotations
 
@@ -365,9 +367,84 @@ def reconcile(sym: str, broker: dict, cfg: dict, state: dict, run: dict, today: 
 
 
 # ---------------------------------------------------------------------------
+# hourly status (read-only)
+# ---------------------------------------------------------------------------
+def status_anomalies(sym: str, broker: dict, state: dict, cfg: dict, equity: float) -> list[str]:
+    """PURE: what's wrong with the account right now, as short human-readable strings."""
+    out = []
+    held = int(math.floor(broker["positions"].get(sym, {}).get("qty", 0.0) or 0.0))
+    stops = lx.open_stops_for(broker["orders"], sym)
+    lot = state.get("lot")
+    if held and not stops:
+        out.append(f"{sym} x{held} has NO resting stop")
+    for o in stops:
+        q = int(lx._f(o.get("quantity"), 0) or 0)
+        if q != held:
+            out.append(f"stop qty {q} != held {held}")
+    if lot and int(lot.get("qty", 0)) != held:
+        out.append(f"state lot qty {lot.get('qty')} != broker {held}")
+    if held and not lot:
+        out.append(f"broker holds {sym} x{held} but no tracked lot")
+    stray = sorted(s for s in broker["positions"] if s != sym)
+    if stray:
+        out.append(f"unexpected positions: {', '.join(stray)}")
+    if breaker_tripped(equity, state.get("hwm"), cfg["breaker_pct"]):
+        out.append(f"breaker: equity ${equity:.2f} is {cfg['breaker_pct']}%+ below high-water ${state['hwm']:.2f}")
+    return out
+
+
+def notify(title: str, msg: str) -> None:
+    """Best-effort macOS banner; never let alerting break the check."""
+    import subprocess
+    try:
+        subprocess.run(["osascript", "-e", f"display notification {json.dumps(msg)} with title {json.dumps(title)}"],
+                       timeout=10, capture_output=True)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def status(cfg: dict, now: datetime) -> int:
+    import rh_mcp
+    sym = cfg["symbol"]
+    rec = {"ts_utc": now.isoformat(timespec="seconds"), "phase": "status", "armed": armed()}
+    snap = rh_mcp.snapshot([sym])
+    if not snap:
+        rec["anomalies"] = ["broker snapshot FAILED (MCP auth/token or network)"]
+    else:
+        broker = lx.parse_snapshot(snap)
+        state = load_state()
+        last = broker["quotes"].get(sym, {}).get("last") or 0.0
+        held = int(math.floor(broker["positions"].get(sym, {}).get("qty", 0.0) or 0.0))
+        equity = broker["cash"] + sum((p.get("qty") or 0) * (broker["quotes"].get(s, {}).get("last") or 0)
+                                      for s, p in broker["positions"].items())
+        lot = state.get("lot") or {}
+        rec.update(equity=round(equity, 2), cash=broker["cash"], buying_power=broker["buying_power"],
+                   held=held, last=last, stop=lot.get("stop_price"), entry=lot.get("entry_price"),
+                   open_orders=len(broker["orders"]), hwm=state.get("hwm"),
+                   anomalies=status_anomalies(sym, broker, state, cfg, equity))
+        if held and lot.get("entry_price"):
+            rec["unrealized_usd"] = round((last - lot["entry_price"]) * held, 2)
+            rec["to_stop_pct"] = round((last / lot["stop_price"] - 1) * 100, 2) if lot.get("stop_price") else None
+        try:
+            sig = compute_signal(completed_closes(fetch_candles(cfg["pair"]), now.date()),
+                                 cfg["sma_n"], cfg["vol_n"], cfg["vol_target"])
+            rec["signal"] = {k: sig.get(k) for k in ("date", "close", "sma", "ext_pct", "on")}
+        except Exception as e:
+            rec["signal"] = {"error": str(e)[:120]}
+    log_event(rec)
+    line = (f"equity ${rec.get('equity')} | {sym} x{rec.get('held')} @ {rec.get('last')}"
+            f" | stop {rec.get('stop')} | signal {'ON' if (rec.get('signal') or {}).get('on') else 'off'}"
+            f" ({(rec.get('signal') or {}).get('ext_pct')}% vs SMA)")
+    print(f"[status] {line}" + (f" | ANOMALIES: {rec['anomalies']}" if rec.get("anomalies") else " | ok"))
+    if rec.get("anomalies"):
+        notify("Trading bot: check account", "; ".join(rec["anomalies"])[:220])
+    return 1 if rec.get("anomalies") else 0
+
+
+# ---------------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser(description="BTC trend sleeve (IBIT) — one scheduled check-in")
-    ap.add_argument("--phase", choices=["open", "close"], required=True)
+    ap.add_argument("--phase", choices=["open", "close", "status"], required=True)
     ap.add_argument("--ignore-hours", action="store_true",
                     help="dry-run testing only: skip the market-open check (refused when armed)")
     args = ap.parse_args()
@@ -379,6 +456,8 @@ def main() -> int:
     cfg = load_cfg()
     sym = cfg["symbol"]
     now = datetime.now(timezone.utc)
+    if args.phase == "status":
+        return status(cfg, now)
     today = now.astimezone(ET).date()
     run = {"ts_utc": now.isoformat(timespec="seconds"), "phase": args.phase, "armed": armed(),
            "events": [], "results": []}

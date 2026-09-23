@@ -137,6 +137,10 @@ high-water mark. All rules in `scripts/trend_sleeve.py` (tests: `test_trend_slee
 
 - Schedule: `run_trend.sh open` 09:45 ET + `run_trend.sh close` 15:50 ET, weekdays (launchd
   `com.agentic.trend-open` / `-close`). Nothing intraday; the resting stop covers the gaps.
+- Hourly, 24/7: `run_trend.sh status` (launchd `com.agentic.trend-status`) — READ-ONLY account check
+  (owner request 2026-09-23). Logs to `data/trend-log.jsonl`; a macOS notification fires on any anomaly
+  (lot without a resting stop, broker/state mismatch, stray position, breaker, broker unreachable).
+  Doubles as an MCP-token health check. Runs only while the Mac is awake.
 - Gate: `TREND_ARMED!=1` = dry-run (real `review_equity_order`, places nothing). State
   `data/trend_state.json`, per-run log `data/trend-log.jsonl`, fills → `data/trades.jsonl` tagged `[btc-trend]`.
 - Kill switches: unload the two `com.agentic.trend-*` plists → `TREND_ARMED=0` → disconnect the MCP.

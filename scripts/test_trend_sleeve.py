@@ -118,4 +118,21 @@ if cache.exists():
 else:
     print("skip: parity check (no cached BTC candles — run bakeoff_crypto.py first)")
 
+# --- hourly status anomalies
+CFGS = {"breaker_pct": 15.0}
+stop_o = {"symbol": "IBIT", "side": "sell", "state": "confirmed", "stop_price": "45.00", "quantity": "2"}
+def brk(pos, orders):
+    return {"positions": pos, "orders": orders, "quotes": {}}
+good = ts.status_anomalies("IBIT", brk({"IBIT": {"qty": 2}}, [stop_o]), {"lot": {"qty": 2}, "hwm": 100}, CFGS, 99)
+check("healthy account has no anomalies", good == [], good)
+bad = ts.status_anomalies("IBIT", brk({"IBIT": {"qty": 2}}, []), {"lot": {"qty": 2}}, CFGS, 99)
+check("missing stop flagged", any("NO resting stop" in a for a in bad), bad)
+bad = ts.status_anomalies("IBIT", brk({"IBIT": {"qty": 2}, "AAPL": {"qty": 1}}, [stop_o]), {"lot": {"qty": 2}}, CFGS, 99)
+check("stray position flagged", any("AAPL" in a for a in bad), bad)
+bad = ts.status_anomalies("IBIT", brk({"IBIT": {"qty": 3}}, [stop_o]), {"lot": {"qty": 2}}, CFGS, 99)
+check("qty mismatches flagged", len(bad) == 2, bad)
+bad = ts.status_anomalies("IBIT", brk({}, []), {"lot": None, "hwm": 200}, CFGS, 100)
+check("breaker flagged", any("breaker" in a for a in bad), bad)
+check("flat account is fine", ts.status_anomalies("IBIT", brk({}, []), {"lot": None, "hwm": 100}, CFGS, 100) == [])
+
 print(f"OK — {_passed} checks passed")

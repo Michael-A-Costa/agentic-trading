@@ -2,9 +2,10 @@
 #
 # run_trend.sh — one BTC-trend-sleeve check-in (IBIT on the agentic account), driven by launchd.
 #
-# Usage: run_trend.sh open|close
-#   open  (~09:45 ET): reconcile, then act on yesterday's BTC close vs SMA50 (entry / exit / resize)
-#   close (~15:50 ET): reconcile + stop guard only
+# Usage: run_trend.sh open|close|status
+#   open   (~09:45 ET): reconcile, then act on yesterday's BTC close vs SMA50 (entry / exit / resize)
+#   close  (~15:50 ET): reconcile + stop guard only
+#   status (hourly, 24/7): READ-ONLY account check; macOS notification on any anomaly
 #
 # Places REAL orders only when TREND_ARMED=1 in .env; otherwise a dry-run (real review, nothing placed).
 # Kill switches (in order of preference):
@@ -20,7 +21,7 @@ REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "$REPO" || exit 1
 
 PHASE="${1:-}"
-[[ "$PHASE" == "open" || "$PHASE" == "close" ]] || { echo "usage: $0 open|close" >&2; exit 2; }
+[[ "$PHASE" == "open" || "$PHASE" == "close" || "$PHASE" == "status" ]] || { echo "usage: $0 open|close|status" >&2; exit 2; }
 
 set -a
 [ -f "$REPO/.env" ] && . "$REPO/.env"
@@ -28,7 +29,7 @@ set +a
 export PYTHONUNBUFFERED=1
 
 # Weekends: nothing to do (IBIT doesn't trade). Holidays are caught in Python by quote freshness.
-[ "$(date +%u)" -ge 6 ] && exit 0
+[ "$PHASE" != "status" ] && [ "$(date +%u)" -ge 6 ] && exit 0
 
 PYTHON="${AGENTIC_PYTHON:-/Library/Frameworks/Python.framework/Versions/3.11/bin/python3}"
 [ -x "$PYTHON" ] || PYTHON="$(command -v python3)"
