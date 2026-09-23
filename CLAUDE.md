@@ -69,6 +69,10 @@ isolated, `agentic_allowed=true` account (`your_account_number`). This is a sanc
 - Write tight, conventional commit messages (`feat:`, `fix:`, `chore:`, `docs:`).
 
 ### Secrets
+- **Never send the owner's email, name, or any personal/work identity to an external service** —
+  not in request headers (User-Agent), forms, API sign-ups, or query strings, and not by subagents.
+  If a service demands a contact address (e.g. SEC EDGAR), stop and ask the owner what to use.
+  Subagent prompts must restate this rule.
 - **Never commit credentials or live account data.** API keys, tokens, account numbers, and
   any real position/balance dumps stay out of git. Use `.env` (gitignored) for secrets and
   `.env.example` for the placeholder template. `data/` is gitignored by default.
