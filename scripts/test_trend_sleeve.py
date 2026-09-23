@@ -135,4 +135,9 @@ bad = ts.status_anomalies("IBIT", brk({}, []), {"lot": None, "hwm": 200}, CFGS, 
 check("breaker flagged", any("breaker" in a for a in bad), bad)
 check("flat account is fine", ts.status_anomalies("IBIT", brk({}, []), {"lot": None, "hwm": 100}, CFGS, 100) == [])
 
+# --- AppleScript quoting (json.dumps broke the banner: it emits \u2014 for an em dash)
+check("non-ascii kept literal", ts.applescript_str("a — b") == '"a — b"')
+check("quotes escaped", ts.applescript_str('say "hi"') == '"say \\"hi\\""', ts.applescript_str('say "hi"'))
+check("backslash escaped", ts.applescript_str("a\\b") == '"a\\\\b"', ts.applescript_str("a\\b"))
+
 print(f"OK — {_passed} checks passed")

@@ -393,14 +393,26 @@ def status_anomalies(sym: str, broker: dict, state: dict, cfg: dict, equity: flo
     return out
 
 
-def notify(title: str, msg: str) -> None:
-    """Best-effort macOS banner; never let alerting break the check."""
+def applescript_str(s: str) -> str:
+    """AppleScript string literal. Only backslash and double-quote need escaping; json.dumps is NOT a
+    substitute — it escapes non-ASCII (an em dash becomes backslash-u2014), which AppleScript rejects
+    as a syntax error."""
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def notify(title: str, msg: str) -> bool:
+    """Best-effort macOS banner; never let alerting break the check, but never fail silently either."""
     import subprocess
     try:
-        subprocess.run(["osascript", "-e", f"display notification {json.dumps(msg)} with title {json.dumps(title)}"],
-                       timeout=10, capture_output=True)
-    except (OSError, subprocess.SubprocessError):
-        pass
+        r = subprocess.run(["osascript", "-e", f"display notification {applescript_str(msg)} "
+                                               f"with title {applescript_str(title)}"],
+                           timeout=10, capture_output=True, text=True)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"[notify] failed: {e}", file=sys.stderr)
+        return False
+    if r.returncode != 0:
+        print(f"[notify] osascript rc={r.returncode}: {r.stderr.strip()}", file=sys.stderr)
+    return r.returncode == 0
 
 
 def status(cfg: dict, now: datetime) -> int:
