@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent: BTC trend sleeve, 09:45 ET weekday check-in (signal + orders). PLACES REAL ORDERS when TREND_ARMED=1.
+  Times are LOCAL (this Mac runs US/Eastern). Pairs with the other com.agentic.trend-* plist.
+
+  Install:  sed "s#/ABSOLUTE/PATH/TO#$HOME#g" scripts/com.agentic.trend-open.plist > ~/Library/LaunchAgents/com.agentic.trend-open.plist
+            launchctl load -w ~/Library/LaunchAgents/com.agentic.trend-open.plist
+  Stop:     launchctl unload -w ~/Library/LaunchAgents/com.agentic.trend-open.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agentic.trend-open</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/ABSOLUTE/PATH/TO/agentic-trading/scripts/run_trend.sh</string>
+        <string>open</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/ABSOLUTE/PATH/TO/agentic-trading</string>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>45</integer></dict>
+    </array>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE/PATH/TO/agentic-trading/data/logs/trend-open.out</string>
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE/PATH/TO/agentic-trading/data/logs/trend-open.err</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

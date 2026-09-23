@@ -126,7 +126,28 @@ Autonomous flow for a trade idea: DD / `search` / `get_equity_tradability` →
 `review_equity_order` (alert/log check) → `place_equity_order` → log the decision + fill to
 `data/`. Skip + log if a cap or a blocking broker alert would be hit.
 
-### Execution pipeline (how a tick runs)
+### Active strategy — BTC trend sleeve (since 2026-09-23)
+Plan + evidence: `docs/strategy-redesign-2026-09.md` (bake-off: `scripts/bakeoff_*.py`,
+`data/bakeoff/*_results.md`). Hold **IBIT** while BTC's last completed daily close (Coinbase public
+candles — not RH's marked-up crypto quote) is above its 50-day SMA; cash below. Vol-targeted,
+risk-sized (`position = equity × TREND_RISK_BUDGET_PCT ÷ TREND_STOP_PCT`), whole shares only, **every
+lot carries a resting GTC stop 8% below entry** (never lowered; synthetic market-sell fallback).
+Re-entry after a stop-out only on a fresh cross; breaker at `TREND_BREAKER_DD_PCT` below the equity
+high-water mark. All rules in `scripts/trend_sleeve.py` (tests: `test_trend_sleeve.py`) — no LLM.
+
+- Schedule: `run_trend.sh open` 09:45 ET + `run_trend.sh close` 15:50 ET, weekdays (launchd
+  `com.agentic.trend-open` / `-close`). Nothing intraday; the resting stop covers the gaps.
+- Gate: `TREND_ARMED!=1` = dry-run (real `review_equity_order`, places nothing). State
+  `data/trend_state.json`, per-run log `data/trend-log.jsonl`, fills → `data/trades.jsonl` tagged `[btc-trend]`.
+- Kill switches: unload the two `com.agentic.trend-*` plists → `TREND_ARMED=0` → disconnect the MCP.
+- Options and RH crypto orders remain unwired (bake-off: no edge over buy-and-hold / ~1.9% RH crypto round trip).
+
+### Retired — intraday momentum engine (below, kept for reference)
+Stopped 2026-09-23: no intraday edge (see memory). Its launchd agents were removed from
+`~/Library/LaunchAgents` (templates remain in `scripts/`), and `LIVE_ARMED=0`. Don't reload it
+without the owner's say-so.
+
+### Execution pipeline (how a tick runs) — retired engine
 Mode is selected by **which entry script you run** — there is no `TRADING_MODE` dispatch.
 Each script forces its own mode after sourcing `.env`, so the wrong `.env` value can't
 accidentally flip modes.
