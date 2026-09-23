@@ -92,18 +92,34 @@ Registered in `.mcp.json` (`https://agent.robinhood.com/mcp/trading`). Schemas l
 demand. Read tools are free; the two write tools execute autonomously within the **Risk
 Guardrails** above (no human approval — caps + logging are the gate).
 
-| Tool | Kind | Purpose |
-|------|------|---------|
-| `mcp__robinhood-trading__get_accounts` | read | List brokerage accounts |
-| `mcp__robinhood-trading__get_portfolio` | read | Portfolio value / buying power |
-| `mcp__robinhood-trading__get_equity_positions` | read | Current equity holdings |
-| `mcp__robinhood-trading__get_equity_quotes` | read | Live quotes for symbols |
-| `mcp__robinhood-trading__get_equity_orders` | read | Open / historical orders |
-| `mcp__robinhood-trading__get_equity_tradability` | read | Whether a symbol is tradable |
-| `mcp__robinhood-trading__search` | read | Search instruments |
-| `mcp__robinhood-trading__review_equity_order` | read | Pre-trade review (no execution) |
-| `mcp__robinhood-trading__place_equity_order` | **write — auto, capped** | Place an order |
-| `mcp__robinhood-trading__cancel_equity_order` | **write — auto, capped** | Cancel an order |
+The server grew from 10 tools at project start to **77** (catalogued 2026-09-22). The engine
+still uses only the equity rows marked *engine*; everything else is available for research/DD
+and future strategies. All names are prefixed `mcp__robinhood-trading__`.
+
+| Group | Tools | Kind |
+|------|------|------|
+| Account (*engine*) | `get_accounts`, `get_portfolio`, `get_equity_positions`, `get_equity_orders`, `get_equity_tradability`, `search` | read |
+| Quotes (*engine*) | `get_equity_quotes` | read |
+| Equity orders (*engine*) | `review_equity_order` (pre-trade review, no execution) | read |
+| Equity orders (*engine*) | `place_equity_order`, `cancel_equity_order` | **write — auto, capped** |
+| Market data | `get_equity_historicals` (OHLCV bars), `get_equity_technical_indicators` (RSI/MACD/BB/MA/ATR/VWAP), `get_equity_price_book` (L2, ≤4 symbols), `get_indexes`, `get_index_quotes`, `get_index_historicals` | read |
+| Fundamentals / catalysts | `get_equity_fundamentals`, `get_financials`, `get_earnings_calendar` (≤31d window), `get_earnings_results`, `get_equity_analyst_ratings`, `get_equity_news`, `get_politician_trades` | read |
+| SEC filings | `get_sec_filing_index`, `get_sec_filing`, `get_sec_filing_facts`, `get_sec_filing_facts_catalog` | read |
+| Scanner | `get_scanner_filter_specs`, `get_scanner_datapoints`, `preview_scan` (ad-hoc, unsaved), `get_scans`, `run_scan` | read |
+| Scanner (saved) | `create_scan`, `update_scan_filters`, `update_scan_config` | write (config only) |
+| P&L / lots | `get_realized_pnl`, `get_pnl_trade_history` (broker-side realized P&L), `get_equity_tax_lots` | read |
+| Upgrades | `get_option_level_upgrade_info` (L2 = long options/CC/CSP, works on cash; L3 = spreads, needs margin/limited margin), `get_limited_margin_upgrade_info`, `get_crypto_account_onboarding_info` | read |
+| Options | `get_option_chains`, `get_option_instruments`, `get_option_quotes`, `get_option_historicals`, `get_option_positions`, `get_option_orders` | read |
+| Options orders | `review_option_order` (read) → `place_option_order`, `cancel_option_order`, `exercise_option`, `cancel_option_exercise` | **write — NOT wired** |
+| Crypto | `get_currency_pairs`, `get_crypto_quotes`, `get_crypto_positions`, `get_crypto_orders` | read |
+| Crypto orders | `preview_crypto_order` (read) → `place_crypto_order`, `cancel_crypto_order` | **write — NOT wired** |
+| Alerts | `get_alerts`, `get_alert_log` (read); `create_alert`, `update_alert`, `delete_alert`, `mark_alerts_read` | write (alerts only) |
+| Watchlists | `get_watchlists`, `get_watchlist_items`, `get_option_watchlist`, `get_popular_watchlists` (read); `create_watchlist`, `update_watchlist`, `add_to_watchlist`, `remove_from_watchlist`, `add_option_to_watchlist`, `remove_option_from_watchlist`, `follow_watchlist`, `unfollow_watchlist` | write (lists only) |
+
+**NOT wired** = no Python guardrail layer exists for that asset class yet; don't place options or
+crypto orders until one is built (caps, review→place, logging), the same way equities are.
+Options need the agentic account's `option_level` raised (it's empty as of 2026-09-22); crypto
+uses the linked crypto account (`rhs_account_number` for crypto-backed calls).
 
 Autonomous flow for a trade idea: DD / `search` / `get_equity_tradability` →
 `get_equity_quotes` → `get_portfolio` (buying power) → size within `.env` caps →
