@@ -28,3 +28,6 @@ venv/
 
 # OS
 .DS_Store
+
+# personal follow-up notes (may hold live position/order details)
+notes/
