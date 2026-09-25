@@ -94,7 +94,7 @@ def show_blotter(rows: list[dict]) -> None:
     if not rows:
         print("none in window.")
         return
-    print(f"{'date/time (ET)':<20}{'mode':<12}{'side':<5}{'qty':>10} {'symbol':<7}"
+    print(f"{'date/time (ET)':<20}{'mode':<13}{'side':<5}{'qty':>10} {'symbol':<7}"
           f"{'price':>10}{'realized':>12}  exit/notes")
     print("-" * 78)
     for r in rows:
@@ -104,7 +104,7 @@ def show_blotter(rows: list[dict]) -> None:
         rz_s = fmt_usd(float(rz)) if rz is not None else ""
         note = EXIT_LABEL.get(r.get("exit_type"), r.get("exit_type") or "") if side == "SELL" \
             else (r.get("stop_type") or "")
-        print(f"{ts:<20}{str(r.get('mode','')):<12}{side:<5}{str(r.get('qty','')):>10} "
+        print(f"{ts:<20}{str(r.get('mode','')):<13}{side:<5}{str(r.get('qty','')):>10} "
               f"{str(r.get('symbol','')):<7}{str(r.get('price','')):>10}{rz_s:>12}  {note}")
 
 

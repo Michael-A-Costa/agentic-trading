@@ -27,6 +27,9 @@ REPO = Path(__file__).resolve().parent.parent
 DATA = REPO / "data"
 TRADES_LOG = DATA / "trades.jsonl"
 STOPS_LOG = DATA / "stops.jsonl"
+# Dry-run SHADOW trades (trend sleeve with TREND_ARMED!=1): would-be fills, kept out of trades.jsonl so
+# no P&L tool ever mixes them with real money. Same row schema, so trade_ledger.py --ledger reads it.
+SHADOW_LOG = DATA / "trend-shadow.jsonl"
 JOURNAL_DIR = DATA / "journal"
 
 SCHEMA_VERSION = 1
@@ -400,6 +403,27 @@ def record_fills(results: list[dict], *, ts_utc: str, ts_et: str | None, mode: s
     try:
         _append_jsonl(TRADES_LOG, rows)
         _append_blotter(rows)
+    except OSError:
+        pass
+    return rows
+
+
+def record_shadow(results: list[dict]) -> list[dict]:
+    """Record dry-run SHADOW trades (each result carries its own ts_utc/ts_et — a stop hit is stamped
+    with the bar it happened in, not the run that noticed it) to data/trend-shadow.jsonl plus a daily
+    data/journal/trend-shadow-<ET>.md. Never touches trades.jsonl. Best-effort like record_fills."""
+    rows = [fill_to_trade(r, ts_utc=r["ts_utc"], ts_et=r.get("ts_et"), mode="trend-dryrun")
+            for r in (results or [])]
+    if not rows:
+        return []
+    try:
+        _append_jsonl(SHADOW_LOG, rows)
+        _append_day_md(rows, prefix="trend-shadow", line_fn=_blotter_line,
+                       header="# Trend sleeve SHADOW blotter — {day}\n\n"
+                              "DRY-RUN ONLY (TREND_ARMED!=1): would-be fills, nothing was placed. Entries "
+                              "fill at the ask when reviewed, stops at the stop (or the open on a gap), "
+                              "exits at the bid. Rows: `data/trend-shadow.jsonl`; round-trips: "
+                              "`python3 scripts/trade_ledger.py --ledger data/trend-shadow.jsonl`.\n\n")
     except OSError:
         pass
     return rows

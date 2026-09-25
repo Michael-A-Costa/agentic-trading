@@ -134,10 +134,73 @@ check("qty mismatches flagged", len(bad) == 2, bad)
 bad = ts.status_anomalies("IBIT", brk({}, []), {"lot": None, "hwm": 200}, CFGS, 100)
 check("breaker flagged", any("breaker" in a for a in bad), bad)
 check("flat account is fine", ts.status_anomalies("IBIT", brk({}, []), {"lot": None, "hwm": 100}, CFGS, 100) == [])
+sata_stop = {"symbol": "SATA", "side": "sell", "state": "confirmed", "stop_price": "77.00", "quantity": "2"}
+ok = ts.status_anomalies("IBIT", brk({"SATA": {"qty": 2.0}}, [sata_stop]), {"lot": None, "hwm": 100}, CFGS, 210, ["SATA"])
+check("stopped manual position is not a stray", ok == [], ok)
+bad = ts.status_anomalies("IBIT", brk({"SATA": {"qty": 2.0}}, []), {"lot": None, "hwm": 100}, CFGS, 210, ["SATA"])
+check("manual position without a stop flagged", any("SATA x2 (manual)" in a for a in bad), bad)
+ok = ts.status_anomalies("IBIT", brk({"SATA": {"qty": 0.5}}, []), {"lot": None, "hwm": 100}, CFGS, 210, ["SATA"])
+check("manual fraction needs no stop", ok == [], ok)
+
+# --- account equity counts every position (a manual holding once priced at $0 tripped the breaker)
+eq = ts.account_equity({"cash": 10.09, "positions": {"SATA": {"qty": 2.0, "avg_cost": 100.01}, "IBIT": {"qty": 1}},
+                        "quotes": {"IBIT": {"last": 47.5}}})
+check("unquoted position valued at avg cost", abs(eq - (10.09 + 200.02 + 47.5)) < 1e-9, eq)
 
 # --- AppleScript quoting (json.dumps broke the banner: it emits \u2014 for an em dash)
 check("non-ascii kept literal", ts.applescript_str("a — b") == '"a — b"')
 check("quotes escaped", ts.applescript_str('say "hi"') == '"say \\"hi\\""', ts.applescript_str('say "hi"'))
 check("backslash escaped", ts.applescript_str("a\\b") == '"a\\\\b"', ts.applescript_str("a\\b"))
+
+# --- dry-run shadow position: would-be trades pair into round-trips
+SC = {"symbol": "IBIT", "stop_pct": 8.0, "sma_n": 50}
+ON = {"ok": True, "on": True, "ext_pct": 16.3}
+OFF = {"ok": True, "on": False, "ext_pct": -1.0}
+QT = {"bid": 48.60, "ask": 48.62, "last": 48.61}
+T0 = datetime(2026, 9, 23, 13, 45, tzinfo=timezone.utc)
+def bar(ts, op, lo):
+    return {"ts": ts, "open": op, "low": lo}
+
+sh, rows = ts.shadow_step(None, phase="open", bars=None, sig=ON, entry_ok=True, want=2, quote=QT, cfg=SC, now=T0)
+check("shadow entry at the ask", sh["lot"]["entry_price"] == 48.62 and rows[0]["side"] == "buy"
+      and rows[0]["status"] == "shadow" and rows[0]["stop_price"] == 44.73, rows)
+sh2, rows = ts.shadow_step(sh, phase="open", bars=[bar("2026-09-24T13:30:00Z", 48.9, 48.5)], sig=ON,
+                           entry_ok=True, want=2, quote=QT, cfg=SC, now=T0 + timedelta(days=1))
+check("no re-entry while holding", rows == [] and sh2["lot"] == sh["lot"], rows)
+_, rows = ts.shadow_step(None, phase="open", bars=None, sig=ON, entry_ok=False, want=2, quote=QT, cfg=SC, now=T0)
+check("blocked review -> no shadow entry", rows == [])
+_, rows = ts.shadow_step(None, phase="close", bars=None, sig=None, entry_ok=True, want=2, quote=QT, cfg=SC, now=T0)
+check("close phase never enters", rows == [])
+
+sh3, rows = ts.shadow_step(sh, phase="close", bars=[bar("2026-09-24T14:00:00Z", 47.0, 46.0),
+                                                   bar("2026-09-24T14:05:00Z", 45.5, 44.70)],
+                           sig=None, entry_ok=False, want=0, quote=QT, cfg=SC, now=T0 + timedelta(days=1))
+check("intraday stop hit fills at the stop", len(rows) == 1 and rows[0]["price"] == 44.73
+      and rows[0]["realized_usd"] == round((44.73 - 48.62) * 2, 2), rows)
+check("stop row stamped with its bar, not the run", rows[0]["ts_utc"].startswith("2026-09-24T14:05"), rows)
+check("stop-out classifies as stop-loss", ts.trade_log.classify_exit(rows[0]["reason"]) == "stop")
+check("stop-out locks re-entry", sh3["lot"] is None and sh3["lock"] == {"since": "2026-09-24", "seen_below": False})
+_, rows = ts.shadow_step(sh, phase="open", bars=[bar("2026-09-28T13:30:00Z", 43.0, 42.5)], sig=ON,
+                         entry_ok=True, want=2, quote=QT, cfg=SC, now=T0 + timedelta(days=5))
+check("gap below the stop fills at the open", rows[0]["price"] == 43.0, rows)
+_, rows = ts.shadow_step(sh3, phase="open", bars=None, sig=ON, entry_ok=True, want=2, quote=QT, cfg=SC,
+                         now=T0 + timedelta(days=2))
+check("locked: no re-entry until a fresh cross", rows == [])
+sh4, _ = ts.shadow_step(sh3, phase="open", bars=None, sig=OFF, entry_ok=False, want=0, quote=QT, cfg=SC,
+                        now=T0 + timedelta(days=3))
+_, rows = ts.shadow_step(sh4, phase="open", bars=None, sig=ON, entry_ok=True, want=2, quote=QT, cfg=SC,
+                         now=T0 + timedelta(days=4))
+check("re-enters after the fresh cross", len(rows) == 1 and rows[0]["side"] == "buy", rows)
+
+sh5, rows = ts.shadow_step(sh, phase="open", bars=[], sig=OFF, entry_ok=False, want=0, quote=QT, cfg=SC,
+                           now=T0 + timedelta(days=1))
+check("signal exit at the bid", sh5["lot"] is None and rows[0]["price"] == 48.60 and rows[0]["side"] == "sell", rows)
+_, rows = ts.shadow_step(sh, phase="close", bars=[], sig=OFF, entry_ok=False, want=0, quote=QT, cfg=SC, now=T0)
+check("signal exit only at the open run", rows == [])
+
+row = ts.trade_log.fill_to_trade(ts.shadow_step(None, phase="open", bars=None, sig=ON, entry_ok=True, want=2,
+                                                quote=QT, cfg=SC, now=T0)[1][0],
+                                 ts_utc="x", ts_et="x", mode="trend-dryrun")
+check("shadow row keeps stop + mode", row["stop_price"] == 44.73 and row["mode"] == "trend-dryrun", row)
 
 print(f"OK — {_passed} checks passed")

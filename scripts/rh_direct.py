@@ -193,6 +193,13 @@ def quotes(symbols: list[str]) -> dict:
     return _run([("quotes", "get_equity_quotes", {"symbols": syms})])
 
 
+def historicals(symbols: list[str], start_time: str, interval: str) -> dict:
+    """OHLCV bars (get_equity_historicals, regular hours, split-adjusted), {"bars": <result>, "errors": {}}."""
+    syms = sorted({s.upper().strip() for s in symbols if s and s.strip()})
+    return _run([("bars", "get_equity_historicals",
+                  {"symbols": syms, "start_time": start_time, "interval": interval})])
+
+
 def recent_orders(account: str, symbol: str, created_at_gte: str | None = None) -> dict:
     """Direct equivalent of rh_mcp.recent_orders — agentic orders for ONE symbol, newest first,
     {"orders": <result>, "errors": {}}."""

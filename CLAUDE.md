@@ -147,6 +147,10 @@ high-water mark. All rules in `scripts/trend_sleeve.py` (tests: `test_trend_slee
   Doubles as an MCP-token health check. Runs only while the Mac is awake.
 - Gate: `TREND_ARMED!=1` = dry-run (real `review_equity_order`, places nothing). State
   `data/trend_state.json`, per-run log `data/trend-log.jsonl`, fills → `data/trades.jsonl` tagged `[btc-trend]`.
+- Dry-run SHADOW ledger: while unarmed, a shadow position (`trend_state.json` → `shadow`) takes the would-be
+  fills (entry at the ask, stop on 5-min bars incl. gaps, signal exit at the bid) → `data/trend-shadow.jsonl` +
+  `data/journal/trend-shadow-<date>.md`, mode `trend-dryrun`. Never in `trades.jsonl`; cleared on arming.
+  Review: `python3 scripts/trade_ledger.py --ledger data/trend-shadow.jsonl`.
 - Kill switches: unload the two `com.agentic.trend-*` plists → `TREND_ARMED=0` → disconnect the MCP.
 - Options and RH crypto orders remain unwired (bake-off: no edge over buy-and-hold / ~1.9% RH crypto round trip).
 

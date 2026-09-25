@@ -20,7 +20,8 @@ Rules (all here in Python; no LLM in the loop):
 Phases: `--phase open` (~09:45 ET) reconciles, then acts on the signal; `--phase close` (~15:50 ET)
 only reconciles + guards the stop; `--phase status` (hourly, 24/7) is READ-ONLY — snapshots the account,
 flags anomalies (lot without a resting stop, broker/state mismatch, stray positions/orders, breaker,
-broker unreachable) and raises a macOS notification on any. TREND_ARMED!=1 is a dry-run: real review, logs intent, places nothing.
+broker unreachable) and raises a macOS notification on any. TREND_ARMED!=1 is a dry-run: real review, logs intent, places nothing
+— and tracks a SHADOW position (state["shadow"]) whose would-be fills go to data/trend-shadow.jsonl, never trades.jsonl.
 """
 from __future__ import annotations
 
@@ -163,6 +164,58 @@ def settled_cash(buying_power: float, unsettled: list, today: date) -> float:
     return max(0.0, buying_power - pending)
 
 
+def shadow_stop_hit(lot: dict, bars: list[dict]) -> dict | None:
+    """First bar (oldest first) that reaches the stop -> {"ts", "price"}. A bar that OPENS below the stop
+    (overnight/weekend gap) fills at its open, worse than the stop — what a resting stop_market does."""
+    for b in bars:
+        if b["low"] <= lot["stop_price"]:
+            return {"ts": b["ts"], "price": round(min(lot["stop_price"], b["open"]), 4)}
+    return None
+
+
+def shadow_step(sh: dict | None, *, phase: str, bars: list[dict] | None, sig: dict | None,
+                entry_ok: bool, want: int, quote: dict, cfg: dict, now: datetime) -> tuple[dict, list[dict]]:
+    """Dry-run SHADOW position: what the armed sleeve would be holding, so would-be trades pair into
+    round-trips instead of every dry-run morning logging a fresh 'entry'. Same rules as the real lot:
+    stop checked on every bar since the last run, signal exit at the open run, re-entry after a stop-out
+    only on a fresh cross. Returns (new shadow state, would-be fills as trade_log results)."""
+    sh = {"lot": None, "lock": None, **(sh or {})}
+    rows: list[dict] = []
+    stamp = {"ts_utc": now.isoformat(timespec="seconds"), "ts_et": now.astimezone(ET).isoformat(timespec="seconds")}
+
+    def close(px: float, why: str, when: dict) -> None:
+        lot = sh["lot"]
+        rows.append({**when, "symbol": cfg["symbol"], "side": "sell", "status": "shadow", "qty": lot["qty"],
+                     "price": px, "reason": f"{TAG} {why}",
+                     "realized_usd": round((px - lot["entry_price"]) * lot["qty"], 2)})
+        sh["lot"] = None
+
+    if sh["lot"] and bars:
+        hit = shadow_stop_hit(sh["lot"], bars)
+        if hit:
+            t = parse_ts(hit["ts"])
+            close(hit["price"], f"stop-loss (resting stop, bar {hit['ts']})",
+                  {"ts_utc": t.isoformat(timespec="seconds"), "ts_et": t.astimezone(ET).isoformat(timespec="seconds")})
+            sh["lock"] = {"since": t.astimezone(ET).date().isoformat(), "seen_below": False}
+    if phase == "open" and sig and sig.get("ok"):
+        sh["lock"] = update_lock(sh["lock"], sig["on"])
+        if sh["lot"] and not sig["on"]:
+            px = quote.get("bid") or quote.get("last")
+            if px:
+                close(px, "signal exit (BTC close below SMA)", stamp)
+        elif not sh["lot"] and entry_ok and want > 0 and sh["lock"] is None:
+            px = quote.get("ask") or quote.get("last")
+            if px:
+                sh["lot"] = {"qty": want, "entry_price": px, "stop_price": stop_level(px, cfg["stop_pct"]),
+                             "entry_ts": stamp["ts_utc"]}
+                sh["checked_through"] = stamp["ts_utc"]
+                rows.append({**stamp, "symbol": cfg["symbol"], "side": "buy", "status": "shadow", "qty": want,
+                             "price": px, "ref_price": px, "stop_price": sh["lot"]["stop_price"],
+                             "stop_type": "resting",
+                             "reason": f"{TAG} signal entry (BTC {sig['ext_pct']}% vs SMA{cfg['sma_n']})"})
+    return sh, rows
+
+
 # ---------------------------------------------------------------------------
 # I/O
 # ---------------------------------------------------------------------------
@@ -172,10 +225,60 @@ def fetch_candles(pair: str) -> list:
         return json.load(r)
 
 
+def fetch_bars(sym: str, since: datetime, now: datetime) -> list[dict] | None:
+    """5-min RTH bars that END after `since`, oldest first, as {ts, open, low}; None if the fetch failed
+    (caller then leaves its checkpoint alone so the next run re-scans the gap). Clamped to 20 days back
+    so an explicit 5-minute request stays under the upstream bar cap."""
+    import rh_direct
+    start = max(since, now - timedelta(days=20))
+    try:
+        raw = rh_direct.historicals([sym], start.strftime("%Y-%m-%dT%H:%M:%SZ"), "5minute")
+    except Exception as e:
+        print(f"[shadow] bars fetch failed: {e}", file=sys.stderr)
+        return None
+    out = []
+    for r in (lx._unwrap(raw.get("bars") or {}) or {}).get("results") or []:
+        for b in r.get("bars") or []:
+            t = parse_ts(b["begins_at"])
+            if b.get("interpolated") or t + timedelta(minutes=5) <= since:
+                continue
+            out.append({"ts": b["begins_at"], "open": float(b["open_price"]), "low": float(b["low_price"])})
+    out.sort(key=lambda b: b["ts"])
+    return out
+
+
 def load_state() -> dict:
     if STATE_PATH.exists():
         return json.loads(STATE_PATH.read_text())
     return {"lot": None, "lock": None, "hwm": None, "unsettled": []}
+
+
+def manual_symbols() -> list[str]:
+    """Symbols the owner holds by hand (`book: manual` live rows in trades.jsonl). They share the account
+    with the sleeve but aren't its to trade, so the checks must count them without calling them strays."""
+    out = set()
+    try:
+        with trade_log.TRADES_LOG.open() as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if row.get("book") == "manual" and row.get("mode") == "live" and row.get("symbol"):
+                    out.add(str(row["symbol"]).upper())
+    except OSError:
+        pass
+    return sorted(out)
+
+
+def account_equity(broker: dict) -> float:
+    """PURE: cash + every position marked to its quote (avg cost when unquoted). Valuing only quoted
+    symbols once priced a manual holding at $0 and tripped the breaker on a flat account."""
+    total = broker["cash"]
+    for s, p in broker["positions"].items():
+        px = broker["quotes"].get(s, {}).get("last") or p.get("avg_cost") or 0.0
+        total += (p.get("qty") or 0.0) * px
+    return total
 
 
 def log_event(ev: dict) -> None:
@@ -324,6 +427,27 @@ def _buy(sym: str, qty: int, reason: str, broker: dict, cfg: dict, state: dict, 
     run["results"].append(res)
 
 
+def _shadow(sym: str, phase: str, broker: dict, cfg: dict, state: dict, run: dict, now: datetime) -> None:
+    """Dry-run only: advance the shadow position and log its would-be fills (trade_log.record_shadow)."""
+    sh = state.get("shadow") or {}
+    bars = None
+    if sh.get("lot"):
+        bars = fetch_bars(sym, parse_ts(sh.get("checked_through") or sh["lot"]["entry_ts"]), now)
+        if bars is None:
+            run["events"].append({"event": "shadow_bars_failed"})
+        else:
+            sh["checked_through"] = now.isoformat(timespec="seconds")
+    # enter only when the real review passed (a blocked review would have stopped the armed buy too)
+    entry_ok = run.get("action") == "entry" and any(
+        e.get("event") == "buy" and e.get("status") == "dryrun" for e in run["events"])
+    sh, rows = shadow_step(sh, phase=phase, bars=bars, sig=run.get("signal") if phase == "open" else None,
+                           entry_ok=entry_ok, want=int(run.get("want") or 0),
+                           quote=broker["quotes"].get(sym, {}), cfg=cfg, now=now)
+    state["shadow"] = sh
+    run["shadow"] = {"lot": sh["lot"], "lock": sh["lock"], "fills": rows}
+    trade_log.record_shadow(rows)
+
+
 # ---------------------------------------------------------------------------
 # reconcile: broker truth wins
 # ---------------------------------------------------------------------------
@@ -369,8 +493,10 @@ def reconcile(sym: str, broker: dict, cfg: dict, state: dict, run: dict, today: 
 # ---------------------------------------------------------------------------
 # hourly status (read-only)
 # ---------------------------------------------------------------------------
-def status_anomalies(sym: str, broker: dict, state: dict, cfg: dict, equity: float) -> list[str]:
-    """PURE: what's wrong with the account right now, as short human-readable strings."""
+def status_anomalies(sym: str, broker: dict, state: dict, cfg: dict, equity: float,
+                     manual: list[str] | tuple = ()) -> list[str]:
+    """PURE: what's wrong with the account right now, as short human-readable strings. `manual` symbols
+    are owner-held, not strays — but they still need a resting stop on their whole shares."""
     out = []
     held = int(math.floor(broker["positions"].get(sym, {}).get("qty", 0.0) or 0.0))
     stops = lx.open_stops_for(broker["orders"], sym)
@@ -385,7 +511,12 @@ def status_anomalies(sym: str, broker: dict, state: dict, cfg: dict, equity: flo
         out.append(f"state lot qty {lot.get('qty')} != broker {held}")
     if held and not lot:
         out.append(f"broker holds {sym} x{held} but no tracked lot")
-    stray = sorted(s for s in broker["positions"] if s != sym)
+    for m in sorted(set(manual) & set(broker["positions"])):
+        whole = int(math.floor(broker["positions"][m].get("qty") or 0.0))
+        covered = sum(int(lx._f(o.get("quantity"), 0) or 0) for o in lx.open_stops_for(broker["orders"], m))
+        if whole and covered < whole:  # a fraction can't carry a broker stop, so only whole shares count
+            out.append(f"{m} x{whole} (manual) has only {covered} under a resting stop")
+    stray = sorted(s for s in broker["positions"] if s != sym and s not in manual)
     if stray:
         out.append(f"unexpected positions: {', '.join(stray)}")
     if breaker_tripped(equity, state.get("hwm"), cfg["breaker_pct"]):
@@ -419,7 +550,8 @@ def status(cfg: dict, now: datetime) -> int:
     import rh_mcp
     sym = cfg["symbol"]
     rec = {"ts_utc": now.isoformat(timespec="seconds"), "phase": "status", "armed": armed()}
-    snap = rh_mcp.snapshot([sym])
+    manual = manual_symbols()
+    snap = rh_mcp.snapshot([sym, *manual])
     if not snap:
         rec["anomalies"] = ["broker snapshot FAILED (MCP auth/token or network)"]
     else:
@@ -427,13 +559,15 @@ def status(cfg: dict, now: datetime) -> int:
         state = load_state()
         last = broker["quotes"].get(sym, {}).get("last") or 0.0
         held = int(math.floor(broker["positions"].get(sym, {}).get("qty", 0.0) or 0.0))
-        equity = broker["cash"] + sum((p.get("qty") or 0) * (broker["quotes"].get(s, {}).get("last") or 0)
-                                      for s, p in broker["positions"].items())
+        equity = account_equity(broker)
         lot = state.get("lot") or {}
         rec.update(equity=round(equity, 2), cash=broker["cash"], buying_power=broker["buying_power"],
                    held=held, last=last, stop=lot.get("stop_price"), entry=lot.get("entry_price"),
                    open_orders=len(broker["orders"]), hwm=state.get("hwm"),
-                   anomalies=status_anomalies(sym, broker, state, cfg, equity))
+                   manual={m: broker["positions"][m]["qty"] for m in manual if m in broker["positions"]},
+                   anomalies=status_anomalies(sym, broker, state, cfg, equity, manual))
+        if not armed() and (state.get("shadow") or {}).get("lot"):
+            rec["shadow_lot"] = state["shadow"]["lot"]
         if held and lot.get("entry_price"):
             rec["unrealized_usd"] = round((last - lot["entry_price"]) * held, 2)
             rec["to_stop_pct"] = round((last / lot["stop_price"] - 1) * 100, 2) if lot.get("stop_price") else None
@@ -474,7 +608,7 @@ def main() -> int:
     run = {"ts_utc": now.isoformat(timespec="seconds"), "phase": args.phase, "armed": armed(),
            "events": [], "results": []}
 
-    snap = rh_mcp.snapshot([sym])
+    snap = rh_mcp.snapshot([sym, *manual_symbols()])
     if not snap:
         run.update(action="skip", reason="broker snapshot failed")
         log_event(run)
@@ -484,10 +618,12 @@ def main() -> int:
     run["market"] = why
     state = load_state()
     state["unsettled"] = [u for u in state["unsettled"] if date.fromisoformat(u["settles"]) > today]
+    if armed() and state.get("shadow"):  # real money from here on; the dry-run shadow must not linger
+        run["events"].append({"event": "shadow_cleared", "shadow": state.pop("shadow")})
 
     last = broker["quotes"].get(sym, {}).get("last") or 0.0
     held = int(math.floor(broker["positions"].get(sym, {}).get("qty", 0.0) or 0.0))
-    equity = broker["cash"] + held * last
+    equity = account_equity(broker)  # whole account: owner-held (manual) money moved out of cash isn't a sleeve loss
     state["hwm"] = max(state.get("hwm") or 0.0, equity)
     run.update(equity=round(equity, 2), hwm=round(state["hwm"], 2), held=held, last=last,
                buying_power=broker["buying_power"])
@@ -545,6 +681,8 @@ def main() -> int:
             else:
                 run.setdefault("action", "hold" if cur else "flat")
 
+    if not armed() and not args.ignore_hours:  # --ignore-hours runs are off-session tests, not sessions
+        _shadow(sym, args.phase, broker, cfg, state, run, now)
     run["lot"] = state["lot"]
     trade_log.record_fills(run["results"], ts_utc=run["ts_utc"], ts_et=now.astimezone(ET).isoformat(timespec="seconds"),
                            mode="live")
