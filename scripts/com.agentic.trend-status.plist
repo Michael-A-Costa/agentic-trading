@@ -23,8 +23,10 @@
     <key>WorkingDirectory</key>
     <string>/ABSOLUTE/PATH/TO/agentic-trading</string>
 
-    <key>StartInterval</key>
-    <integer>3600</integer>
+    <!-- Calendar, not StartInterval: StartInterval's clock stops while the Mac sleeps, so after a
+         night asleep the check waited a further awake hour. A missed calendar slot fires on wake. -->
+    <key>StartCalendarInterval</key>
+    <dict><key>Minute</key><integer>5</integer></dict>
 
     <key>RunAtLoad</key>
     <false/>
